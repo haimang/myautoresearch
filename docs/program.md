@@ -2,142 +2,155 @@
 
 Train a Gomoku (五子棋) AI using the autoresearch experiment loop on Apple Silicon (MLX). The agent autonomously modifies `src/train.py` to discover the best neural network architecture and training strategy for beating increasingly strong opponents.
 
-**Monorepo note:** This project lives inside `autoresearch-mlx/mag-gomoku/`. Always stage only `autoresearch-mlx/mag-gomoku/` paths. Never use blind `git add -A`.
+## Repository layout
+
+```
+mag-gomoku/
+├── src/
+│   ├── game.py        # Board engine, renderer, batch self-play          [READ-ONLY]
+│   ├── prepare.py     # Minimax opponents L0-L3, evaluation harness      [READ-ONLY]
+│   ├── train.py       # NN, self-play, training loop, TUI, CLI           [AGENT-EDITABLE]
+│   ├── tracker.py     # SQLite experiment tracking                       [READ-ONLY]
+│   ├── tui.py         # Terminal UI helpers (sparklines, panels)          [READ-ONLY]
+│   ├── play.py        # Human vs AI / AI vs AI                           [READ-ONLY]
+│   ├── replay.py      # Replay recorded games, export video frames       [READ-ONLY]
+│   └── analyze.py     # Query tracker.db for analysis                    [READ-ONLY]
+├── docs/
+│   ├── program.md     # THIS FILE — agent operating instructions
+│   └── caveats.md     # Known pitfalls and troubleshooting
+├── output/            # All generated artifacts (gitignored)
+│   ├── tracker.db     # SQLite database — global index across all runs
+│   ├── opponents/     # Registered NN opponents
+│   └── <uuid>/        # Per-run output directory
+│       ├── model.safetensors
+│       ├── checkpoints/
+│       └── recordings/games/
+├── pyproject.toml
+└── uv.lock
+```
+
+## The single rule
+
+**`src/train.py` is the ONLY file you modify.** All other source files are read-only.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
-
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr10`). The branch `autoresearch/<tag>` must not already exist.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main.
-3. **Read the in-scope files**:
-   - `src/game.py` — board engine, rendering, batch self-play. Do not modify.
-   - `src/prepare.py` — minimax opponents (L0-L3), evaluation, checkpoint archive. Do not modify.
-   - `src/train.py` — the file you modify. NN architecture, self-play, training loop.
-4. **Install dependencies**: `cd autoresearch-mlx/mag-gomoku && uv sync`
-5. **Initialize data/results.tsv**: Run `uv run python src/train.py` once to establish YOUR baseline on this hardware.
-6. **Confirm and go**.
+1. Read the in-scope files:
+   - `src/game.py` — board engine (BOARD_SIZE=15, WIN_LENGTH=5), BatchBoards for parallel self-play
+   - `src/prepare.py` — minimax opponents, `evaluate_win_rate()` harness
+   - `src/train.py` — the file you edit: model architecture, self-play, training loop, hyperparameters
+2. Install dependencies: `uv sync`
+3. Run one baseline experiment: `uv run python src/train.py --time-budget 300`
+4. Confirm baseline win_rate in the output summary, then begin the experiment loop.
 
 ## Experimentation
 
-Each experiment runs on Apple Silicon via MLX. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time). Launch: `uv run python src/train.py`.
+### What you CAN do
+- Modify `src/train.py` — everything inside is fair game: model architecture, optimizer, hyperparameters, self-play strategy, batch size, temperature schedule, replay buffer, MCTS, loss function, etc.
 
-**What you CAN do:**
-- Modify `src/train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, self-play strategy, batch size, temperature schedule, replay buffer, MCTS, loss function, etc.
+### What you CANNOT do
+- Modify any file other than `src/train.py`
+- Install new packages or add dependencies
+- Modify the evaluation harness (`evaluate_win_rate` in `src/prepare.py`)
 
-**What you CANNOT do:**
-- Modify `src/prepare.py` or `src/game.py`. They are read-only.
-- Install new packages or add dependencies.
-- Modify the evaluation harness (`evaluate_win_rate` in `src/prepare.py`).
-
-**The goal is simple: get the highest win_rate against the current evaluation opponent.** Since the time budget is fixed, you don't need to worry about training time. Everything is fair game as long as the code runs and finishes within budget.
-
-**Simplicity criterion**: Same as upstream autoresearch. Simpler is better. A 1% win_rate improvement that adds ugly complexity? Probably not worth it. A 1% improvement from deleting code? Keep.
+### Simplicity criterion
+Same as upstream autoresearch. Simpler is better. A 1% win_rate improvement that adds ugly complexity? Probably not worth it. A 1% improvement from deleting code? Keep.
 
 ## Evaluation metric
 
-The single metric is `win_rate` — the fraction of games won against a fixed minimax opponent at the current evaluation level.
+The single metric is `win_rate` — the fraction of games won against a fixed opponent.
 
 ```
 win_rate = wins / n_games   (higher is better, range [0.0, 1.0])
 ```
 
-Evaluation runs automatically at the end of `src/train.py`. The evaluation opponent level is controlled by `EVAL_LEVEL` in train.py (default: 0, starting with random opponent).
+Evaluation happens automatically:
+- **Probe eval**: Every N cycles during training (lightweight, in-process)
+- **Full eval**: At each checkpoint milestone (200 games, subprocess-isolated)
+- **Final eval**: At run end (200 games vs minimax)
+
+The evaluation opponent level is controlled by `--eval-level` (default: 0).
 
 ## Stage promotion
 
-As the agent improves, promote to harder opponents:
+As the model improves, promote to harder opponents:
 
 | Stage | Opponent | Promotion threshold | Action |
 |---|---|---|---|
-| 0 | L0 (random) | win_rate > 0.95 | Set EVAL_LEVEL = 1 |
-| 1 | L1 (minimax depth 2) | win_rate > 0.80 | Set EVAL_LEVEL = 2 |
-| 2 | L2 (minimax depth 4) | win_rate > 0.60 | Set EVAL_LEVEL = 3 |
+| 0 | L0 (random) | win_rate > 0.95 | Use `--eval-level 1` in next run |
+| 1 | L1 (minimax depth 2) | win_rate > 0.80 | Use `--eval-level 2` in next run |
+| 2 | L2 (minimax depth 4) | win_rate > 0.60 | Use `--eval-level 3` in next run |
 | 3 | L3 (minimax depth 6) | Keep optimizing | No limit |
 
-When promoting:
-1. **Archive the current model**: call `prepare.archive_checkpoint()` with a descriptive tag
-2. **Update EVAL_LEVEL** in train.py
-3. **Record the new baseline** in data/results.tsv
-4. **Continue the loop** — the new baseline win_rate will be lower, and you climb again
+Alternatively, register a trained checkpoint as a named NN opponent and train against it with `--eval-opponent <alias>`.
+
+## Canonical benchmark profile
+
+For **comparable** experiments, use the standard benchmark settings:
+
+```bash
+uv run python src/train.py --time-budget 300 --eval-level 0 --probe-games 50 --eval-interval 15 --full-eval-games 200
+```
+
+Rules for benchmark runs:
+- Fixed 5-minute wall-clock budget
+- Fixed minimax opponent (no `--eval-opponent`)
+- No `--resume` (fresh run only)
+- Results are directly comparable across experiments
+
+Exploratory runs (custom time budget, NN opponents, resume) are encouraged for development but should not be used to claim benchmark progress.
+
+## Experiment tracking
+
+All experiment data is stored in `output/tracker.db` (SQLite). Key tables:
+
+- **runs**: One row per training run. UUID, hyperparams, hardware info, status, final metrics.
+- **cycle_metrics**: Per-cycle loss, win_rate, buffer size, game counts.
+- **checkpoints**: Model snapshots at WR milestones, with full eval results.
+- **recordings**: Game records linked to checkpoints.
+- **opponents**: Registered NN opponents with alias, source run, and WR.
+
+Each run creates an isolated directory: `output/<uuid>/`. The tracker.db is the global cross-run index.
 
 ## Output format
 
-The script prints a summary at the end:
+The training script prints a summary at the end:
 
 ```
----
-training_seconds: 300.0
-total_seconds:    452.3
-peak_vram_mb:     1842.0
-num_params_K:     876.5
-total_games:      12000
-total_train_steps: 1750
-final_loss:       0.8234
-
----
-win_rate:         0.7300
-eval_level:       2
-wins:             146
-losses:           38
-draws:            16
-avg_game_length:  47.2
+============================================================
+Run:        a3f7b2c1 (target_win_rate)
+Cycles:     85 (total cycle #85)
+Games:      5440
+Steps:      4226
+Final loss: 1.168
+Win rate:   73.0% (vs L0)  [benchmark]
+Checkpoints:4
+Wall time:  300.2s
+Output:     output/a3f7b2c1-.../
+Tracker:    output/tracker.db
+============================================================
 ```
 
-Read results:
-```
-grep "^win_rate:" output/run.log
-```
-
-## Logging results
-
-Log to `data/data/results.tsv` (tab-separated):
-
-```
-commit	win_rate	eval_level	memory_gb	status	description
-```
-
-1. git commit hash (short, 7 chars)
-2. win_rate achieved (e.g. 0.7300) — use 0.0000 for crashes
-3. eval_level (0-3)
-4. peak memory in GB (rough estimate from output)
-5. status: `keep`, `discard`, or `crash`
-6. short text description
-
-Example:
-```
-commit	win_rate	eval_level	memory_gb	status	description
-a1b2c3d	0.4200	0	1.2	keep	baseline: 6 res blocks, 64 filters
-e5f6g7h	0.6800	0	1.2	keep	increase parallel games to 128
-i9j0k1l	0.9700	0	1.2	keep	temperature annealing + lower LR
-m2n3o4p	0.8200	1	1.2	keep	promoted to L1, new baseline
+Query results from DB:
+```bash
+sqlite3 -header -column output/tracker.db "SELECT substr(id,1,8) AS run, status, total_cycles, final_win_rate FROM runs ORDER BY created_at DESC LIMIT 10"
 ```
 
 ## The experiment loop
 
 LOOP FOREVER:
 
-1. Look at the git state: current branch/commit
-2. Tune `src/train.py` with an experimental idea
+1. Read the current state: last run's win_rate, loss trajectory, any regressions
+2. Form a hypothesis and modify `src/train.py`
 3. `git add src/train.py && git commit -m "experiment: <description>"`
-4. Run: `uv run python src/train.py > output/run.log 2>&1`
-5. Read results: `grep "^win_rate:\|^eval_level:" output/run.log`
-6. If grep is empty, run crashed. `tail -n 50 output/run.log` for stack trace.
-7. Record in data/results.tsv
-8. If win_rate improved: `git add data/results.tsv && git commit --amend --no-edit`
-9. If win_rate same/worse: `git reset --hard <previous kept commit>`
-10. **Check for stage promotion**: if win_rate exceeds promotion threshold, promote
+4. Run: `uv run python src/train.py --time-budget 300`
+5. Read the output summary (win_rate, loss, cycles)
+6. If crashed: `tail -n 50` of terminal output for stack trace
+7. If win_rate improved: keep the commit
+8. If win_rate same/worse: `git reset --hard <previous kept commit>`
+9. Check for stage promotion: if win_rate exceeds threshold, promote in next run
 
-**Timeout**: Each experiment should take ~7-8 minutes total. Kill after 15 minutes.
-
-**Stage promotion workflow**: When promoting to a harder opponent:
-```bash
-# 1. Archive checkpoint
-python3 -c "from prepare import archive_checkpoint; archive_checkpoint('model.safetensors', 'stage1_beat_random', {'win_rate': 0.97, 'eval_level': 0, 'experiment': 12})"
-
-# 2. Update EVAL_LEVEL in train.py to the next level
-# 3. Commit and continue the loop
-```
+**Timeout**: Each benchmark experiment should take ~6-8 minutes total (5 min training + eval). Kill after 15 minutes.
 
 ## Hints for the agent
 

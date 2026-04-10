@@ -11,6 +11,7 @@ Requirements: Apple Silicon Mac, Python 3.10+, [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync
 uv run python src/train.py                     # run one 5-minute training experiment
+uv run python src/analyze.py --runs            # view all training runs
 uv run python src/play.py --list               # list saved checkpoints
 uv run python src/play.py --list-opponents     # list registered NN opponents
 uv run python src/play.py                      # play against the trained AI
@@ -143,8 +144,10 @@ autoresearch loop (agent modifies src/train.py → self-play + train → evaluat
   output/<uuid>/checkpoints/*.safetensors  (snapshots at milestones)
   output/tracker.db                        (full experiment history across all runs)
         ↓
-  src/play.py (human vs AI game)
-  src/replay.py (video production)
+  src/play.py     (human vs AI game)
+  src/analyze.py  (tracker data analysis)
+  src/replay.py   (video production)
+  src/tui.py      (TUI rendering helpers)
 ```
 
 The single metric is **win_rate** against fixed minimax opponents. The agent promotes through increasingly strong opponents:
@@ -190,6 +193,19 @@ uv run python src/replay.py output/<uuid>/recordings/games/wr070_c0045_game003.j
 
 # Growth montage
 uv run python src/replay.py --montage
+```
+
+## Analysis tool
+
+`analyze.py` provides read-only queries against the tracker database:
+
+```bash
+uv run python src/analyze.py --runs                          # list all runs with stats
+uv run python src/analyze.py --best                          # best checkpoint per run
+uv run python src/analyze.py --frontier                      # WR progression frontier
+uv run python src/analyze.py --compare 374d567f 1922e0f0     # side-by-side run comparison
+uv run python src/analyze.py --lineage 1922e0f0              # trace resume chain
+uv run python src/analyze.py --opponents                     # list registered opponents
 ```
 
 ## Querying experiment data

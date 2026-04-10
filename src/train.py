@@ -21,6 +21,7 @@ import mlx.optimizers as optim
 import numpy as np
 
 from game import BatchBoards, BOARD_SIZE, BLACK, WHITE, EMPTY
+from tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, progress_bar as _progress_bar_fn
 
 # Try to import TIME_BUDGET and evaluate_win_rate from prepare.py.
 try:
@@ -322,6 +323,13 @@ def train(args):
     parallel_games = args.parallel_games
     probe_window = args.probe_window
 
+    # Detect benchmark mode: fixed budget, minimax only, no resume
+    is_benchmark = (
+        time_budget is not None
+        and args.eval_opponent is None
+        and args.resume is None
+    )
+
     # Ensure at least one stop condition
     if time_budget is None and target_win_rate is None and target_games is None:
         print("Warning: no stop condition set, defaulting to --time-budget 300")
@@ -384,7 +392,9 @@ def train(args):
         "eval_opponent": args.eval_opponent,
     }
     _tracker.create_run(db_conn, run_id, hyperparams, hw_info,
-                        resumed_from=resumed_from, output_dir=output_dir)
+                        resumed_from=resumed_from, output_dir=output_dir,
+                        is_benchmark=is_benchmark,
+                        eval_opponent=args.eval_opponent)
 
     # Initialize model
     if resume_model_path and os.path.exists(resume_model_path):
@@ -444,38 +454,10 @@ def train(args):
     events: list[str] = []
 
     def _sparkline(values: list[float], width: int = 30) -> str:
-        """Single-row sparkline for compact display."""
-        if not values:
-            return ""
-        chars = "▁▂▃▄▅▆▇█"
-        recent = values[-width:]
-        lo, hi = min(recent), max(recent)
-        span = hi - lo if hi > lo else 1.0
-        return "".join(chars[min(int((v - lo) / span * 7), 7)] for v in recent)
+        return _sparkline_fn(values, width)
 
     def _sparkline2(values: list[float], width: int = 40) -> tuple[str, str]:
-        """Double-height sparkline — returns (upper_row, lower_row)."""
-        if not values:
-            return ("", "")
-        # Block elements for upper/lower halves
-        # Lower row uses full blocks ▁▂▃▄▅▆▇█ for values 0-7
-        # Upper row uses spaces for low values, blocks for values 8-15
-        lo_chars = " ▁▂▃▄▅▆▇"  # 0-7: lower half
-        hi_chars = " ▁▂▃▄▅▆▇"  # 8-15: upper half (shifted)
-        recent = values[-width:]
-        lo, hi = min(recent), max(recent)
-        span = hi - lo if hi > lo else 1.0
-        upper = []
-        lower = []
-        for v in recent:
-            level = min(int((v - lo) / span * 15), 15)
-            if level >= 8:
-                lower.append("█")
-                upper.append(hi_chars[level - 8])
-            else:
-                lower.append(lo_chars[level])
-                upper.append(" ")
-        return ("".join(upper), "".join(lower))
+        return _sparkline2_fn(values, width)
 
     def _smoothed_wr(window: int = probe_window) -> float | None:
         """Sliding average of recent probe WRs for stable decisions."""
@@ -485,14 +467,7 @@ def train(args):
         return sum(wr_history[-w:]) / w
 
     def _progress_bar(elapsed: float, budget: float | None, width: int = 34) -> str:
-        if budget is None or budget <= 0:
-            return ""
-        frac = min(elapsed / budget, 1.0)
-        filled = int(frac * width)
-        bar = "━" * filled + "─" * (width - filled)
-        em, es = divmod(int(elapsed), 60)
-        bm, bs = divmod(int(budget), 60)
-        return f"{bar} {frac:3.0%} {em}:{es:02d} / {bm}:{bs:02d}"
+        return _progress_bar_fn(elapsed, budget, width)
 
     def _draw_panel():
         """Render the full text TUI panel with fixed-width columns."""
@@ -507,7 +482,9 @@ def train(args):
 
         lines = []
         lines.append("╭" + "─" * W + "╮")
-        lines.append(row(f" Run: {run_id_short}  {chip}  {num_params/1000:.1f}K params"))
+        prov = "[benchmark]" if is_benchmark else "[exploratory]"
+        resumed = " resumed" if resumed_from else ""
+        lines.append(row(f" Run: {run_id_short}  {chip}  {num_params/1000:.1f}K params  {prov}{resumed}"))
         if time_budget is not None:
             lines.append(row(" " + _progress_bar(elapsed, time_budget)))
         else:
@@ -775,9 +752,11 @@ def train(args):
     # ----- Print summary -----
     print()
     print("=" * 60)
+    prov_label = "benchmark" if is_benchmark else "exploratory"
     resumed_str = f"  (resumed from {resumed_from[:8]})" if resumed_from else ""
     opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
-    print(f"Run:        {run_id_short}{resumed_str} ({stop_reason})")
+    print(f"Run:        {run_id_short}{resumed_str} ({stop_reason}) [{prov_label}]")
+    print(f"Opponent:   {opp_label}")
     print(f"Cycles:     {cycle - initial_cycle} (total cycle #{cycle})")
     print(f"Games:      {total_games}")
     print(f"Steps:      {total_train_steps}")
@@ -855,15 +834,23 @@ def _quick_eval(model, level: int, n_games: int,
     return wins / n_games if n_games > 0 else 0.0
 
 
-def _nn_opponent_move(opp_model, board) -> tuple[int, int]:
-    """Make a move using an NN opponent model (argmax policy)."""
+def _nn_opponent_move(opp_model, board, temperature: float = 0.5) -> tuple[int, int]:
+    """Make a move using an NN opponent model.
+
+    With temperature > 0, uses softmax sampling for diversity.
+    With temperature = 0, uses deterministic argmax.
+    """
     encoded = board.encode()
     x = mx.array(encoded[np.newaxis, ...])
     policy_logits, _ = opp_model(x)
     policy = policy_logits[0]
     legal_mask = mx.array(board.get_legal_mask())
     masked = mx.where(legal_mask > 0, policy, mx.array(float("-inf")))
-    action = int(mx.argmax(masked).item())
+    if temperature > 0:
+        probs = mx.softmax(masked / temperature)
+        action = int(mx.random.categorical(mx.log(probs + 1e-10)).item())
+    else:
+        action = int(mx.argmax(masked).item())
     row, col = divmod(action, BOARD_SIZE)
     return row, col
 

@@ -158,6 +158,12 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # v6 migration: benchmark flag and eval_opponent
+    for col, typ in [("is_benchmark", "INTEGER DEFAULT 0"), ("eval_opponent", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     return conn
 
@@ -233,7 +239,9 @@ def collect_hardware_info() -> dict:
 def create_run(conn: sqlite3.Connection, run_id: str,
                hyperparams: dict, hardware: Optional[dict] = None,
                resumed_from: Optional[str] = None,
-               output_dir: Optional[str] = None) -> None:
+               output_dir: Optional[str] = None,
+               is_benchmark: bool = False,
+               eval_opponent: Optional[str] = None) -> None:
     """Insert a new training run."""
     hw = hardware or {}
     conn.execute(
@@ -244,7 +252,7 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             batch_size, parallel_games, mcts_simulations, temperature,
             temp_threshold, replay_buffer_size, train_steps_per_cycle,
             time_budget, target_win_rate, target_games, eval_level,
-            resumed_from, output_dir
+            resumed_from, output_dir, is_benchmark, eval_opponent
         ) VALUES (
             ?, ?, 'running',
             ?, ?, ?, ?, ?,
@@ -252,7 +260,7 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             ?, ?, ?, ?,
             ?, ?, ?,
             ?, ?, ?, ?,
-            ?, ?
+            ?, ?, ?, ?
         )""",
         (
             run_id,
@@ -276,6 +284,8 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             hyperparams.get("eval_level"),
             resumed_from,
             output_dir,
+            1 if is_benchmark else 0,
+            eval_opponent,
         ),
     )
     conn.commit()
