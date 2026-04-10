@@ -425,6 +425,12 @@ def train(args):
     run_id_short = run_id[:8]
     start_time = _time.time()
 
+    # Seed control for reproducibility
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        mx.random.seed(args.seed)
+
     # Resolve effective parameters (CLI args override module constants)
     time_budget = args.time_budget
     eval_level = args.eval_level
@@ -438,6 +444,8 @@ def train(args):
     num_blocks = args.num_blocks
     num_filters = args.num_filters
     buffer_size = args.buffer_size
+    learning_rate = args.learning_rate
+    steps_per_cycle = args.steps_per_cycle
 
     # Detect benchmark mode: fixed budget, minimax only, no resume
     is_benchmark = (
@@ -492,7 +500,7 @@ def train(args):
     hyperparams = {
         "num_res_blocks": num_blocks,
         "num_filters": num_filters,
-        "learning_rate": LEARNING_RATE,
+        "learning_rate": learning_rate,
         "weight_decay": WEIGHT_DECAY,
         "batch_size": BATCH_SIZE,
         "parallel_games": parallel_games,
@@ -500,7 +508,7 @@ def train(args):
         "temperature": TEMPERATURE,
         "temp_threshold": TEMP_THRESHOLD,
         "replay_buffer_size": buffer_size,
-        "train_steps_per_cycle": TRAIN_STEPS_PER_CYCLE,
+        "train_steps_per_cycle": steps_per_cycle,
         "time_budget": time_budget,
         "target_win_rate": target_win_rate,
         "target_games": target_games,
@@ -508,6 +516,8 @@ def train(args):
         "eval_opponent": args.eval_opponent,
         "train_opponent": args.train_opponent,
         "opponent_mix": args.opponent_mix if args.train_opponent else None,
+        "seed": args.seed,
+        "sweep_tag": args.sweep_tag,
     }
     _tracker.create_run(db_conn, run_id, hyperparams, hw_info,
                         resumed_from=resumed_from, output_dir=output_dir,
@@ -528,7 +538,7 @@ def train(args):
 
     # Optimizer
     optimizer = optim.AdamW(
-        learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        learning_rate=learning_rate, weight_decay=WEIGHT_DECAY
     )
 
     # Replay buffer
@@ -739,7 +749,7 @@ def train(args):
                 model.train()
                 cycle_loss = 0.0
                 steps_this_cycle = min(
-                    TRAIN_STEPS_PER_CYCLE,
+                    steps_per_cycle,
                     len(replay_buffer) // BATCH_SIZE
                 )
                 steps_this_cycle = max(steps_this_cycle, 1)
@@ -1187,9 +1197,20 @@ def parse_args() -> argparse.Namespace:
                    help=f"Number of residual blocks (default: {NUM_RES_BLOCKS})")
     p.add_argument("--num-filters", type=int, default=NUM_FILTERS,
                    help=f"Number of convolutional filters (default: {NUM_FILTERS})")
+    # Training dynamics
+    p.add_argument("--learning-rate", type=float, default=LEARNING_RATE,
+                   help=f"Learning rate (default: {LEARNING_RATE})")
+    p.add_argument("--steps-per-cycle", type=int, default=TRAIN_STEPS_PER_CYCLE,
+                   help=f"Training steps per self-play cycle (default: {TRAIN_STEPS_PER_CYCLE})")
     # Replay buffer
     p.add_argument("--buffer-size", type=int, default=REPLAY_BUFFER_SIZE,
                    help=f"Replay buffer capacity (default: {REPLAY_BUFFER_SIZE})")
+    # Reproducibility
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed for reproducibility (default: None = non-deterministic)")
+    # Sweep integration (set by sweep.py, not typically used directly)
+    p.add_argument("--sweep-tag", type=str, default=None,
+                   help=argparse.SUPPRESS)
     # Mixed opponent training
     p.add_argument("--train-opponent", type=str, default=None,
                    help="Train with mixed self-play + games vs a registered NN opponent")

@@ -26,6 +26,9 @@ mag-gomoku/
 │   ├── prepare.py               #   minimax opponents, evaluation (read-only)
 │   ├── train.py                 #   neural network, training loop, plain-text TUI (agent-mutable)
 │   ├── tracker.py               #   SQLite experiment tracking (output/tracker.db)
+│   ├── analyze.py               #   training analysis & sweep matrix (read-only queries)
+│   ├── sweep.py                 #   hyperparameter sweep tool (batch experiments)
+│   ├── tui.py                   #   TUI rendering helpers (sparklines, progress bar)
 │   ├── play.py                  #   human vs AI / AI vs AI gameplay
 │   └── replay.py                #   replay recorded games, export frames for video
 ├── docs/                        # documentation
@@ -80,6 +83,12 @@ uv run python src/train.py --num-blocks 8 --num-filters 64 --target-win-rate 0.8
 # 使用更大 replay buffer
 uv run python src/train.py --buffer-size 100000 --target-win-rate 0.80
 
+# 调整学习率和每 cycle 训练步数
+uv run python src/train.py --learning-rate 3e-4 --steps-per-cycle 50 --target-win-rate 0.80
+
+# 可复现实验（固定随机种子）
+uv run python src/train.py --seed 42 --time-budget 300
+
 # 从上一次训练断点续训（支持短 UUID 前缀）
 uv run python src/train.py --resume c8d815ac --time-budget 600
 
@@ -99,6 +108,9 @@ Each run creates its own directory under `output/<uuid>/` with isolated model, c
 | `--parallel-games` | 64 | 并行自对弈局数（降低可减少 GPU 占用） |
 | `--num-blocks` | 6 | 残差块数量（模型深度） |
 | `--num-filters` | 64 | 卷积通道数（模型宽度） |
+| `--learning-rate` | 5e-4 | 学习率 |
+| `--steps-per-cycle` | 30 | 每个 cycle 的训练步数 |
+| `--seed` | 无 (可选) | 随机种子（random + numpy + MLX），用于可复现实验 |
 | `--buffer-size` | 50000 | Replay buffer 最大样本数 |
 | `--eval-level` | 0 | 对手: 0=random, 1=minimax2, 2=minimax4, 3=minimax6 |
 | `--eval-opponent` | 无 (可选) | 对战注册的 NN 对手（别名），与 eval-level 互不影响 |
@@ -221,7 +233,31 @@ uv run python src/analyze.py --compare 374d567f 1922e0f0     # side-by-side run 
 uv run python src/analyze.py --lineage 1922e0f0              # trace resume chain
 uv run python src/analyze.py --opponents                     # list registered opponents
 uv run python src/analyze.py --stability 374d567f            # training stability report
+uv run python src/analyze.py --matrix sweep1                 # sweep matrix results by tag prefix
 ```
+
+## Hyperparameter sweep
+
+`sweep.py` runs batch experiments with cartesian product of hyperparameters:
+
+```bash
+# Dry-run: preview the experiment matrix
+uv run python src/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
+  --time-budget 120 --tag arch_search --dry-run
+
+# Run the sweep (2 filter × 2 lr × 2 seeds = 8 experiments)
+uv run python src/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
+  --time-budget 120 --tag arch_search
+
+# Resume (skip already-completed configs)
+uv run python src/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
+  --time-budget 120 --tag arch_search --resume
+
+# View results
+uv run python src/analyze.py --matrix arch_search
+```
+
+Sweep axes: `--num-blocks`, `--num-filters`, `--learning-rate`, `--steps-per-cycle`, `--buffer-size` (comma-separated values). Fixed params: `--time-budget` (required), `--seeds`, `--tag`. Passthrough: `--eval-opponent`, `--parallel-games`, `--target-win-rate`.
 
 ## Querying experiment data
 

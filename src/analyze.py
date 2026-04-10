@@ -239,6 +239,87 @@ def cmd_opponents(conn: sqlite3.Connection) -> None:
               f"{wr:>6}  {dt:>12}  {desc}")
 
 
+def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
+    """Show sweep results grouped by tag prefix with aggregated metrics."""
+    import math
+
+    rows = conn.execute(
+        "SELECT id, status, sweep_tag, total_cycles, total_games, "
+        "final_loss, final_win_rate, wall_time_s, num_params, "
+        "learning_rate, train_steps_per_cycle, num_res_blocks, num_filters, "
+        "replay_buffer_size, seed "
+        "FROM runs WHERE sweep_tag IS NOT NULL ORDER BY started_at"
+    ).fetchall()
+
+    # Filter to runs with matching sweep_tag prefix
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        sweep_tag = r["sweep_tag"] or ""
+        if not sweep_tag.startswith(tag_prefix):
+            continue
+        # Strip seed suffix to group by config
+        parts = sweep_tag.rsplit("_sd", 1)
+        base_tag = parts[0] if len(parts) == 2 else sweep_tag
+        seed = parts[1] if len(parts) == 2 else "?"
+
+        entry = {
+            "id": r["id"], "status": r["status"], "seed": seed,
+            "cycles": r["total_cycles"], "games": r["total_games"],
+            "loss": r["final_loss"], "wr": r["final_win_rate"],
+            "wall_s": r["wall_time_s"], "params": r["num_params"],
+            "lr": r["learning_rate"], "spc": r["train_steps_per_cycle"],
+            "nb": r["num_res_blocks"], "nf": r["num_filters"],
+            "buf": r["replay_buffer_size"],
+        }
+        groups.setdefault(base_tag, []).append(entry)
+
+    if not groups:
+        print(f"No runs found with sweep_tag prefix '{tag_prefix}'")
+        return
+
+    # Extract varying axes from hyperparams across groups
+    print(f"Sweep Matrix: {tag_prefix}  ({sum(len(v) for v in groups.values())} runs in {len(groups)} configs)")
+    print("=" * 95)
+    print(f"  {'Config':<35} {'Seeds':>5}  {'WR Mean':>7}  {'WR Std':>6}  "
+          f"{'Loss':>7}  {'Games/s':>7}  {'Params':>8}")
+    print("-" * 95)
+
+    best_wr = -1.0
+    best_tag = ""
+
+    for base_tag in sorted(groups.keys()):
+        runs = groups[base_tag]
+        n = len(runs)
+        wrs = [r["wr"] for r in runs if r["wr"] is not None]
+        losses = [r["loss"] for r in runs if r["loss"] is not None]
+        throughputs = []
+        for r in runs:
+            if r["games"] and r["wall_s"] and r["wall_s"] > 0:
+                throughputs.append(r["games"] / r["wall_s"])
+
+        mean_wr = sum(wrs) / len(wrs) if wrs else 0
+        std_wr = math.sqrt(sum((w - mean_wr)**2 for w in wrs) / len(wrs)) if len(wrs) > 1 else 0
+        mean_loss = sum(losses) / len(losses) if losses else 0
+        mean_thr = sum(throughputs) / len(throughputs) if throughputs else 0
+        params = runs[0]["params"] or 0
+
+        # Short config label: strip the tag prefix
+        label = base_tag[len(tag_prefix) + 1:] if base_tag.startswith(tag_prefix + "_") else base_tag
+
+        marker = ""
+        if mean_wr > best_wr:
+            best_wr = mean_wr
+            best_tag = label
+
+        print(f"  {label:<35} {n:>5}  {mean_wr:>6.1%}  {std_wr:>5.1%}  "
+              f"{mean_loss:>7.3f}  {mean_thr:>6.1f}/s  {params:>8.0f}")
+
+    print("-" * 95)
+    if best_tag:
+        print(f"  Best mean WR: {best_tag}  ({best_wr:.1%})")
+    print()
+
+
 def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
     """Show training stability metrics for a run."""
     import math
@@ -353,6 +434,8 @@ def main():
                        help="List registered opponents")
     group.add_argument("--stability", metavar="RUN_ID",
                        help="Training stability report for a run")
+    group.add_argument("--matrix", metavar="TAG_PREFIX",
+                       help="Sweep matrix results grouped by tag prefix")
 
     args = parser.parse_args()
     conn = _connect()
@@ -371,6 +454,8 @@ def main():
         cmd_opponents(conn)
     elif args.stability:
         cmd_stability(conn, args.stability)
+    elif args.matrix:
+        cmd_matrix(conn, args.matrix)
 
     conn.close()
 

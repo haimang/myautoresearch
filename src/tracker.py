@@ -170,6 +170,12 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE opponents ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    # v9 migration: sweep tag and seed for experiment tracking
+    for col, typ in [("sweep_tag", "TEXT"), ("seed", "INTEGER")]:
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     return conn
 
@@ -258,7 +264,8 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             batch_size, parallel_games, mcts_simulations, temperature,
             temp_threshold, replay_buffer_size, train_steps_per_cycle,
             time_budget, target_win_rate, target_games, eval_level,
-            resumed_from, output_dir, is_benchmark, eval_opponent
+            resumed_from, output_dir, is_benchmark, eval_opponent,
+            sweep_tag, seed
         ) VALUES (
             ?, ?, 'running',
             ?, ?, ?, ?, ?,
@@ -266,7 +273,8 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             ?, ?, ?, ?,
             ?, ?, ?,
             ?, ?, ?, ?,
-            ?, ?, ?, ?
+            ?, ?, ?, ?,
+            ?, ?
         )""",
         (
             run_id,
@@ -292,6 +300,8 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             output_dir,
             1 if is_benchmark else 0,
             eval_opponent,
+            hyperparams.get("sweep_tag"),
+            hyperparams.get("seed"),
         ),
     )
     conn.commit()
