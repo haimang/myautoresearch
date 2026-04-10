@@ -50,15 +50,16 @@ def cmd_runs(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """SELECT id, status, started_at, total_cycles, total_games,
                   final_loss, final_win_rate, wall_time_s, eval_level,
-                  is_benchmark, eval_opponent, resumed_from
+                  is_benchmark, eval_opponent, resumed_from,
+                  num_res_blocks, num_filters, num_params
            FROM runs ORDER BY started_at DESC"""
     ).fetchall()
     if not rows:
         print("No runs found.")
         return
     print(f"{'Run':>10}  {'Status':>11}  {'Cycles':>6}  {'Games':>6}  "
-          f"{'Loss':>7}  {'WR':>6}  {'Time':>7}  {'Opp':>6}  {'Type':>12}")
-    print("-" * 90)
+          f"{'Loss':>7}  {'WR':>6}  {'Time':>7}  {'Opp':>6}  {'Model':>8}  {'Type':>12}")
+    print("-" * 105)
     for r in rows:
         rid = r["id"][:8]
         st = r["status"] or "?"
@@ -70,8 +71,11 @@ def cmd_runs(conn: sqlite3.Connection) -> None:
         opp = r["eval_opponent"] if r["eval_opponent"] else f"L{r['eval_level'] or 0}"
         bm = "benchmark" if r["is_benchmark"] else "exploratory"
         resumed = " (resumed)" if r["resumed_from"] else ""
+        nb = r["num_res_blocks"] or "?"
+        nf = r["num_filters"] or "?"
+        model_str = f"{nb}x{nf}"
         print(f"{rid:>10}  {st:>11}  {str(cyc):>6}  {str(gm):>6}  "
-              f"{loss:>7}  {wr:>6}  {wt:>7}  {opp:>6}  {bm}{resumed}")
+              f"{loss:>7}  {wr:>6}  {wt:>7}  {opp:>6}  {model_str:>8}  {bm}{resumed}")
 
 
 def cmd_best(conn: sqlite3.Connection) -> None:
@@ -138,6 +142,7 @@ def cmd_compare(conn: sqlite3.Connection, run_a: str, run_b: str) -> None:
 
     fields = [
         ("Status", "status"),
+        ("Model", None),  # special handling
         ("Cycles", "total_cycles"),
         ("Games", "total_games"),
         ("Steps", "total_steps"),
@@ -148,6 +153,7 @@ def cmd_compare(conn: sqlite3.Connection, run_a: str, run_b: str) -> None:
         ("Eval Level", "eval_level"),
         ("Opponent", "eval_opponent"),
         ("Benchmark", "is_benchmark"),
+        ("Buffer Size", "replay_buffer_size"),
         ("Batch Size", "batch_size"),
         ("Parallel", "parallel_games"),
     ]
@@ -155,6 +161,11 @@ def cmd_compare(conn: sqlite3.Connection, run_a: str, run_b: str) -> None:
     print(f"{'':>16}  {a['id'][:8]:>14}  {b['id'][:8]:>14}")
     print("-" * 50)
     for label, key in fields:
+        if key is None and label == "Model":
+            va = f"{a.get('num_res_blocks') or '?'}x{a.get('num_filters') or '?'} ({a.get('num_params') or 0:.0f})"
+            vb = f"{b.get('num_res_blocks') or '?'}x{b.get('num_filters') or '?'} ({b.get('num_params') or 0:.0f})"
+            print(f"{label:>16}  {va:>14}  {vb:>14}")
+            continue
         va = a.get(key, "-")
         vb = b.get(key, "-")
         if key == "final_win_rate":

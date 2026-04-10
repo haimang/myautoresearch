@@ -71,6 +71,15 @@ uv run python src/train.py --eval-level 1 --target-win-rate 0.80
 # 对战注册的 NN 对手训练
 uv run python src/train.py --eval-opponent L0 --target-win-rate 0.80
 
+# 混合对手训练（20% 对局 vs 注册对手，80% 自对弈）
+uv run python src/train.py --eval-opponent L0 --train-opponent L0 --opponent-mix 0.2 --target-win-rate 0.80
+
+# 使用更大模型（8 残差块 × 64 通道，~713K 参数）
+uv run python src/train.py --num-blocks 8 --num-filters 64 --target-win-rate 0.80
+
+# 使用更大 replay buffer
+uv run python src/train.py --buffer-size 100000 --target-win-rate 0.80
+
 # 从上一次训练断点续训（支持短 UUID 前缀）
 uv run python src/train.py --resume c8d815ac --time-budget 600
 
@@ -88,8 +97,13 @@ Each run creates its own directory under `output/<uuid>/` with isolated model, c
 | `--target-win-rate` | 无 (可选) | 达到此平滑胜率后停止 |
 | `--target-games` | 无 (可选) | 达到此局数后停止 |
 | `--parallel-games` | 64 | 并行自对弈局数（降低可减少 GPU 占用） |
+| `--num-blocks` | 6 | 残差块数量（模型深度） |
+| `--num-filters` | 64 | 卷积通道数（模型宽度） |
+| `--buffer-size` | 50000 | Replay buffer 最大样本数 |
 | `--eval-level` | 0 | 对手: 0=random, 1=minimax2, 2=minimax4, 3=minimax6 |
 | `--eval-opponent` | 无 (可选) | 对战注册的 NN 对手（别名），与 eval-level 互不影响 |
+| `--train-opponent` | 无 (可选) | 混合训练时的 NN 对手（别名） |
+| `--opponent-mix` | 0.25 | 混合训练对手对局占比（0.0–1.0） |
 | `--eval-interval` | 15 | 每 N 个 cycle 做一次 probe 评估 |
 | `--probe-games` | 50 | probe 评估的游戏数 |
 | `--probe-window` | 3 | 平滑胜率的滑动窗口大小 |
@@ -235,7 +249,7 @@ sqlite3 -header -column output/tracker.db "SELECT alias, win_rate, eval_level, s
 
 ## Hardware
 
-Tested on M3 Max 128GB. The model is tiny (~564K params) — any Apple Silicon Mac will work. Default config: 64 parallel self-play games, 6 residual blocks, 64 filters. Training uses D4 board symmetry augmentation (8x effective data), recency-weighted replay buffer, and gradual temperature decay.
+Tested on M3 Max 128GB. The model is tiny (~564K params default) — any Apple Silicon Mac will work. Model architecture is configurable via `--num-blocks` and `--num-filters` (e.g. 8×64 = ~713K, 6×96 = ~1.1M). Default config: 64 parallel self-play games, 6 residual blocks, 64 filters. Training uses D4 board symmetry augmentation (8× effective data), recency-weighted replay buffer, gradual temperature decay, and optional mixed opponent training.
 
 ## License
 

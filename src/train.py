@@ -269,6 +269,93 @@ def run_self_play(model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE):
     return all_training_data, num_games, avg_game_len
 
 
+def run_opponent_play(model, opponent_model, num_games: int,
+                      temperature: float = TEMPERATURE) -> tuple[list, int, float]:
+    """
+    Play games where `model` faces `opponent_model`.
+    Each game: model plays one colour, opponent the other (alternating).
+    Training data is collected only from the model's perspective.
+
+    Returns (training_data, games_completed, avg_game_length).
+    """
+    from game import Board
+
+    model.eval()
+    opponent_model.eval()
+
+    all_data: list[tuple[np.ndarray, np.ndarray, float]] = []
+    game_lengths: list[int] = []
+
+    for game_i in range(num_games):
+        nn_is_black = game_i < num_games // 2
+        nn_player = BLACK if nn_is_black else WHITE
+
+        board = Board()
+        # Collect (encoded, policy_dist) for each model move
+        model_moves: list[tuple[np.ndarray, np.ndarray, int]] = []
+
+        while not board.is_terminal():
+            if board.current_player == nn_player:
+                # Model's turn — with temperature exploration
+                encoded = board.encode()
+                x = mx.array(encoded[np.newaxis, ...])
+                logits, _ = model(x)
+                mx.eval(logits)
+                logits_np = np.array(logits[0])
+                legal_mask = board.get_legal_mask()
+                logits_np[legal_mask == 0] = -1e9
+
+                move_num = board.move_count
+                if TEMP_THRESHOLD > 0 and move_num < TEMP_THRESHOLD:
+                    frac = move_num / TEMP_THRESHOLD
+                    temp = temperature * (1.0 - frac) + 0.3 * frac
+                else:
+                    temp = 0.3
+
+                if temp < 0.01:
+                    action = int(np.argmax(logits_np))
+                    policy_dist = np.zeros(BOARD_SIZE * BOARD_SIZE, dtype=np.float32)
+                    policy_dist[action] = 1.0
+                else:
+                    scaled = logits_np / temp
+                    scaled -= np.max(scaled)
+                    probs = np.exp(scaled)
+                    probs_sum = probs.sum()
+                    if probs_sum > 0:
+                        probs /= probs_sum
+                    else:
+                        probs = legal_mask.copy()
+                        probs /= probs.sum()
+                    action = np.random.choice(BOARD_SIZE * BOARD_SIZE, p=probs)
+                    policy_dist = probs
+
+                model_moves.append((encoded, policy_dist, nn_player))
+                row, col = divmod(action, BOARD_SIZE)
+            else:
+                # Opponent's turn
+                row, col = _nn_opponent_move(opponent_model, board)
+
+            board.place(row, col)
+
+        # Determine value targets
+        winner = board.winner
+        game_lengths.append(board.move_count)
+        for encoded, policy_dist, player in model_moves:
+            if winner == -1:
+                value_target = 0.0
+            elif winner == player:
+                value_target = 1.0
+            else:
+                value_target = -1.0
+            all_data.append((encoded, policy_dist, value_target))
+
+        if game_i % 20 == 0:
+            mx.clear_cache()
+
+    avg_game_len = sum(game_lengths) / len(game_lengths) if game_lengths else 0.0
+    return all_data, num_games, avg_game_len
+
+
 def _collect_game_with_policies(batch, game_idx, policies):
     """
     Collect training data for a finished game, pairing each move's
@@ -348,6 +435,9 @@ def train(args):
     target_games = args.target_games
     parallel_games = args.parallel_games
     probe_window = args.probe_window
+    num_blocks = args.num_blocks
+    num_filters = args.num_filters
+    buffer_size = args.buffer_size
 
     # Detect benchmark mode: fixed budget, minimax only, no resume
     is_benchmark = (
@@ -400,8 +490,8 @@ def train(args):
     hw_info = _tracker.collect_hardware_info()
 
     hyperparams = {
-        "num_res_blocks": NUM_RES_BLOCKS,
-        "num_filters": NUM_FILTERS,
+        "num_res_blocks": num_blocks,
+        "num_filters": num_filters,
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
         "batch_size": BATCH_SIZE,
@@ -409,13 +499,15 @@ def train(args):
         "mcts_simulations": MCTS_SIMULATIONS,
         "temperature": TEMPERATURE,
         "temp_threshold": TEMP_THRESHOLD,
-        "replay_buffer_size": REPLAY_BUFFER_SIZE,
+        "replay_buffer_size": buffer_size,
         "train_steps_per_cycle": TRAIN_STEPS_PER_CYCLE,
         "time_budget": time_budget,
         "target_win_rate": target_win_rate,
         "target_games": target_games,
         "eval_level": eval_level,
         "eval_opponent": args.eval_opponent,
+        "train_opponent": args.train_opponent,
+        "opponent_mix": args.opponent_mix if args.train_opponent else None,
     }
     _tracker.create_run(db_conn, run_id, hyperparams, hw_info,
                         resumed_from=resumed_from, output_dir=output_dir,
@@ -424,9 +516,10 @@ def train(args):
 
     # Initialize model
     if resume_model_path and os.path.exists(resume_model_path):
-        model = load_model(resume_model_path)
+        model = load_model(resume_model_path, num_blocks=num_blocks,
+                           num_filters=num_filters)
     else:
-        model = GomokuNet()
+        model = GomokuNet(num_blocks=num_blocks, num_filters=num_filters)
     dummy = mx.zeros((1, 3, BOARD_SIZE, BOARD_SIZE))
     _ = model(dummy)
     mx.eval(model.parameters())
@@ -463,10 +556,35 @@ def train(args):
         if not os.path.exists(opp["model_path"]):
             print(f"Error: opponent model file not found: {opp['model_path']}")
             sys.exit(1)
-        opponent_model = load_model(opp["model_path"])
+        opp_nb = opp.get("num_res_blocks") or NUM_RES_BLOCKS
+        opp_nf = opp.get("num_filters") or NUM_FILTERS
+        opponent_model = load_model(opp["model_path"],
+                                    num_blocks=opp_nb, num_filters=opp_nf)
         opponent_model.eval()
         mx.eval(opponent_model.parameters())
-        print(f"Loaded NN opponent '{eval_opponent_alias}' from {opp['model_path']}")
+        print(f"Loaded NN opponent '{eval_opponent_alias}' ({opp_nb}x{opp_nf}) "
+              f"from {opp['model_path']}")
+
+    # NN training opponent (if --train-opponent specified)
+    train_opponent_alias: str | None = args.train_opponent
+    train_opponent_model = None
+    opponent_mix: float = args.opponent_mix if train_opponent_alias else 0.0
+    if train_opponent_alias:
+        opp = _tracker.get_opponent(db_conn, train_opponent_alias)
+        if not opp:
+            print(f"Error: train-opponent '{train_opponent_alias}' not found")
+            sys.exit(1)
+        if not os.path.exists(opp["model_path"]):
+            print(f"Error: train-opponent model not found: {opp['model_path']}")
+            sys.exit(1)
+        opp_nb = opp.get("num_res_blocks") or NUM_RES_BLOCKS
+        opp_nf = opp.get("num_filters") or NUM_FILTERS
+        train_opponent_model = load_model(opp["model_path"],
+                                          num_blocks=opp_nb, num_filters=opp_nf)
+        train_opponent_model.eval()
+        mx.eval(train_opponent_model.parameters())
+        print(f"Loaded train-opponent '{train_opponent_alias}' ({opp_nb}x{opp_nf}) "
+              f"(mix={opponent_mix:.0%}) from {opp['model_path']}")
 
     # History for sparklines
     loss_history: list[float] = []
@@ -525,9 +643,10 @@ def train(args):
         sm_wr = _smoothed_wr()
         sm_str = f" avg:{sm_wr:.0%}" if sm_wr is not None and len(wr_history) > 1 else ""
         opp_str = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
+        mix_str = f" mix:{train_opponent_alias}({opponent_mix:.0%})" if train_opponent_alias else ""
         lines.append(row(f"  Cycle  {cycle:>6d}  │  Loss    {last_loss:>8.4f}  │  Games  {total_games:>7d}"))
         lines.append(row(f"  Steps  {total_train_steps:>6d}  │  Buffer  {len(replay_buffer):>8d}  │  WR {wr_str:>5}{sm_str}"))
-        lines.append(row(f"  Gm/s   {gps:>6.1f}  │  AvgLen  {avg_game_length:>8.1f}  │  vs {opp_str}  Ckpts:{num_checkpoints}"))
+        lines.append(row(f"  Gm/s   {gps:>6.1f}  │  AvgLen  {avg_game_length:>8.1f}  │  vs {opp_str}{mix_str}"))
 
         # --- Charts block (WR + Loss, each 2-row height) ---
         CW = 40  # chart width
@@ -583,16 +702,33 @@ def train(args):
 
             cycle += 1
 
-            # ----- Self-play -----
+            # ----- Self-play (+ optional opponent games) -----
             model.eval()
+            if train_opponent_model and opponent_mix > 0 and parallel_games >= 2:
+                n_opp = max(1, int(parallel_games * opponent_mix))
+                n_self = max(1, parallel_games - n_opp)
+            else:
+                n_opp = 0
+                n_self = parallel_games
+
             data, games_done, avg_gl = run_self_play(
-                model, num_games=parallel_games, temperature=TEMPERATURE
+                model, num_games=n_self, temperature=TEMPERATURE
             )
             total_games += games_done
             avg_game_length = avg_gl
 
+            if n_opp > 0 and train_opponent_model is not None:
+                opp_data, opp_done, opp_gl = run_opponent_play(
+                    model, train_opponent_model, n_opp, temperature=TEMPERATURE
+                )
+                data.extend(opp_data)
+                total_games += opp_done
+                # Weighted average of game lengths
+                total_g = games_done + opp_done
+                avg_game_length = (avg_gl * games_done + opp_gl * opp_done) / total_g if total_g > 0 else 0.0
+
             for item in data:
-                if len(replay_buffer) >= REPLAY_BUFFER_SIZE:
+                if len(replay_buffer) >= buffer_size:
                     idx = random.randint(0, len(replay_buffer) - 1)
                     replay_buffer[idx] = item
                 else:
@@ -688,6 +824,7 @@ def train(args):
                         start_time, events, _log_event,
                         ckpt_dir, recording_dir,
                         threshold=crossed,
+                        num_blocks=num_blocks, num_filters=num_filters,
                     )
                     last_ckpt_wr = effective_wr
                     num_checkpoints += 1
@@ -742,6 +879,7 @@ def train(args):
         result = _subprocess_eval(
             model_path, eval_level, full_eval_games, tag, run_id,
             recording_dir=recording_dir,
+            num_blocks=num_blocks, num_filters=num_filters,
         )
         if result:
             final_wr = result.get("win_rate", final_wr)
@@ -799,6 +937,9 @@ def train(args):
     opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
     print(f"Run:        {run_id_short}{resumed_str} ({stop_reason}) [{prov_label}]")
     print(f"Opponent:   {opp_label}")
+    if train_opponent_alias:
+        print(f"Train-opp:  {train_opponent_alias} (mix={opponent_mix:.0%})")
+    print(f"Model:      {num_blocks}x{num_filters} ({num_params/1000:.1f}K params)")
     print(f"Cycles:     {cycle - initial_cycle} (total cycle #{cycle})")
     print(f"Games:      {total_games}")
     print(f"Steps:      {total_train_steps}")
@@ -899,12 +1040,21 @@ def _nn_opponent_move(opp_model, board, temperature: float = 0.5) -> tuple[int, 
 
 def _subprocess_eval(model_path: str, level: int, n_games: int,
                      tag: str, run_id: str,
-                     recording_dir: str = "") -> dict | None:
+                     recording_dir: str = "",
+                     num_blocks: int = NUM_RES_BLOCKS,
+                     num_filters: int = NUM_FILTERS) -> dict | None:
     """Run full evaluation in subprocess, return parsed result dict."""
     src_dir = os.path.dirname(os.path.abspath(__file__))
     env = {**os.environ, "PYTHONPATH": src_dir, "PYTHONUNBUFFERED": "1"}
     rec_arg = f", recording_dir='{recording_dir}'" if recording_dir else ""
+    # Monkey-patch load_model so prepare.py uses correct architecture
+    patch = (
+        f"import train; "
+        f"_orig = train.load_model; "
+        f"train.load_model = lambda p, **kw: _orig(p, num_blocks={num_blocks}, num_filters={num_filters}); "
+    )
     code = (
+        f"{patch}"
         f"import json; from prepare import evaluate_win_rate; "
         f"r = evaluate_win_rate('{model_path}', level={level}, "
         f"n_games={n_games}, record_games={n_games}, "
@@ -936,7 +1086,8 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
                    total_steps, loss, win_rate, eval_level,
                    full_eval_games, num_params, start_time,
                    events, log_event_fn, ckpt_dir, recording_dir,
-                   threshold=None):
+                   threshold=None,
+                   num_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS):
     """Save checkpoint, run full eval in subprocess, record to DB."""
     import tracker as _tracker
 
@@ -953,6 +1104,7 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
     result = _subprocess_eval(
         ckpt_path, eval_level, full_eval_games, tag, run_id,
         recording_dir=recording_dir,
+        num_blocks=num_blocks, num_filters=num_filters,
     )
 
     if result:
@@ -1030,6 +1182,19 @@ def parse_args() -> argparse.Namespace:
                    help="Games per full evaluation at checkpoint (default: 200)")
     p.add_argument("--parallel-games", type=int, default=PARALLEL_GAMES,
                    help=f"Number of simultaneous self-play games (default: {PARALLEL_GAMES})")
+    # Model capacity
+    p.add_argument("--num-blocks", type=int, default=NUM_RES_BLOCKS,
+                   help=f"Number of residual blocks (default: {NUM_RES_BLOCKS})")
+    p.add_argument("--num-filters", type=int, default=NUM_FILTERS,
+                   help=f"Number of convolutional filters (default: {NUM_FILTERS})")
+    # Replay buffer
+    p.add_argument("--buffer-size", type=int, default=REPLAY_BUFFER_SIZE,
+                   help=f"Replay buffer capacity (default: {REPLAY_BUFFER_SIZE})")
+    # Mixed opponent training
+    p.add_argument("--train-opponent", type=str, default=None,
+                   help="Train with mixed self-play + games vs a registered NN opponent")
+    p.add_argument("--opponent-mix", type=float, default=0.2,
+                   help="Fraction of games played vs train-opponent (default: 0.2)")
     p.add_argument("--resume", type=str, default=None,
                    help="UUID of a previous run to resume from its last checkpoint")
     # Opponent registration (non-training mode)
@@ -1087,13 +1252,17 @@ def _handle_register_opponent(args: argparse.Namespace) -> None:
         win_rate=ckpt.get("win_rate"),
         eval_level=ckpt.get("eval_level"),
         description=args.description,
+        num_res_blocks=run.get("num_res_blocks"),
+        num_filters=run.get("num_filters"),
     )
     conn.close()
 
+    nb = run.get("num_res_blocks") or NUM_RES_BLOCKS
+    nf = run.get("num_filters") or NUM_FILTERS
     print(f"✓ Registered opponent '{alias}'")
     print(f"  Source: run {resolved_run_id[:8]} / {ckpt['tag']}")
     print(f"  WR: {ckpt.get('win_rate', 0):.1%}  Level: L{ckpt.get('eval_level', '?')}")
-    print(f"  Model: {dst_path}")
+    print(f"  Model: {dst_path} ({nb}x{nf})")
     sys.exit(0)
 
 

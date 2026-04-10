@@ -164,6 +164,12 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    # v8 migration: opponent architecture metadata
+    for col, typ in [("num_res_blocks", "INTEGER"), ("num_filters", "INTEGER")]:
+        try:
+            conn.execute(f"ALTER TABLE opponents ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     return conn
 
@@ -552,16 +558,20 @@ def register_opponent(conn: sqlite3.Connection, alias: str,
                       source_tag: Optional[str] = None,
                       win_rate: Optional[float] = None,
                       eval_level: Optional[int] = None,
-                      description: Optional[str] = None) -> None:
+                      description: Optional[str] = None,
+                      num_res_blocks: Optional[int] = None,
+                      num_filters: Optional[int] = None) -> None:
     """Register a model checkpoint as a named opponent."""
     conn.execute(
         """INSERT OR REPLACE INTO opponents (
             alias, source_run, source_tag, model_path,
-            win_rate, eval_level, description, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            win_rate, eval_level, description, created_at,
+            num_res_blocks, num_filters
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (alias, source_run, source_tag, model_path,
          win_rate, eval_level, description,
-         datetime.now(timezone.utc).isoformat()),
+         datetime.now(timezone.utc).isoformat(),
+         num_res_blocks, num_filters),
     )
     conn.commit()
 
