@@ -1,0 +1,14 @@
+[project]
+name = "mag-gomoku"
+version = "0.1.0"
+description = "Gomoku AI trained via autoresearch loop on Apple Silicon (MLX)"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx>=0.22.0",
+    "numpy>=1.26.0",
+    "pygame>=2.5.0",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends._legacy:_Backend"
