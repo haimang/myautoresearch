@@ -22,13 +22,13 @@ mag-gomoku/
 ├── src/                         # Python source code
 │   ├── game.py                  #   board engine, pygame renderer, batched self-play (read-only)
 │   ├── prepare.py               #   minimax opponents, evaluation (read-only)
-│   ├── train.py                 #   neural network, training loop, Rich TUI (agent-mutable)
+│   ├── train.py                 #   neural network, training loop, plain-text TUI (agent-mutable)
 │   ├── tracker.py               #   SQLite experiment tracking (output/tracker.db)
 │   ├── play.py                  #   human vs AI / AI vs AI gameplay
 │   └── replay.py                #   replay recorded games, export frames for video
 ├── docs/                        # documentation
 │   ├── program.md               #   autonomous experiment protocol (agent reads this)
-│   └── action-plan.md           #   project plan, dev log & troubleshooting
+│   └── caveats.md               #   pitfall records & troubleshooting notes
 ├── output/                      # generated artifacts (gitignored)
 │   ├── tracker.db               #   SQLite database — global index across all runs
 │   └── <uuid>/                  #   per-run output directory
@@ -43,29 +43,32 @@ mag-gomoku/
 
 ## Training
 
-The training script features a Rich TUI dashboard, automatic checkpoint export at win-rate milestones, and full experiment tracking via SQLite.
+The training script features a plain-text dashboard with sparkline charts, automatic checkpoint export at win-rate milestones, and full experiment tracking via SQLite.
 
 ```bash
-# 默认 5 分钟训练
+# 默认训练（无时间限制时自动设 300 秒安全限）
 uv run python src/train.py
 
 # 训练到 80% 胜率停止（无时间限制）
-uv run python src/train.py --target-win-rate 0.80 --time-budget 3600
+uv run python src/train.py --target-win-rate 0.80
 
 # 10 分钟快速训练，每 5 cycle 评估一次
 uv run python src/train.py --time-budget 600 --eval-interval 5
 
 # 长时间训练到 95% 胜率，详细评估
-uv run python src/train.py --target-win-rate 0.95 --time-budget 7200 --probe-games 100 --full-eval-games 200
+uv run python src/train.py --target-win-rate 0.95 --time-budget 7200 --probe-games 100
+
+# 低负载持久训练（16 并行对局，降低 GPU 占用）
+uv run python src/train.py --target-win-rate 0.80 --parallel-games 16
 
 # 对战 minimax depth-2 对手训练
-uv run python src/train.py --eval-level 1 --target-win-rate 0.80 --time-budget 3600
+uv run python src/train.py --eval-level 1 --target-win-rate 0.80
 
-# 从上一次训练断点续训
-uv run python src/train.py --resume <uuid> --time-budget 600
+# 从上一次训练断点续训（支持短 UUID 前缀）
+uv run python src/train.py --resume c8d815ac --time-budget 600
 
 # 后台运行并记录日志
-PYTHONUNBUFFERED=1 uv run python src/train.py --target-win-rate 0.80 --time-budget 3600 > output/train.log 2>&1 &
+PYTHONUNBUFFERED=1 uv run python src/train.py --target-win-rate 0.80 > output/train.log 2>&1 &
 ```
 
 Each run creates its own directory under `output/<uuid>/` with isolated model, checkpoints, and recordings.
@@ -74,13 +77,16 @@ Each run creates its own directory under `output/<uuid>/` with isolated model, c
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--time-budget` | 300 | 最大训练时间（秒） |
-| `--target-win-rate` | 1.0 | 达到此胜率后停止 |
+| `--time-budget` | 无 (可选) | 最大训练时间（秒），不设则无限运行直到达标 |
+| `--target-win-rate` | 无 (可选) | 达到此平滑胜率后停止 |
+| `--target-games` | 无 (可选) | 达到此局数后停止 |
+| `--parallel-games` | 64 | 并行自对弈局数（降低可减少 GPU 占用） |
 | `--eval-level` | 0 | 对手: 0=random, 1=minimax2, 2=minimax4, 3=minimax6 |
-| `--eval-interval` | 10 | 每 N 个 cycle 做一次 probe 评估 |
+| `--eval-interval` | 15 | 每 N 个 cycle 做一次 probe 评估 |
 | `--probe-games` | 50 | probe 评估的游戏数 |
+| `--probe-window` | 3 | 平滑胜率的滑动窗口大小 |
 | `--full-eval-games` | 200 | checkpoint 完整评估的游戏数 |
-| `--resume` | — | 从指定 UUID 的最新 checkpoint 续训 |
+| `--resume` | — | 从指定 UUID 的最新 checkpoint 续训（支持短前缀） |
 
 ### Checkpoint milestones
 

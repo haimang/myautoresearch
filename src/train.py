@@ -301,7 +301,7 @@ def compute_loss(model, batch_boards, batch_policies, batch_values):
 # ---------------------------------------------------------------------------
 
 def train(args):
-    """Main training function with checkpoint tracking and Rich TUI."""
+    """Main training function with checkpoint tracking and text TUI."""
     import tracker as _tracker
 
     run_id = str(uuid.uuid4())
@@ -316,6 +316,13 @@ def train(args):
     full_eval_games = args.full_eval_games
     target_win_rate = args.target_win_rate
     target_games = args.target_games
+    parallel_games = args.parallel_games
+    probe_window = args.probe_window
+
+    # Ensure at least one stop condition
+    if time_budget is None and target_win_rate is None and target_games is None:
+        print("Warning: no stop condition set, defaulting to --time-budget 300")
+        time_budget = 300
 
     # --- Output paths (per-run UUID directory) ---
     output_dir = f"output/{run_id}"
@@ -337,15 +344,16 @@ def train(args):
         if not old_run:
             print(f"Error: run '{args.resume}' not found in tracker.db")
             sys.exit(1)
-        latest_ckpt = _tracker.get_latest_checkpoint(db_tmp, args.resume)
+        resolved_id = old_run["id"]
+        latest_ckpt = _tracker.get_latest_checkpoint(db_tmp, resolved_id)
         if not latest_ckpt:
-            print(f"Error: no checkpoint found for run '{args.resume}'")
+            print(f"Error: no checkpoint found for run '{resolved_id[:8]}'")
             sys.exit(1)
-        resumed_from = args.resume
+        resumed_from = resolved_id
         resume_model_path = latest_ckpt["model_path"]
         initial_cycle = latest_ckpt["cycle"]
         initial_ckpt_wr = latest_ckpt["win_rate"]
-        print(f"Resuming from run {args.resume[:8]}  "
+        print(f"Resuming from run {resolved_id[:8]}  "
               f"cycle={initial_cycle}  wr={initial_ckpt_wr:.1%}  "
               f"model={resume_model_path}")
         db_tmp.close()
@@ -360,7 +368,7 @@ def train(args):
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
         "batch_size": BATCH_SIZE,
-        "parallel_games": PARALLEL_GAMES,
+        "parallel_games": parallel_games,
         "mcts_simulations": MCTS_SIMULATIONS,
         "temperature": TEMPERATURE,
         "temp_threshold": TEMP_THRESHOLD,
@@ -410,102 +418,85 @@ def train(args):
     # Loss and grad function
     loss_and_grad = nn.value_and_grad(model, compute_loss)
 
-    # --- Rich TUI setup ---
+    # --- Plain text TUI ---
     use_tui = sys.stdout.isatty()
-    live = None
     events: list[str] = []
 
-    if use_tui:
-        try:
-            from rich.live import Live
-            from rich.layout import Layout
-            from rich.panel import Panel
-            from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
-            from rich.table import Table
-            from rich.text import Text
+    def _sparkline(values: list[float], width: int = 30) -> str:
+        if not values:
+            return ""
+        chars = "▁▂▃▄▅▆▇█"
+        recent = values[-width:]
+        lo, hi = min(recent), max(recent)
+        span = hi - lo if hi > lo else 1.0
+        return "".join(chars[min(int((v - lo) / span * 7), 7)] for v in recent)
 
-            progress = Progress(
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(bar_width=40),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TimeElapsedColumn(),
-                TextColumn("/"),
-                TimeRemainingColumn(),
-            )
-            task_id = progress.add_task("Training", total=time_budget)
+    def _smoothed_wr(window: int = probe_window) -> float | None:
+        """Sliding average of recent probe WRs for stable decisions."""
+        if not wr_history:
+            return None
+        w = min(window, len(wr_history))
+        return sum(wr_history[-w:]) / w
 
-            def _sparkline(values: list[float], width: int = 30) -> str:
-                if not values:
-                    return ""
-                chars = "▁▂▃▄▅▆▇█"
-                recent = values[-width:]
-                lo, hi = min(recent), max(recent)
-                span = hi - lo if hi > lo else 1.0
-                return "".join(chars[min(int((v - lo) / span * 7), 7)] for v in recent)
+    def _progress_bar(elapsed: float, budget: float | None, width: int = 34) -> str:
+        if budget is None or budget <= 0:
+            return ""
+        frac = min(elapsed / budget, 1.0)
+        filled = int(frac * width)
+        bar = "━" * filled + "─" * (width - filled)
+        em, es = divmod(int(elapsed), 60)
+        bm, bs = divmod(int(budget), 60)
+        return f"{bar} {frac:3.0%} {em}:{es:02d} / {bm}:{bs:02d}"
 
-            def build_display() -> Panel:
-                # Metrics table
-                tbl = Table(show_header=False, box=None, padding=(0, 2))
-                tbl.add_column(style="bold cyan", width=12)
-                tbl.add_column(width=12)
-                tbl.add_column(style="bold cyan", width=12)
-                tbl.add_column(width=12)
-                tbl.add_column(style="bold cyan", width=14)
-                tbl.add_column(width=14)
+    def _draw_panel():
+        """Render the full text TUI panel."""
+        W = 62  # inner width
+        chip = hw_info.get("chip", "")
+        elapsed = _time.time() - start_time
 
-                wr_str = f"{last_probe_wr:.1%}" if last_probe_wr is not None else "—"
-                next_t = _tracker.next_threshold(last_ckpt_wr)
-                next_str = f"→ {next_t:.0%}" if next_t else "—"
+        lines = []
+        lines.append("╭" + "─" * W + "╮")
+        hdr = f" Run: {run_id_short}  {chip}  {num_params/1000:.1f}K params"
+        lines.append("│" + hdr.ljust(W) + "│")
+        if time_budget is not None:
+            pbar = " " + _progress_bar(elapsed, time_budget)
+            lines.append("│" + pbar.ljust(W) + "│")
+        else:
+            tgt = f"  Target: {target_win_rate:.0%} WR" if target_win_rate else ""
+            em, es = divmod(int(elapsed), 60)
+            info = f" Elapsed: {em}:{es:02d}{tgt}"
+            lines.append("│" + info.ljust(W) + "│")
+        lines.append("├" + "─" * W + "┤")
+        wr_str = f"{last_probe_wr:.1%}" if last_probe_wr is not None else "—"
+        sm_wr = _smoothed_wr()
+        sm_str = f" avg:{sm_wr:.1%}" if sm_wr is not None and len(wr_history) > 1 else ""
+        r1 = f"  Cycle {cycle:5d}  │  Loss {last_loss:8.4f}  │  Games {total_games:7d}"
+        lines.append("│" + r1.ljust(W) + "│")
+        r2 = f"  Steps {total_train_steps:5d}  │  Buffer {len(replay_buffer):5d}  │  WR {wr_str}{sm_str} (L{eval_level})"
+        lines.append("│" + r2.ljust(W) + "│")
+        if loss_history or wr_history:
+            lines.append("├" + "─" * W + "┤")
+            if wr_history:
+                spark = _sparkline(wr_history)
+                wr_last = wr_history[-1]
+                sl = f"  Win Rate {spark} {wr_last:.0%}"
+                lines.append("│" + sl.ljust(W) + "│")
+            if loss_history:
+                spark = _sparkline(loss_history)
+                sl = f"  Loss     {spark} {last_loss:.2f}"
+                lines.append("│" + sl.ljust(W) + "│")
+        if events:
+            lines.append("├" + "─" * W + "┤")
+            for e in events[-6:]:
+                lines.append("│" + f"  {e}".ljust(W) + "│")
+        lines.append("╰" + "─" * W + "╯")
+        return "\n".join(lines)
 
-                tbl.add_row(
-                    "Cycle", str(cycle),
-                    "Loss", f"{last_loss:.4f}" if last_loss else "—",
-                    "Games", str(total_games),
-                )
-                tbl.add_row(
-                    "Steps", str(total_train_steps),
-                    "Buffer", str(len(replay_buffer)),
-                    f"WinRate(L{eval_level})", f"{wr_str} {next_str}",
-                )
-
-                # Sparklines
-                lines = Text()
-                if loss_history:
-                    lines.append("  Loss  ", style="bold cyan")
-                    lines.append(_sparkline(loss_history))
-                    lines.append(f" {last_loss:.3f}\n")
-                if wr_history:
-                    lines.append("  WR    ", style="bold cyan")
-                    lines.append(_sparkline(wr_history))
-                    wr_last = wr_history[-1] if wr_history else 0
-                    lines.append(f" {wr_last:.1%}\n")
-
-                # Event log (last 8)
-                evt_text = Text()
-                for e in events[-8:]:
-                    evt_text.append(f"  {e}\n")
-
-                # Assemble
-                layout = Layout()
-                layout.split_column(
-                    Layout(progress, size=1),
-                    Layout(tbl, size=3),
-                    Layout(lines, size=3) if (loss_history or wr_history) else Layout("", size=0),
-                    Layout(evt_text, size=min(len(events[-8:]) + 1, 9)),
-                )
-
-                return Panel(
-                    layout,
-                    title=f"[bold]MAG-Gomoku Training[/bold]  "
-                          f"[dim]Run {run_id_short}  {hw_info.get('chip', '')}  "
-                          f"{num_params/1000:.1f}K params[/dim]",
-                    border_style="blue",
-                )
-
-            live = Live(build_display(), refresh_per_second=2)
-            live.start()
-        except Exception:
-            use_tui = False
+    def _update_tui():
+        if use_tui:
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(_draw_panel() + "\n")
+            sys.stdout.flush()
 
     def _log_event(msg: str):
         ts = _time.strftime("%H:%M:%S")
@@ -513,13 +504,8 @@ def train(args):
         if not use_tui:
             print(f"[{ts}] {msg}")
 
-    def _update_tui():
-        if live:
-            elapsed = _time.time() - start_time
-            progress.update(task_id, completed=min(elapsed, time_budget))
-            live.update(build_display())
-
-    _log_event(f"Started run {run_id_short} | {num_params/1000:.1f}K params | budget {time_budget}s")
+    _log_event(f"Started run {run_id_short} | {num_params/1000:.1f}K params"
+               + (f" | budget {time_budget}s" if time_budget else ""))
 
     # -----------------------------------------------------------------------
     # Training loop
@@ -527,7 +513,7 @@ def train(args):
     try:
         while True:
             elapsed = _time.time() - start_time
-            if elapsed >= time_budget:
+            if time_budget is not None and elapsed >= time_budget:
                 stop_reason = "time_budget"
                 break
             if target_games and total_games >= target_games:
@@ -539,7 +525,7 @@ def train(args):
             # ----- Self-play -----
             model.eval()
             data, games_done = run_self_play(
-                model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE
+                model, num_games=parallel_games, temperature=TEMPERATURE
             )
             total_games += games_done
 
@@ -561,7 +547,7 @@ def train(args):
                 steps_this_cycle = max(steps_this_cycle, 1)
 
                 for step in range(steps_this_cycle):
-                    if _time.time() - start_time >= time_budget:
+                    if time_budget is not None and _time.time() - start_time >= time_budget:
                         break
 
                     indices = random.sample(range(len(replay_buffer)), BATCH_SIZE)
@@ -607,23 +593,28 @@ def train(args):
                 metric["eval_games"] = probe_games
                 metric["eval_level"] = eval_level
 
-                _log_event(f"Probe: {probe_wr:.1%} ({probe_games} games vs L{eval_level})")
+                sm_wr = _smoothed_wr()
+                sm_str = f" (avg:{sm_wr:.1%})" if sm_wr is not None and len(wr_history) > 1 else ""
+                _log_event(f"Probe: {probe_wr:.1%}{sm_str} ({probe_games} games vs L{eval_level})")
 
-                # Check checkpoint threshold
-                if _tracker.should_checkpoint(probe_wr, last_ckpt_wr):
+                # Check checkpoint threshold using smoothed WR
+                effective_wr = sm_wr if sm_wr is not None else probe_wr
+                crossed = _tracker.crossed_threshold(effective_wr, last_ckpt_wr)
+                if crossed is not None:
                     _do_checkpoint(
                         model, db_conn, run_id, run_id_short, cycle,
-                        total_train_steps, last_loss, probe_wr,
+                        total_train_steps, last_loss, effective_wr,
                         eval_level, full_eval_games, num_params,
                         start_time, events, _log_event,
                         ckpt_dir, recording_dir,
+                        threshold=crossed,
                     )
-                    last_ckpt_wr = probe_wr
+                    last_ckpt_wr = effective_wr
                     num_checkpoints += 1
 
-                # Early stop on target win rate
-                if target_win_rate and probe_wr >= target_win_rate:
-                    _log_event(f"🎯 Target win rate {target_win_rate:.0%} reached!")
+                # Early stop on target win rate (using smoothed WR)
+                if target_win_rate and effective_wr >= target_win_rate:
+                    _log_event(f"🎯 Target win rate {target_win_rate:.0%} reached! (avg:{effective_wr:.1%})")
                     stop_reason = "target_win_rate"
                     _update_tui()
                     break
@@ -652,9 +643,11 @@ def train(args):
         stop_reason = "interrupted"
         _log_event("Training interrupted by user")
     finally:
-        if live:
-            _update_tui()
-            live.stop()
+        if use_tui:
+            # Print final state after clearing
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(_draw_panel() + "\n")
+            sys.stdout.flush()
 
     # ----- Save final model -----
     total_elapsed = _time.time() - start_time
@@ -809,11 +802,14 @@ def _subprocess_eval(model_path: str, level: int, n_games: int,
 def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
                    total_steps, loss, win_rate, eval_level,
                    full_eval_games, num_params, start_time,
-                   events, log_event_fn, ckpt_dir, recording_dir):
+                   events, log_event_fn, ckpt_dir, recording_dir,
+                   threshold=None):
     """Save checkpoint, run full eval in subprocess, record to DB."""
     import tracker as _tracker
 
-    tag = f"wr{int(win_rate * 100):03d}_c{cycle:04d}"
+    # Tag uses the crossed threshold (not raw probe WR)
+    wr_pct = int((threshold if threshold is not None else win_rate) * 100)
+    tag = f"wr{wr_pct:03d}_c{cycle:04d}"
     ckpt_path = f"{ckpt_dir}/{tag}.safetensors"
     save_model(model, ckpt_path)
 
@@ -881,20 +877,24 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MAG-Gomoku Training")
-    p.add_argument("--time-budget", type=int, default=TIME_BUDGET,
-                   help=f"Training time budget in seconds (default: {TIME_BUDGET})")
+    p.add_argument("--time-budget", type=int, default=None,
+                   help="Training time budget in seconds (default: unlimited)")
     p.add_argument("--target-win-rate", type=float, default=None,
-                   help="Stop early when this win rate is reached")
+                   help="Stop when smoothed win rate reaches this value")
     p.add_argument("--target-games", type=int, default=None,
-                   help="Stop early after this many self-play games")
+                   help="Stop after this many self-play games")
     p.add_argument("--eval-level", type=int, default=EVAL_LEVEL,
                    help=f"Evaluation opponent level 0-3 (default: {EVAL_LEVEL})")
-    p.add_argument("--eval-interval", type=int, default=10,
-                   help="Probe evaluation every N cycles (default: 10)")
+    p.add_argument("--eval-interval", type=int, default=15,
+                   help="Probe evaluation every N cycles (default: 15)")
     p.add_argument("--probe-games", type=int, default=50,
                    help="Games per probe evaluation (default: 50)")
+    p.add_argument("--probe-window", type=int, default=3,
+                   help="Sliding window size for smoothed win rate (default: 3)")
     p.add_argument("--full-eval-games", type=int, default=200,
                    help="Games per full evaluation at checkpoint (default: 200)")
+    p.add_argument("--parallel-games", type=int, default=PARALLEL_GAMES,
+                   help=f"Number of simultaneous self-play games (default: {PARALLEL_GAMES})")
     p.add_argument("--resume", type=str, default=None,
                    help="UUID of a previous run to resume from its last checkpoint")
     return p.parse_args()

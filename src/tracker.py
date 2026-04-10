@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS cycle_metrics (
 CREATE TABLE IF NOT EXISTS checkpoints (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id           TEXT NOT NULL REFERENCES runs(id),
-    tag              TEXT NOT NULL UNIQUE,
+    tag              TEXT NOT NULL,
     cycle            INTEGER NOT NULL,
     step             INTEGER NOT NULL,
     loss             REAL NOT NULL,
@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 
     created_at       TEXT NOT NULL,
     train_elapsed_s  REAL,
-    eval_elapsed_s   REAL
+    eval_elapsed_s   REAL,
+    UNIQUE(run_id, tag)
 );
 
 CREATE TABLE IF NOT EXISTS recordings (
@@ -413,6 +414,15 @@ def should_checkpoint(current_wr: float, last_ckpt_wr: float) -> bool:
     return False
 
 
+def crossed_threshold(current_wr: float, last_ckpt_wr: float) -> Optional[float]:
+    """Return the highest threshold crossed between last_ckpt_wr and current_wr, or None."""
+    crossed = None
+    for t in CHECKPOINT_THRESHOLDS:
+        if last_ckpt_wr < t <= current_wr:
+            crossed = t
+    return crossed
+
+
 def next_threshold(last_ckpt_wr: float) -> Optional[float]:
     """Return the next threshold above last_ckpt_wr, or None."""
     for t in CHECKPOINT_THRESHOLDS:
@@ -426,8 +436,17 @@ def next_threshold(last_ckpt_wr: float) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 def get_run(conn: sqlite3.Connection, run_id: str) -> Optional[dict]:
+    """Look up a run by exact ID or short prefix."""
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+    # Try prefix match
+    rows = conn.execute(
+        "SELECT * FROM runs WHERE id LIKE ?", (run_id + "%",)
+    ).fetchall()
+    if len(rows) == 1:
+        return dict(rows[0])
+    return None
 
 
 def get_checkpoints(conn: sqlite3.Connection,
