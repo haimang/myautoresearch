@@ -1,11 +1,11 @@
 """
 Replay recorded games and export frames for video production.
 
-Usage:
-  uv run replay.py games/exp047_game003.json              # replay in pygame window
-  uv run replay.py games/exp047_game003.json --export      # export PNG frame sequence
-  uv run replay.py --montage                               # growth montage from all stages
-  uv run replay.py --versus stage0_baseline best           # render two checkpoints playing
+Usage (run from project root):
+  uv run python src/replay.py output/recordings/games/exp047_game003.json
+  uv run python src/replay.py output/recordings/games/exp047_game003.json --export
+  uv run python src/replay.py --montage
+  uv run python src/replay.py --versus stage0_baseline best
 """
 
 import argparse
@@ -96,7 +96,7 @@ def replay_game(record: GameRecord, renderer: Renderer, speed: float = 1.0,
 
 def find_stage_games() -> dict[str, str]:
     """Find representative games for each stage from recordings."""
-    games_dir = "recordings/games"
+    games_dir = "output/recordings/games"
     if not os.path.isdir(games_dir):
         return {}
 
@@ -134,13 +134,13 @@ def montage(renderer: Renderer, speed: float = 0.5, export_dir: str = None):
 
     if not games:
         # Fallback: just play all recorded games
-        games_dir = "recordings/games"
+        games_dir = "output/recordings/games"
         if os.path.isdir(games_dir):
             files = sorted(glob.glob(os.path.join(games_dir, "*.json")))[:10]
             games = {os.path.basename(f): f for f in files}
 
     if not games:
-        print("No recorded games found in recordings/games/")
+        print("No recorded games found in output/recordings/games/")
         return
 
     print(f"Montage: {len(games)} games")
@@ -179,8 +179,8 @@ def main():
     if not args.game_file:
         parser.print_help()
         print("\nExamples:")
-        print("  uv run replay.py recordings/games/exp001_game0.json")
-        print("  uv run replay.py recordings/games/exp001_game0.json --export")
+        print("  uv run python src/replay.py output/recordings/games/exp001_game0.json")
+        print("  uv run python src/replay.py output/recordings/games/exp001_game0.json --export")
         print("  uv run replay.py --montage")
         return
 

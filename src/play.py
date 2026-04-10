@@ -4,14 +4,14 @@ Human vs AI (or AI vs AI) gameplay interface.
 Load any checkpoint from the archive and play against it, or watch two
 different checkpoints play each other.
 
-Usage:
-  uv run play.py                              # play vs latest model
-  uv run play.py --checkpoint best            # play vs best archived model
-  uv run play.py --checkpoint stage1_beat_random
-  uv run play.py --list                       # list all checkpoints
-  uv run play.py --black stage0 --white best  # AI vs AI
-  uv run play.py --mcts 200                   # stronger AI with MCTS
-  uv run play.py --level 2                    # play vs minimax L2 (no NN)
+Usage (run from project root):
+  uv run python src/play.py                              # play vs latest model
+  uv run python src/play.py --checkpoint best            # play vs best archived model
+  uv run python src/play.py --checkpoint stage1_beat_random
+  uv run python src/play.py --list                       # list all checkpoints
+  uv run python src/play.py --black stage0 --white best  # AI vs AI
+  uv run python src/play.py --mcts 200                   # stronger AI with MCTS
+  uv run python src/play.py --level 2                    # play vs minimax L2 (no NN)
 """
 
 import argparse
@@ -40,8 +40,8 @@ def resolve_checkpoint(tag: str) -> str:
         return path
 
     # Check local model.safetensors
-    if tag in ("latest", "local") and os.path.isfile("model.safetensors"):
-        return "model.safetensors"
+    if tag in ("latest", "local") and os.path.isfile("output/model.safetensors"):
+        return "output/model.safetensors"
 
     # Fuzzy match in manifest
     checkpoints = list_checkpoints()
@@ -88,8 +88,8 @@ def print_checkpoints():
     checkpoints = list_checkpoints()
     if not checkpoints:
         print("No archived checkpoints found.")
-        if os.path.isfile("model.safetensors"):
-            print("  Local model.safetensors is available (use --checkpoint latest)")
+        if os.path.isfile("output/model.safetensors"):
+            print("  Local output/model.safetensors is available (use --checkpoint latest)")
         return
 
     print(f"{'#':>3}  {'Tag':<35}  {'Win Rate':>8}  {'Level':>5}  {'Timestamp':<20}")
@@ -103,9 +103,9 @@ def print_checkpoints():
             wr = f"{wr:.2%}"
         print(f"{i:3d}  {tag:<35}  {wr:>8}  {level:>5}  {ts:<20}")
 
-    if os.path.isfile("model.safetensors"):
+    if os.path.isfile("output/model.safetensors"):
         print()
-        print("  + Local model.safetensors (use --checkpoint latest)")
+        print("  + Local output/model.safetensors (use --checkpoint latest)")
 
 
 def main():
@@ -159,7 +159,7 @@ def main():
         # Human vs NN
         checkpoint = args.checkpoint
         if checkpoint is None:
-            if os.path.isfile("model.safetensors"):
+            if os.path.isfile("output/model.safetensors"):
                 checkpoint = "latest"
             else:
                 print("No model found. Use --checkpoint, --level, or train first.")

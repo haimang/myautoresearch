@@ -5,6 +5,7 @@ This is the MUTABLE training script for the autoresearch loop.
 The agent modifies hyperparameters and architecture between runs.
 """
 
+import os
 import random
 import time as _time
 
@@ -44,7 +45,7 @@ POLICY_LOSS_WEIGHT = 1.0
 VALUE_LOSS_WEIGHT = 1.0
 EVAL_LEVEL = 0            # opponent level for evaluation (0=random, 1=minimax2, 2=minimax4, 3=minimax6)
 
-MODEL_PATH = "model.safetensors"
+MODEL_PATH = "output/model.safetensors"
 
 # ---------------------------------------------------------------------------
 # Neural network
@@ -410,6 +411,7 @@ def train():
     total_elapsed = _time.time() - start_time
     print()
     print(f"Training complete. Saving model to {MODEL_PATH}")
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     save_model(model, MODEL_PATH)
 
     # ----- Estimate peak VRAM -----
@@ -431,12 +433,25 @@ def train():
     print()
 
     # ----- Evaluation -----
+    # Run evaluation in a subprocess to get a clean Metal GPU state.
+    # The training process accumulates Metal buffers; a fresh process avoids
+    # contention with any residual allocations.
     if evaluate_win_rate is not None:
         print(f"Running evaluation vs L{EVAL_LEVEL}...")
-        try:
-            eval_result = evaluate_win_rate(MODEL_PATH, level=EVAL_LEVEL)
-        except Exception as e:
-            print(f"Evaluation error: {e}")
+        import subprocess, sys
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        env = {**os.environ, 'PYTHONPATH': src_dir}
+        eval_cmd = [
+            sys.executable, "-c",
+            f"from prepare import evaluate_win_rate; evaluate_win_rate('{MODEL_PATH}', level={EVAL_LEVEL})"
+        ]
+        proc = subprocess.run(eval_cmd, capture_output=True, text=True, env=env)
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.returncode != 0:
+            print(f"Evaluation error (exit {proc.returncode}):")
+            if proc.stderr:
+                print(proc.stderr.strip())
     else:
         print("(prepare.py not found — skipping evaluation)")
 

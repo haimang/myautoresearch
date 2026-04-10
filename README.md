@@ -10,38 +10,47 @@ Requirements: Apple Silicon Mac, Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run game.py          # play a two-player game (verify the game works)
-uv run train.py         # run one 5-minute training experiment
-uv run play.py --list   # list saved checkpoints
-uv run play.py          # play against the trained AI
+uv run python src/train.py         # run one 5-minute training experiment
+uv run python src/play.py --list   # list saved checkpoints
+uv run python src/play.py          # play against the trained AI
 ```
 
-## Architecture
+## Project structure
 
-Three core files, same as autoresearch:
-
-| File | Role | Editable? |
-|---|---|---|
-| `game.py` | Board engine, pygame renderer, batched self-play | No |
-| `prepare.py` | Minimax opponents (L0-L3), evaluation, checkpoint archive | No |
-| `train.py` | Neural network, self-play, training loop | **Yes — agent modifies this** |
-
-Plus supporting files:
-
-- `program.md` — autonomous experiment protocol (the agent reads this)
-- `play.py` — human vs AI / AI vs AI gameplay
-- `replay.py` — replay recorded games, export frames for video
-- `results.tsv` — experiment log
-- `action-plan.md` — detailed project plan and dev log
+```
+mag-gomoku/
+├── src/                         # Python source code
+│   ├── game.py                  #   board engine, pygame renderer, batched self-play (read-only)
+│   ├── prepare.py               #   minimax opponents, evaluation, checkpoint archive (read-only)
+│   ├── train.py                 #   neural network, self-play, training loop (agent-mutable)
+│   ├── play.py                  #   human vs AI / AI vs AI gameplay
+│   └── replay.py                #   replay recorded games, export frames for video
+├── docs/                        # documentation
+│   ├── program.md               #   autonomous experiment protocol (agent reads this)
+│   └── action-plan.md           #   project plan, dev log & troubleshooting
+├── data/                        # experiment tracking (version controlled)
+│   └── results.tsv              #   experiment log
+├── output/                      # generated artifacts (gitignored)
+│   ├── model.safetensors        #   trained model weights
+│   ├── run.log                  #   latest training run output
+│   └── recordings/              #   training game recordings
+│       ├── games/               #     full game records (JSON)
+│       ├── metrics/             #     training metrics (CSV)
+│       └── frames/              #     key frame captures (PNG)
+├── .gitignore
+├── README.md
+├── pyproject.toml
+└── uv.lock
+```
 
 ## How it works
 
 ```
-autoresearch loop (agent modifies train.py → self-play + train → evaluate win_rate → keep/revert)
+autoresearch loop (agent modifies src/train.py → self-play + train → evaluate win_rate → keep/revert)
         ↓
-  model.safetensors (a few MB of weights)
+  output/model.safetensors (a few MB of weights)
         ↓
-  play.py (human vs AI game)
+  src/play.py (human vs AI game)
 ```
 
 The single metric is **win_rate** against fixed minimax opponents. The agent promotes through increasingly strong opponents:
@@ -57,8 +66,8 @@ The single metric is **win_rate** against fixed minimax opponents. The agent pro
 
 ```bash
 git checkout -b autoresearch/gomoku-v1
-uv run train.py   # establish baseline
-# Point Claude Code at program.md and let it run
+uv run python src/train.py   # establish baseline
+# Point Claude Code at docs/program.md and let it run
 ```
 
 Each experiment takes ~8 minutes (5 min training + eval). Expect ~7 experiments/hour, ~70 overnight.
@@ -66,26 +75,26 @@ Each experiment takes ~8 minutes (5 min training + eval). Expect ~7 experiments/
 ## Playing against the AI
 
 ```bash
-uv run play.py                              # vs latest model
-uv run play.py --checkpoint best            # vs best archived model
-uv run play.py --black stage0 --white best  # watch two AIs play
-uv run play.py --level 2                    # vs minimax (no NN)
-uv run play.py --list                       # list all checkpoints
+uv run python src/play.py                              # vs latest model
+uv run python src/play.py --checkpoint best            # vs best archived model
+uv run python src/play.py --black stage0 --white best  # watch two AIs play
+uv run python src/play.py --level 2                    # vs minimax (no NN)
+uv run python src/play.py --list                       # list all checkpoints
 ```
 
 ## Recording and replay
 
-Training automatically records games, metrics, and key frames to `recordings/`.
+Training automatically records games, metrics, and key frames to `output/recordings/`.
 
 ```bash
-uv run replay.py recordings/games/exp001_game0.json          # replay a game
-uv run replay.py recordings/games/exp001_game0.json --export  # export PNG frames
-uv run replay.py --montage                                    # growth montage
+uv run python src/replay.py output/recordings/games/exp001_game0.json          # replay a game
+uv run python src/replay.py output/recordings/games/exp001_game0.json --export  # export PNG frames
+uv run python src/replay.py --montage                                           # growth montage
 ```
 
 ## Hardware
 
-Tested on M3 Max 128GB. The model is tiny (~1M params) — any Apple Silicon Mac will work. Default config: 64 parallel self-play games, 6 residual blocks, 64 filters.
+Tested on M3 Max 128GB. The model is tiny (~564K params) — any Apple Silicon Mac will work. Default config: 64 parallel self-play games, 6 residual blocks, 64 filters.
 
 ## License
 

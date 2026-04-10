@@ -1,6 +1,6 @@
 # mag-gomoku autoresearch
 
-Train a Gomoku (五子棋) AI using the autoresearch experiment loop on Apple Silicon (MLX). The agent autonomously modifies `train.py` to discover the best neural network architecture and training strategy for beating increasingly strong opponents.
+Train a Gomoku (五子棋) AI using the autoresearch experiment loop on Apple Silicon (MLX). The agent autonomously modifies `src/train.py` to discover the best neural network architecture and training strategy for beating increasingly strong opponents.
 
 **Monorepo note:** This project lives inside `autoresearch-mlx/mag-gomoku/`. Always stage only `autoresearch-mlx/mag-gomoku/` paths. Never use blind `git add -A`.
 
@@ -11,24 +11,24 @@ To set up a new experiment, work with the user to:
 1. **Agree on a run tag**: propose a tag based on today's date (e.g. `apr10`). The branch `autoresearch/<tag>` must not already exist.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main.
 3. **Read the in-scope files**:
-   - `game.py` — board engine, rendering, batch self-play. Do not modify.
-   - `prepare.py` — minimax opponents (L0-L3), evaluation, checkpoint archive. Do not modify.
-   - `train.py` — the file you modify. NN architecture, self-play, training loop.
+   - `src/game.py` — board engine, rendering, batch self-play. Do not modify.
+   - `src/prepare.py` — minimax opponents (L0-L3), evaluation, checkpoint archive. Do not modify.
+   - `src/train.py` — the file you modify. NN architecture, self-play, training loop.
 4. **Install dependencies**: `cd autoresearch-mlx/mag-gomoku && uv sync`
-5. **Initialize results.tsv**: Run `uv run train.py` once to establish YOUR baseline on this hardware.
+5. **Initialize data/results.tsv**: Run `uv run python src/train.py` once to establish YOUR baseline on this hardware.
 6. **Confirm and go**.
 
 ## Experimentation
 
-Each experiment runs on Apple Silicon via MLX. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time). Launch: `uv run train.py`.
+Each experiment runs on Apple Silicon via MLX. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time). Launch: `uv run python src/train.py`.
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, self-play strategy, batch size, temperature schedule, replay buffer, MCTS, loss function, etc.
+- Modify `src/train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, self-play strategy, batch size, temperature schedule, replay buffer, MCTS, loss function, etc.
 
 **What you CANNOT do:**
-- Modify `prepare.py` or `game.py`. They are read-only.
+- Modify `src/prepare.py` or `src/game.py`. They are read-only.
 - Install new packages or add dependencies.
-- Modify the evaluation harness (`evaluate_win_rate` in `prepare.py`).
+- Modify the evaluation harness (`evaluate_win_rate` in `src/prepare.py`).
 
 **The goal is simple: get the highest win_rate against the current evaluation opponent.** Since the time budget is fixed, you don't need to worry about training time. Everything is fair game as long as the code runs and finishes within budget.
 
@@ -42,7 +42,7 @@ The single metric is `win_rate` — the fraction of games won against a fixed mi
 win_rate = wins / n_games   (higher is better, range [0.0, 1.0])
 ```
 
-Evaluation runs automatically at the end of `train.py`. The evaluation opponent level is controlled by `EVAL_LEVEL` in train.py (default: 0, starting with random opponent).
+Evaluation runs automatically at the end of `src/train.py`. The evaluation opponent level is controlled by `EVAL_LEVEL` in train.py (default: 0, starting with random opponent).
 
 ## Stage promotion
 
@@ -58,7 +58,7 @@ As the agent improves, promote to harder opponents:
 When promoting:
 1. **Archive the current model**: call `prepare.archive_checkpoint()` with a descriptive tag
 2. **Update EVAL_LEVEL** in train.py
-3. **Record the new baseline** in results.tsv
+3. **Record the new baseline** in data/results.tsv
 4. **Continue the loop** — the new baseline win_rate will be lower, and you climb again
 
 ## Output format
@@ -86,12 +86,12 @@ avg_game_length:  47.2
 
 Read results:
 ```
-grep "^win_rate:" run.log
+grep "^win_rate:" output/run.log
 ```
 
 ## Logging results
 
-Log to `results.tsv` (tab-separated):
+Log to `data/data/results.tsv` (tab-separated):
 
 ```
 commit	win_rate	eval_level	memory_gb	status	description
@@ -118,13 +118,13 @@ m2n3o4p	0.8200	1	1.2	keep	promoted to L1, new baseline
 LOOP FOREVER:
 
 1. Look at the git state: current branch/commit
-2. Tune `train.py` with an experimental idea
-3. `git add autoresearch-mlx/mag-gomoku/train.py && git commit -m "experiment: <description>"`
-4. Run: `uv run train.py > run.log 2>&1`
-5. Read results: `grep "^win_rate:\|^eval_level:" run.log`
-6. If grep is empty, run crashed. `tail -n 50 run.log` for stack trace.
-7. Record in results.tsv
-8. If win_rate improved: `git add autoresearch-mlx/mag-gomoku/results.tsv && git commit --amend --no-edit`
+2. Tune `src/train.py` with an experimental idea
+3. `git add src/train.py && git commit -m "experiment: <description>"`
+4. Run: `uv run python src/train.py > output/run.log 2>&1`
+5. Read results: `grep "^win_rate:\|^eval_level:" output/run.log`
+6. If grep is empty, run crashed. `tail -n 50 output/run.log` for stack trace.
+7. Record in data/results.tsv
+8. If win_rate improved: `git add data/results.tsv && git commit --amend --no-edit`
 9. If win_rate same/worse: `git reset --hard <previous kept commit>`
 10. **Check for stage promotion**: if win_rate exceeds promotion threshold, promote
 

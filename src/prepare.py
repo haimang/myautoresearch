@@ -39,7 +39,7 @@ from game import (
 TIME_BUDGET = 300  # 5 minutes training wall clock
 EVAL_GAMES = 200  # games per evaluation
 CHECKPOINT_DIR = os.path.expanduser("~/.cache/mag-gomoku/checkpoints")
-RECORDING_DIR = "recordings"
+RECORDING_DIR = "output/recordings"
 
 # ---------------------------------------------------------------------------
 # Minimax evaluation heuristic
@@ -395,6 +395,7 @@ def evaluate_win_rate(
     from train import GomokuNet, load_model
 
     model = load_model(model_path)
+    model.eval()  # Crucial: disable BatchNorm running stats updates during inference
     opponent_fn = OPPONENTS[level]
 
     wins = 0
@@ -435,6 +436,10 @@ def evaluate_win_rate(
             board.place(row, col)
             record.add_move(step=step, row=row, col=col, player=board.history[-1][2])
             step += 1
+
+        # Periodically clear Metal cache to avoid resource limit exhaustion
+        if game_i % 20 == 0:
+            mx.clear_cache()
 
         # Record result
         total_length += board.move_count

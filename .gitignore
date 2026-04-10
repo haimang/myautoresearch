@@ -1,20 +1,18 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
-# Model weights (tracked separately via checkpoint archive)
-model.safetensors
-
-# Recordings are local artifacts
-recordings/games/*.json
-recordings/metrics/*.csv
-recordings/frames/*.png
+# ── Generated output (training artifacts) ──
+output/
 
 # Replay frame exports
 replay_frames/
 
-# OS
+# ── OS ──
 .DS_Store
+uv.lock
 
-# uv
+# ── Python tooling ──
 .venv/
+.vscode/
