@@ -228,6 +228,96 @@ def cmd_opponents(conn: sqlite3.Connection) -> None:
               f"{wr:>6}  {dt:>12}  {desc}")
 
 
+def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
+    """Show training stability metrics for a run."""
+    import math
+
+    row = conn.execute(
+        "SELECT id, total_cycles, total_games, final_win_rate, final_loss "
+        "FROM runs WHERE id LIKE ?", (run_id + "%",)
+    ).fetchone()
+    if not row:
+        print(f"Run not found: {run_id}")
+        return
+
+    full_id = row["id"]
+    print(f"Stability report for run {full_id[:8]}")
+    print("=" * 60)
+
+    # WR metrics
+    wr_rows = conn.execute(
+        "SELECT cycle, win_rate FROM cycle_metrics "
+        "WHERE run_id = ? AND win_rate IS NOT NULL ORDER BY cycle",
+        (full_id,)
+    ).fetchall()
+    if wr_rows:
+        wrs = [r["win_rate"] for r in wr_rows]
+        n = len(wrs)
+        mean_wr = sum(wrs) / n
+        var_wr = sum((w - mean_wr) ** 2 for w in wrs) / n if n > 1 else 0
+        std_wr = math.sqrt(var_wr)
+        min_wr, max_wr = min(wrs), max(wrs)
+        # Max consecutive swing
+        max_swing = 0.0
+        for i in range(1, len(wrs)):
+            max_swing = max(max_swing, abs(wrs[i] - wrs[i - 1]))
+
+        print(f"\nWin Rate ({n} probes)")
+        print(f"  Mean:       {mean_wr:.1%}")
+        print(f"  Std Dev:    {std_wr:.1%}")
+        print(f"  Range:      {min_wr:.1%} — {max_wr:.1%}")
+        print(f"  Max Swing:  {max_swing:.1%} (between consecutive probes)")
+        if n >= 5:
+            last5 = wrs[-5:]
+            trend = last5[-1] - last5[0]
+            print(f"  Last 5 WR:  {' → '.join(f'{w:.0%}' for w in last5)}  (trend: {trend:+.1%})")
+    else:
+        print("\nNo win-rate data.")
+
+    # Loss metrics
+    loss_rows = conn.execute(
+        "SELECT cycle, loss FROM cycle_metrics "
+        "WHERE run_id = ? AND loss IS NOT NULL ORDER BY cycle",
+        (full_id,)
+    ).fetchall()
+    if loss_rows:
+        losses = [r["loss"] for r in loss_rows]
+        n = len(losses)
+        mean_loss = sum(losses) / n
+        var_loss = sum((l - mean_loss) ** 2 for l in losses) / n if n > 1 else 0
+        std_loss = math.sqrt(var_loss)
+        min_loss, max_loss = min(losses), max(losses)
+        # Loss reduction rate (first vs last quarter)
+        q = max(n // 4, 1)
+        first_q = sum(losses[:q]) / q
+        last_q = sum(losses[-q:]) / q
+        reduction = (first_q - last_q) / first_q * 100 if first_q > 0 else 0
+
+        print(f"\nLoss ({n} cycles)")
+        print(f"  Mean:       {mean_loss:.4f}")
+        print(f"  Std Dev:    {std_loss:.4f}")
+        print(f"  Range:      {min_loss:.4f} — {max_loss:.4f}")
+        print(f"  Reduction:  {reduction:.0f}% (first quarter → last quarter)")
+        if n >= 5:
+            last5 = losses[-5:]
+            print(f"  Last 5:     {' → '.join(f'{l:.3f}' for l in last5)}")
+    else:
+        print("\nNo loss data.")
+
+    # Checkpoint distribution
+    ckpt_rows = conn.execute(
+        "SELECT tag, cycle, win_rate FROM checkpoints "
+        "WHERE run_id = ? ORDER BY cycle", (full_id,)
+    ).fetchall()
+    if ckpt_rows:
+        print(f"\nCheckpoints ({len(ckpt_rows)})")
+        for c in ckpt_rows:
+            wr = f"{c['win_rate']:.1%}" if c["win_rate"] is not None else "-"
+            print(f"  cycle {c['cycle']:>4}  {c['tag']:<18}  WR={wr}")
+
+    print()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -250,6 +340,8 @@ def main():
                        help="Trace resume chain for a run")
     group.add_argument("--opponents", action="store_true",
                        help="List registered opponents")
+    group.add_argument("--stability", metavar="RUN_ID",
+                       help="Training stability report for a run")
 
     args = parser.parse_args()
     conn = _connect()
@@ -266,6 +358,8 @@ def main():
         cmd_lineage(conn, args.lineage)
     elif args.opponents:
         cmd_opponents(conn)
+    elif args.stability:
+        cmd_stability(conn, args.stability)
 
     conn.close()
 

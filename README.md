@@ -206,6 +206,7 @@ uv run python src/analyze.py --frontier                      # WR progression fr
 uv run python src/analyze.py --compare 374d567f 1922e0f0     # side-by-side run comparison
 uv run python src/analyze.py --lineage 1922e0f0              # trace resume chain
 uv run python src/analyze.py --opponents                     # list registered opponents
+uv run python src/analyze.py --stability 374d567f            # training stability report
 ```
 
 ## Querying experiment data
@@ -234,7 +235,7 @@ sqlite3 -header -column output/tracker.db "SELECT alias, win_rate, eval_level, s
 
 ## Hardware
 
-Tested on M3 Max 128GB. The model is tiny (~564K params) — any Apple Silicon Mac will work. Default config: 64 parallel self-play games, 6 residual blocks, 64 filters.
+Tested on M3 Max 128GB. The model is tiny (~564K params) — any Apple Silicon Mac will work. Default config: 64 parallel self-play games, 6 residual blocks, 64 filters. Training uses D4 board symmetry augmentation (8x effective data), recency-weighted replay buffer, and gradual temperature decay.
 
 ## License
 

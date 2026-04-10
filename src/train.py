@@ -37,19 +37,41 @@ except ImportError:
 # === Hyperparameters (autoresearch agent modifies these) ===
 NUM_RES_BLOCKS = 6
 NUM_FILTERS = 64
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-4
 BATCH_SIZE = 256          # training batch size
 PARALLEL_GAMES = 64       # number of simultaneous self-play games
 MCTS_SIMULATIONS = 0      # 0 = pure policy network (no MCTS)
 TEMPERATURE = 1.0         # self-play exploration temperature
-TEMP_THRESHOLD = 15       # after this many moves, use temp=0.1 (exploit)
+TEMP_THRESHOLD = 30       # moves over which temperature decays (see run_self_play)
 REPLAY_BUFFER_SIZE = 50000
-TRAIN_STEPS_PER_CYCLE = 50
+TRAIN_STEPS_PER_CYCLE = 30
 CYCLES_PER_REPORT = 5     # print stats every N cycles
 POLICY_LOSS_WEIGHT = 1.0
 VALUE_LOSS_WEIGHT = 1.0
 EVAL_LEVEL = 0            # opponent level for evaluation (0=random, 1=minimax2, 2=minimax4, 3=minimax6)
+
+# ---------------------------------------------------------------------------
+# D4 symmetry augmentation (8-fold: 4 rotations x 2 reflections)
+# ---------------------------------------------------------------------------
+
+def _apply_symmetry(board_np: np.ndarray, policy_np: np.ndarray,
+                    transform_id: int) -> tuple[np.ndarray, np.ndarray]:
+    """Apply one of 8 D4 symmetry transforms to a (board, policy) pair.
+
+    board_np: [3, H, W]  policy_np: [H*W]
+    transform_id: 0-7 (0=identity, 1-3=rotations, 4-7=flip+rotations)
+    """
+    H = board_np.shape[1]
+    p2d = policy_np.reshape(H, H)
+    k = transform_id % 4
+    if transform_id >= 4:
+        board_np = np.flip(board_np, axis=2).copy()  # horizontal flip
+        p2d = np.flip(p2d, axis=1).copy()
+    if k > 0:
+        board_np = np.rot90(board_np, k=k, axes=(1, 2)).copy()
+        p2d = np.rot90(p2d, k=k).copy()
+    return board_np, p2d.ravel()
 
 # ---------------------------------------------------------------------------
 # Neural network
@@ -193,9 +215,13 @@ def run_self_play(model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE):
 
             game_logits = logits_np[i]
 
-            # Determine temperature based on move count
+            # Gradual temperature decay over TEMP_THRESHOLD moves
             move_num = batch.move_counts[i]
-            temp = temperature if move_num < TEMP_THRESHOLD else 0.1
+            if TEMP_THRESHOLD > 0 and move_num < TEMP_THRESHOLD:
+                frac = move_num / TEMP_THRESHOLD
+                temp = temperature * (1.0 - frac) + 0.3 * frac  # linear decay
+            else:
+                temp = 0.3
 
             if temp < 0.01:
                 # Greedy
@@ -582,16 +608,32 @@ def train(args):
                 )
                 steps_this_cycle = max(steps_this_cycle, 1)
 
+                # Recency-weighted sampling: newer samples ~3x more likely
+                buf_len = len(replay_buffer)
+                recency_w = np.linspace(1.0, 3.0, buf_len)
+                recency_w /= recency_w.sum()
+
                 for step in range(steps_this_cycle):
                     if time_budget is not None and _time.time() - start_time >= time_budget:
                         break
 
-                    indices = random.sample(range(len(replay_buffer)), BATCH_SIZE)
-                    batch_boards_np = np.stack([replay_buffer[i][0] for i in indices])
-                    batch_policies_np = np.stack([replay_buffer[i][1] for i in indices])
-                    batch_values_np = np.array(
-                        [replay_buffer[i][2] for i in indices], dtype=np.float32
-                    )
+                    indices = np.random.choice(buf_len, size=BATCH_SIZE,
+                                               replace=False, p=recency_w)
+                    # Apply random D4 symmetry transform to each sample
+                    aug_boards = []
+                    aug_policies = []
+                    aug_values = []
+                    for i in indices:
+                        b, p, v = replay_buffer[i]
+                        t = random.randint(0, 7)
+                        if t > 0:
+                            b, p = _apply_symmetry(b, p, t)
+                        aug_boards.append(b)
+                        aug_policies.append(p)
+                        aug_values.append(v)
+                    batch_boards_np = np.stack(aug_boards)
+                    batch_policies_np = np.stack(aug_policies)
+                    batch_values_np = np.array(aug_values, dtype=np.float32)
 
                     batch_boards_mx = mx.array(batch_boards_np)
                     batch_policies_mx = mx.array(batch_policies_np)
@@ -980,10 +1022,10 @@ def parse_args() -> argparse.Namespace:
                    help="Evaluate against a registered NN opponent alias")
     p.add_argument("--eval-interval", type=int, default=15,
                    help="Probe evaluation every N cycles (default: 15)")
-    p.add_argument("--probe-games", type=int, default=50,
-                   help="Games per probe evaluation (default: 50)")
-    p.add_argument("--probe-window", type=int, default=3,
-                   help="Sliding window size for smoothed win rate (default: 3)")
+    p.add_argument("--probe-games", type=int, default=100,
+                   help="Games per probe evaluation (default: 100)")
+    p.add_argument("--probe-window", type=int, default=5,
+                   help="Sliding window size for smoothed win rate (default: 5)")
     p.add_argument("--full-eval-games", type=int, default=200,
                    help="Games per full evaluation at checkpoint (default: 200)")
     p.add_argument("--parallel-games", type=int, default=PARALLEL_GAMES,
