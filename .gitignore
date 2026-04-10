@@ -18,5 +18,6 @@ uv.lock
 .vscode/
 
 # Plan docs (not tracked)
+update-v1.md
 update-v2.md
 update-v3.md
