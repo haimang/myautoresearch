@@ -46,21 +46,41 @@ mag-gomoku/
 The training script features a Rich TUI dashboard, automatic checkpoint export at win-rate milestones, and full experiment tracking via SQLite.
 
 ```bash
-# Default: 5-minute training run
+# 默认 5 分钟训练
 uv run python src/train.py
 
-# Custom parameters
-uv run python src/train.py \
-  --time-budget 600 \           # 10 minutes
-  --target-win-rate 0.95 \      # stop when 95% win rate reached
-  --eval-level 0 \              # opponent: 0=random, 1=minimax2, 2=minimax4, 3=minimax6
-  --eval-interval 10 \          # probe eval every 10 cycles
-  --probe-games 50 \            # games per probe
-  --full-eval-games 200 \       # games per checkpoint evaluation
-  --resume <uuid>               # resume from a previous run's last checkpoint
+# 训练到 80% 胜率停止（无时间限制）
+uv run python src/train.py --target-win-rate 0.80 --time-budget 3600
+
+# 10 分钟快速训练，每 5 cycle 评估一次
+uv run python src/train.py --time-budget 600 --eval-interval 5
+
+# 长时间训练到 95% 胜率，详细评估
+uv run python src/train.py --target-win-rate 0.95 --time-budget 7200 --probe-games 100 --full-eval-games 200
+
+# 对战 minimax depth-2 对手训练
+uv run python src/train.py --eval-level 1 --target-win-rate 0.80 --time-budget 3600
+
+# 从上一次训练断点续训
+uv run python src/train.py --resume <uuid> --time-budget 600
+
+# 后台运行并记录日志
+PYTHONUNBUFFERED=1 uv run python src/train.py --target-win-rate 0.80 --time-budget 3600 > output/train.log 2>&1 &
 ```
 
 Each run creates its own directory under `output/<uuid>/` with isolated model, checkpoints, and recordings.
+
+### Parameter reference
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--time-budget` | 300 | 最大训练时间（秒） |
+| `--target-win-rate` | 1.0 | 达到此胜率后停止 |
+| `--eval-level` | 0 | 对手: 0=random, 1=minimax2, 2=minimax4, 3=minimax6 |
+| `--eval-interval` | 10 | 每 N 个 cycle 做一次 probe 评估 |
+| `--probe-games` | 50 | probe 评估的游戏数 |
+| `--full-eval-games` | 200 | checkpoint 完整评估的游戏数 |
+| `--resume` | — | 从指定 UUID 的最新 checkpoint 续训 |
 
 ### Checkpoint milestones
 
