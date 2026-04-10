@@ -30,12 +30,11 @@ mag-gomoku/
 │   ├── program.md               #   autonomous experiment protocol (agent reads this)
 │   └── action-plan.md           #   project plan, dev log & troubleshooting
 ├── output/                      # generated artifacts (gitignored)
-│   ├── tracker.db               #   SQLite database (single source of truth)
-│   ├── model.safetensors        #   latest trained model weights
-│   ├── checkpoints/             #   model snapshots at win-rate milestones
-│   └── recordings/
-│       ├── games/               #     full game records (JSON, bound to checkpoints)
-│       └── frames/              #     key frame captures (PNG)
+│   ├── tracker.db               #   SQLite database — global index across all runs
+│   └── <uuid>/                  #   per-run output directory
+│       ├── model.safetensors    #     final trained model
+│       ├── checkpoints/         #     model snapshots at win-rate milestones
+│       └── recordings/games/    #     full game records (JSON, bound to checkpoints)
 ├── .gitignore
 ├── README.md
 ├── pyproject.toml
@@ -58,8 +57,10 @@ uv run python src/train.py \
   --eval-interval 10 \          # probe eval every 10 cycles
   --probe-games 50 \            # games per probe
   --full-eval-games 200 \       # games per checkpoint evaluation
-  --resume output/model.safetensors  # continue from existing model
+  --resume <uuid>               # resume from a previous run's last checkpoint
 ```
+
+Each run creates its own directory under `output/<uuid>/` with isolated model, checkpoints, and recordings.
 
 ### Checkpoint milestones
 
@@ -70,13 +71,27 @@ Checkpoints are automatically saved when win rate crosses these thresholds:
 
 Each checkpoint includes: model weights, 200-game full evaluation, and all game recordings.
 
+### Resuming training
+
+If a training run is interrupted, or you want to continue from a previous experiment:
+
+```bash
+# List past runs
+sqlite3 -header -column output/tracker.db "SELECT substr(id,1,8) AS run, status, total_cycles, final_win_rate FROM runs ORDER BY created_at DESC"
+
+# Resume from the last checkpoint of a specific run
+uv run python src/train.py --resume <uuid>
+```
+
+Resume creates a **new run** with its own UUID directory. The model weights are loaded from the previous run's last checkpoint, and training continues from the saved cycle number.
+
 ## How it works
 
 ```
 autoresearch loop (agent modifies src/train.py → self-play + train → evaluate win_rate → keep/revert)
         ↓
-  output/checkpoints/*.safetensors  (snapshots at milestones)
-  output/tracker.db                 (full experiment history)
+  output/<uuid>/checkpoints/*.safetensors  (snapshots at milestones)
+  output/tracker.db                        (full experiment history across all runs)
         ↓
   src/play.py (human vs AI game)
   src/replay.py (video production)
@@ -117,10 +132,10 @@ Training automatically records all evaluation games at each checkpoint. Recordin
 
 ```bash
 # Replay a specific game
-uv run python src/replay.py output/recordings/games/abc12345_wr070_c0045_game003.json
+uv run python src/replay.py output/<uuid>/recordings/games/wr070_c0045_game003.json
 
 # Export frames for video
-uv run python src/replay.py output/recordings/games/abc12345_wr070_c0045_game003.json --export
+uv run python src/replay.py output/<uuid>/recordings/games/wr070_c0045_game003.json --export
 
 # Growth montage
 uv run python src/replay.py --montage
@@ -132,16 +147,19 @@ All experiment data is stored in `output/tracker.db` (SQLite):
 
 ```bash
 # List all training runs
-sqlite3 -header -column output/tracker.db "SELECT id, status, total_cycles, final_win_rate, wall_time_s FROM runs"
+sqlite3 -header -column output/tracker.db "SELECT substr(id,1,8) AS run, status, total_cycles, final_win_rate, wall_time_s, output_dir FROM runs"
 
-# List checkpoints for a run
-sqlite3 -header -column output/tracker.db "SELECT tag, cycle, win_rate, eval_games FROM checkpoints ORDER BY cycle"
+# List checkpoints for a specific run
+sqlite3 -header -column output/tracker.db "SELECT tag, cycle, win_rate, eval_games FROM checkpoints WHERE run_id LIKE 'c117fa23%' ORDER BY cycle"
 
 # Win rate progression
 sqlite3 -header -csv output/tracker.db "SELECT cycle, win_rate FROM cycle_metrics WHERE win_rate IS NOT NULL" > wr_curve.csv
 
 # Export all recordings for a checkpoint
 sqlite3 -header -csv output/tracker.db "SELECT game_file, result, total_moves, nn_side, nn_won FROM recordings WHERE checkpoint_id = 1"
+
+# View resume chain
+sqlite3 -header -column output/tracker.db "SELECT substr(id,1,8) AS run, substr(resumed_from,1,8) AS parent FROM runs WHERE resumed_from IS NOT NULL"
 ```
 
 ## Hardware

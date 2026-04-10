@@ -25,29 +25,40 @@ from game import (
     BOARD_SIZE, BLACK, WHITE, EMPTY,
     Board, Renderer, GameRecord,
 )
-from prepare import OPPONENTS, CHECKPOINT_DIR, list_checkpoints
+from prepare import OPPONENTS
+import tracker
 
 
 def resolve_checkpoint(tag: str) -> str:
-    """Resolve a checkpoint tag to a file path."""
-    # Direct file path
+    """Resolve a checkpoint tag to a file path.
+
+    Checks: direct file path → DB tag match → DB partial match →
+    latest model for "latest"/"local".
+    """
     if os.path.isfile(tag):
         return tag
 
-    # Check archive
-    path = os.path.join(CHECKPOINT_DIR, f"{tag}.safetensors")
-    if os.path.isfile(path):
-        return path
+    # Query tracker DB
+    try:
+        conn = tracker.init_db()
+        cp = tracker.find_checkpoint_by_tag(conn, tag)
+        if cp and os.path.isfile(cp["model_path"]):
+            conn.close()
+            return cp["model_path"]
+        conn.close()
+    except Exception:
+        pass
 
-    # Check local model.safetensors
-    if tag in ("latest", "local") and os.path.isfile("output/model.safetensors"):
-        return "output/model.safetensors"
-
-    # Fuzzy match in manifest
-    checkpoints = list_checkpoints()
-    for cp in checkpoints:
-        if tag in cp.get("tag", ""):
-            return cp.get("archived_path", "")
+    # "latest"/"local" — find the newest checkpoint across all runs
+    if tag in ("latest", "local", "best"):
+        try:
+            conn = tracker.init_db()
+            all_cp = tracker.list_all_checkpoints(conn, limit=1)
+            conn.close()
+            if all_cp and os.path.isfile(all_cp[0]["model_path"]):
+                return all_cp[0]["model_path"]
+        except Exception:
+            pass
 
     print(f"Error: checkpoint '{tag}' not found")
     print("Use --list to see available checkpoints")
@@ -71,11 +82,9 @@ def load_nn_player(checkpoint_path: str, mcts_sims: int = 0):
         policy = np.array(policy_logits[0])
         val = float(np.array(value[0, 0]))
 
-        # Mask illegal moves
         legal_mask = board.get_legal_mask()
         policy[legal_mask == 0] = -1e9
 
-        # Argmax (no MCTS for now)
         action = int(np.argmax(policy))
         row, col = divmod(action, BOARD_SIZE)
         return row, col
@@ -84,28 +93,29 @@ def load_nn_player(checkpoint_path: str, mcts_sims: int = 0):
 
 
 def print_checkpoints():
-    """Print all available checkpoints."""
-    checkpoints = list_checkpoints()
-    if not checkpoints:
-        print("No archived checkpoints found.")
-        if os.path.isfile("output/model.safetensors"):
-            print("  Local output/model.safetensors is available (use --checkpoint latest)")
+    """Print all available checkpoints from tracker DB."""
+    try:
+        conn = tracker.init_db()
+        checkpoints = tracker.list_all_checkpoints(conn, limit=100)
+        conn.close()
+    except Exception as e:
+        print(f"Error reading tracker.db: {e}")
         return
 
-    print(f"{'#':>3}  {'Tag':<35}  {'Win Rate':>8}  {'Level':>5}  {'Timestamp':<20}")
-    print("-" * 80)
+    if not checkpoints:
+        print("No checkpoints found in tracker.db.")
+        return
+
+    print(f"{'#':>3}  {'Tag':<25}  {'Run':>8}  {'WR':>7}  {'L':>2}  {'Cycle':>5}  {'Model Path':<40}")
+    print("-" * 100)
     for i, cp in enumerate(checkpoints):
         tag = cp.get("tag", "?")
-        wr = cp.get("win_rate", "?")
+        run_short = cp.get("run_id", "?")[:8]
+        wr = cp.get("win_rate", 0)
         level = cp.get("eval_level", "?")
-        ts = cp.get("timestamp", "?")[:19]
-        if isinstance(wr, float):
-            wr = f"{wr:.2%}"
-        print(f"{i:3d}  {tag:<35}  {wr:>8}  {level:>5}  {ts:<20}")
-
-    if os.path.isfile("output/model.safetensors"):
-        print()
-        print("  + Local output/model.safetensors (use --checkpoint latest)")
+        cyc = cp.get("cycle", "?")
+        path = cp.get("model_path", "?")
+        print(f"{i:3d}  {tag:<25}  {run_short:>8}  {wr:>6.1%}  {level:>2}  {cyc:>5}  {path:<40}")
 
 
 def main():

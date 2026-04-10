@@ -140,6 +140,12 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     """Create tables if they don't exist and return a connection."""
     conn = _connect(db_path)
     conn.executescript(_SCHEMA_SQL)
+    # v3 migration: add columns for UUID output dirs and resume support
+    for col, typ in [("resumed_from", "TEXT"), ("output_dir", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
     return conn
 
@@ -213,7 +219,9 @@ def collect_hardware_info() -> dict:
 # ---------------------------------------------------------------------------
 
 def create_run(conn: sqlite3.Connection, run_id: str,
-               hyperparams: dict, hardware: Optional[dict] = None) -> None:
+               hyperparams: dict, hardware: Optional[dict] = None,
+               resumed_from: Optional[str] = None,
+               output_dir: Optional[str] = None) -> None:
     """Insert a new training run."""
     hw = hardware or {}
     conn.execute(
@@ -223,14 +231,16 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             num_res_blocks, num_filters, learning_rate, weight_decay,
             batch_size, parallel_games, mcts_simulations, temperature,
             temp_threshold, replay_buffer_size, train_steps_per_cycle,
-            time_budget, target_win_rate, target_games, eval_level
+            time_budget, target_win_rate, target_games, eval_level,
+            resumed_from, output_dir
         ) VALUES (
             ?, ?, 'running',
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?,
-            ?, ?, ?, ?
+            ?, ?, ?, ?,
+            ?, ?
         )""",
         (
             run_id,
@@ -252,6 +262,8 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             hyperparams.get("target_win_rate"),
             hyperparams.get("target_games"),
             hyperparams.get("eval_level"),
+            resumed_from,
+            output_dir,
         ),
     )
     conn.commit()
@@ -450,3 +462,42 @@ def count_checkpoints(conn: sqlite3.Connection, run_id: str) -> int:
         "SELECT COUNT(*) FROM checkpoints WHERE run_id = ?", (run_id,),
     ).fetchone()
     return row[0] if row else 0
+
+
+def get_latest_checkpoint(conn: sqlite3.Connection,
+                          run_id: str) -> Optional[dict]:
+    """Return the most recent checkpoint for a run, or None."""
+    row = conn.execute(
+        "SELECT * FROM checkpoints WHERE run_id = ? ORDER BY cycle DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_all_checkpoints(conn: sqlite3.Connection,
+                         limit: int = 50) -> list[dict]:
+    """List checkpoints across all runs, newest first."""
+    rows = conn.execute(
+        """SELECT c.*, r.chip, r.output_dir
+           FROM checkpoints c
+           JOIN runs r ON c.run_id = r.id
+           ORDER BY c.created_at DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_checkpoint_by_tag(conn: sqlite3.Connection,
+                           tag: str) -> Optional[dict]:
+    """Find a checkpoint by exact or partial tag match."""
+    row = conn.execute(
+        "SELECT * FROM checkpoints WHERE tag = ?", (tag,),
+    ).fetchone()
+    if row:
+        return dict(row)
+    # Partial match
+    row = conn.execute(
+        "SELECT * FROM checkpoints WHERE tag LIKE ? ORDER BY created_at DESC LIMIT 1",
+        (f"%{tag}%",),
+    ).fetchone()
+    return dict(row) if row else None

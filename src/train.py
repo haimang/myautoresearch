@@ -50,8 +50,6 @@ POLICY_LOSS_WEIGHT = 1.0
 VALUE_LOSS_WEIGHT = 1.0
 EVAL_LEVEL = 0            # opponent level for evaluation (0=random, 1=minimax2, 2=minimax4, 3=minimax6)
 
-MODEL_PATH = "output/model.safetensors"
-
 # ---------------------------------------------------------------------------
 # Neural network
 # ---------------------------------------------------------------------------
@@ -319,6 +317,39 @@ def train(args):
     target_win_rate = args.target_win_rate
     target_games = args.target_games
 
+    # --- Output paths (per-run UUID directory) ---
+    output_dir = f"output/{run_id}"
+    model_path = f"{output_dir}/model.safetensors"
+    ckpt_dir = f"{output_dir}/checkpoints"
+    recording_dir = f"{output_dir}/recordings"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(os.path.join(recording_dir, "games"), exist_ok=True)
+
+    # --- Resume support ---
+    resumed_from = None
+    initial_cycle = 0
+    initial_ckpt_wr = 0.0
+    resume_model_path = None
+
+    if args.resume:
+        db_tmp = _tracker.init_db()
+        old_run = _tracker.get_run(db_tmp, args.resume)
+        if not old_run:
+            print(f"Error: run '{args.resume}' not found in tracker.db")
+            sys.exit(1)
+        latest_ckpt = _tracker.get_latest_checkpoint(db_tmp, args.resume)
+        if not latest_ckpt:
+            print(f"Error: no checkpoint found for run '{args.resume}'")
+            sys.exit(1)
+        resumed_from = args.resume
+        resume_model_path = latest_ckpt["model_path"]
+        initial_cycle = latest_ckpt["cycle"]
+        initial_ckpt_wr = latest_ckpt["win_rate"]
+        print(f"Resuming from run {args.resume[:8]}  "
+              f"cycle={initial_cycle}  wr={initial_ckpt_wr:.1%}  "
+              f"model={resume_model_path}")
+        db_tmp.close()
+
     # Initialize tracker DB
     db_conn = _tracker.init_db()
     hw_info = _tracker.collect_hardware_info()
@@ -340,11 +371,12 @@ def train(args):
         "target_games": target_games,
         "eval_level": eval_level,
     }
-    _tracker.create_run(db_conn, run_id, hyperparams, hw_info)
+    _tracker.create_run(db_conn, run_id, hyperparams, hw_info,
+                        resumed_from=resumed_from, output_dir=output_dir)
 
     # Initialize model
-    if args.resume and os.path.exists(args.resume):
-        model = load_model(args.resume)
+    if resume_model_path and os.path.exists(resume_model_path):
+        model = load_model(resume_model_path)
     else:
         model = GomokuNet()
     dummy = mx.zeros((1, 3, BOARD_SIZE, BOARD_SIZE))
@@ -364,10 +396,10 @@ def train(args):
     # Training state
     total_games = 0
     total_train_steps = 0
-    cycle = 0
+    cycle = initial_cycle
     last_loss = 0.0
     last_probe_wr: float | None = None
-    last_ckpt_wr: float = 0.0
+    last_ckpt_wr: float = initial_ckpt_wr
     num_checkpoints = 0
     stop_reason = "time_budget"
 
@@ -584,6 +616,7 @@ def train(args):
                         total_train_steps, last_loss, probe_wr,
                         eval_level, full_eval_games, num_params,
                         start_time, events, _log_event,
+                        ckpt_dir, recording_dir,
                     )
                     last_ckpt_wr = probe_wr
                     num_checkpoints += 1
@@ -625,26 +658,25 @@ def train(args):
 
     # ----- Save final model -----
     total_elapsed = _time.time() - start_time
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    save_model(model, MODEL_PATH)
-    _log_event(f"Model saved to {MODEL_PATH}")
+    save_model(model, model_path)
+    _log_event(f"Model saved to {model_path}")
 
     # ----- Final evaluation (subprocess) -----
     final_wr = last_probe_wr
     if evaluate_win_rate is not None:
         print(f"\nRunning final evaluation vs L{eval_level} ({full_eval_games} games)...")
-        tag = f"{run_id_short}_final_c{cycle:04d}"
+        tag = f"final_c{cycle:04d}"
         result = _subprocess_eval(
-            MODEL_PATH, eval_level, full_eval_games, tag, run_id
+            model_path, eval_level, full_eval_games, tag, run_id,
+            recording_dir=recording_dir,
         )
         if result:
             final_wr = result.get("win_rate", final_wr)
             print(f"Final win_rate: {final_wr:.1%}")
 
             # Save as checkpoint
-            ckpt_path = f"output/checkpoints/{tag}.safetensors"
-            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            shutil.copy2(MODEL_PATH, ckpt_path)
+            ckpt_path = f"{ckpt_dir}/{tag}.safetensors"
+            shutil.copy2(model_path, ckpt_path)
 
             ckpt_id = _tracker.save_checkpoint(db_conn, run_id, {
                 "tag": tag,
@@ -674,7 +706,7 @@ def train(args):
     # ----- Finalize run -----
     _tracker.finish_run(db_conn, run_id, {
         "status": "completed" if stop_reason != "interrupted" else "interrupted",
-        "total_cycles": cycle,
+        "total_cycles": cycle - initial_cycle,
         "total_games": total_games,
         "total_steps": total_train_steps,
         "final_loss": last_loss,
@@ -689,8 +721,9 @@ def train(args):
     # ----- Print summary -----
     print()
     print("=" * 60)
-    print(f"Run:        {run_id_short} ({stop_reason})")
-    print(f"Cycles:     {cycle}")
+    resumed_str = f"  (resumed from {resumed_from[:8]})" if resumed_from else ""
+    print(f"Run:        {run_id_short}{resumed_str} ({stop_reason})")
+    print(f"Cycles:     {cycle - initial_cycle} (total cycle #{cycle})")
     print(f"Games:      {total_games}")
     print(f"Steps:      {total_train_steps}")
     print(f"Final loss: {last_loss:.4f}")
@@ -698,7 +731,7 @@ def train(args):
         print(f"Win rate:   {final_wr:.1%} (vs L{eval_level})")
     print(f"Checkpoints:{num_checkpoints}")
     print(f"Wall time:  {total_elapsed:.1f}s")
-    print(f"Model:      {MODEL_PATH}")
+    print(f"Output:     {output_dir}/")
     print(f"Tracker:    output/tracker.db")
     print("=" * 60)
 
@@ -739,15 +772,17 @@ def _quick_eval(model, level: int, n_games: int) -> float:
 
 
 def _subprocess_eval(model_path: str, level: int, n_games: int,
-                     tag: str, run_id: str) -> dict | None:
+                     tag: str, run_id: str,
+                     recording_dir: str = "") -> dict | None:
     """Run full evaluation in subprocess, return parsed result dict."""
     src_dir = os.path.dirname(os.path.abspath(__file__))
     env = {**os.environ, "PYTHONPATH": src_dir, "PYTHONUNBUFFERED": "1"}
+    rec_arg = f", recording_dir='{recording_dir}'" if recording_dir else ""
     code = (
         f"import json; from prepare import evaluate_win_rate; "
         f"r = evaluate_win_rate('{model_path}', level={level}, "
         f"n_games={n_games}, record_games={n_games}, "
-        f"tag='{tag}', run_id='{run_id}'); "
+        f"tag='{tag}', run_id='{run_id}'{rec_arg}); "
         f"print('JSON_RESULT:' + json.dumps(r, default=str))"
     )
     proc = subprocess.run(
@@ -774,13 +809,12 @@ def _subprocess_eval(model_path: str, level: int, n_games: int,
 def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
                    total_steps, loss, win_rate, eval_level,
                    full_eval_games, num_params, start_time,
-                   events, log_event_fn):
+                   events, log_event_fn, ckpt_dir, recording_dir):
     """Save checkpoint, run full eval in subprocess, record to DB."""
     import tracker as _tracker
 
-    tag = f"{run_id_short}_wr{int(win_rate * 100):03d}_c{cycle:04d}"
-    ckpt_path = f"output/checkpoints/{tag}.safetensors"
-    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+    tag = f"wr{int(win_rate * 100):03d}_c{cycle:04d}"
+    ckpt_path = f"{ckpt_dir}/{tag}.safetensors"
     save_model(model, ckpt_path)
 
     log_event_fn(f"✓ Checkpoint {tag}  wr={win_rate:.1%}")
@@ -788,7 +822,8 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
     # Full eval in subprocess
     elapsed = _time.time() - start_time
     result = _subprocess_eval(
-        ckpt_path, eval_level, full_eval_games, tag, run_id
+        ckpt_path, eval_level, full_eval_games, tag, run_id,
+        recording_dir=recording_dir,
     )
 
     if result:
@@ -861,7 +896,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--full-eval-games", type=int, default=200,
                    help="Games per full evaluation at checkpoint (default: 200)")
     p.add_argument("--resume", type=str, default=None,
-                   help="Path to model file to resume training from")
+                   help="UUID of a previous run to resume from its last checkpoint")
     return p.parse_args()
 
 

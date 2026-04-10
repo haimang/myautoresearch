@@ -379,6 +379,7 @@ def evaluate_win_rate(
     record_games: int = 0,
     tag: str = "",
     run_id: str = "",
+    recording_dir: str = "",
 ) -> dict:
     """
     Play `n_games` between a trained NN model and a minimax opponent.
@@ -402,7 +403,7 @@ def evaluate_win_rate(
     total_length = 0
     recorded_files: list[str] = []
 
-    games_dir = os.path.join(RECORDING_DIR, "games")
+    games_dir = os.path.join(recording_dir or RECORDING_DIR, "games")
     os.makedirs(games_dir, exist_ok=True)
 
     # Per-game detail for data analysis
