@@ -125,6 +125,17 @@ CREATE INDEX IF NOT EXISTS idx_cycle_metrics_run ON cycle_metrics(run_id, cycle)
 CREATE INDEX IF NOT EXISTS idx_checkpoints_run ON checkpoints(run_id);
 CREATE INDEX IF NOT EXISTS idx_recordings_checkpoint ON recordings(checkpoint_id);
 CREATE INDEX IF NOT EXISTS idx_recordings_run ON recordings(run_id);
+
+CREATE TABLE IF NOT EXISTS opponents (
+    alias        TEXT PRIMARY KEY,
+    source_run   TEXT,
+    source_tag   TEXT,
+    model_path   TEXT NOT NULL,
+    win_rate     REAL,
+    eval_level   INTEGER,
+    description  TEXT,
+    created_at   TEXT NOT NULL
+);
 """
 
 
@@ -520,3 +531,42 @@ def find_checkpoint_by_tag(conn: sqlite3.Connection,
         (f"%{tag}%",),
     ).fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Opponents
+# ---------------------------------------------------------------------------
+
+def register_opponent(conn: sqlite3.Connection, alias: str,
+                      model_path: str, source_run: Optional[str] = None,
+                      source_tag: Optional[str] = None,
+                      win_rate: Optional[float] = None,
+                      eval_level: Optional[int] = None,
+                      description: Optional[str] = None) -> None:
+    """Register a model checkpoint as a named opponent."""
+    conn.execute(
+        """INSERT OR REPLACE INTO opponents (
+            alias, source_run, source_tag, model_path,
+            win_rate, eval_level, description, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (alias, source_run, source_tag, model_path,
+         win_rate, eval_level, description,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def get_opponent(conn: sqlite3.Connection, alias: str) -> Optional[dict]:
+    """Look up a registered opponent by alias."""
+    row = conn.execute(
+        "SELECT * FROM opponents WHERE alias = ?", (alias,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_opponents(conn: sqlite3.Connection) -> list[dict]:
+    """List all registered opponents."""
+    rows = conn.execute(
+        "SELECT * FROM opponents ORDER BY created_at",
+    ).fetchall()
+    return [dict(r) for r in rows]

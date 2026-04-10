@@ -12,6 +12,7 @@ Requirements: Apple Silicon Mac, Python 3.10+, [uv](https://docs.astral.sh/uv/).
 uv sync
 uv run python src/train.py                     # run one 5-minute training experiment
 uv run python src/play.py --list               # list saved checkpoints
+uv run python src/play.py --list-opponents     # list registered NN opponents
 uv run python src/play.py                      # play against the trained AI
 ```
 
@@ -31,6 +32,8 @@ mag-gomoku/
 │   └── caveats.md               #   pitfall records & troubleshooting notes
 ├── output/                      # generated artifacts (gitignored)
 │   ├── tracker.db               #   SQLite database — global index across all runs
+│   ├── opponents/               #   registered NN opponents
+│   │   └── <alias>/model.safetensors
 │   └── <uuid>/                  #   per-run output directory
 │       ├── model.safetensors    #     final trained model
 │       ├── checkpoints/         #     model snapshots at win-rate milestones
@@ -64,6 +67,9 @@ uv run python src/train.py --target-win-rate 0.80 --parallel-games 16
 # 对战 minimax depth-2 对手训练
 uv run python src/train.py --eval-level 1 --target-win-rate 0.80
 
+# 对战注册的 NN 对手训练
+uv run python src/train.py --eval-opponent L0 --target-win-rate 0.80
+
 # 从上一次训练断点续训（支持短 UUID 前缀）
 uv run python src/train.py --resume c8d815ac --time-budget 600
 
@@ -82,11 +88,29 @@ Each run creates its own directory under `output/<uuid>/` with isolated model, c
 | `--target-games` | 无 (可选) | 达到此局数后停止 |
 | `--parallel-games` | 64 | 并行自对弈局数（降低可减少 GPU 占用） |
 | `--eval-level` | 0 | 对手: 0=random, 1=minimax2, 2=minimax4, 3=minimax6 |
+| `--eval-opponent` | 无 (可选) | 对战注册的 NN 对手（别名），与 eval-level 互不影响 |
 | `--eval-interval` | 15 | 每 N 个 cycle 做一次 probe 评估 |
 | `--probe-games` | 50 | probe 评估的游戏数 |
 | `--probe-window` | 3 | 平滑胜率的滑动窗口大小 |
 | `--full-eval-games` | 200 | checkpoint 完整评估的游戏数 |
 | `--resume` | — | 从指定 UUID 的最新 checkpoint 续训（支持短前缀） |
+
+### Opponent management
+
+Register a trained checkpoint as a named NN opponent for future training:
+
+```bash
+# Register a checkpoint as opponent with alias
+uv run python src/train.py --register-opponent L0 --from-run 374d567f --from-tag wr065_c0310 --description "5000-game baseline"
+
+# List registered opponents
+uv run python src/play.py --list-opponents
+
+# Train against registered opponent
+uv run python src/train.py --eval-opponent L0 --target-win-rate 0.80
+```
+
+Probe evaluations use the NN opponent for fast feedback; checkpoint full evaluations still use minimax for consistent cross-run comparison.
 
 ### Checkpoint milestones
 
@@ -150,6 +174,7 @@ uv run python src/play.py --checkpoint best            # vs best archived model
 uv run python src/play.py --black stage0 --white best  # watch two AIs play
 uv run python src/play.py --level 2                    # vs minimax (no NN)
 uv run python src/play.py --list                       # list all checkpoints
+uv run python src/play.py --list-opponents             # list registered NN opponents
 ```
 
 ## Recording and replay
@@ -186,6 +211,9 @@ sqlite3 -header -csv output/tracker.db "SELECT game_file, result, total_moves, n
 
 # View resume chain
 sqlite3 -header -column output/tracker.db "SELECT substr(id,1,8) AS run, substr(resumed_from,1,8) AS parent FROM runs WHERE resumed_from IS NOT NULL"
+
+# List registered opponents
+sqlite3 -header -column output/tracker.db "SELECT alias, win_rate, eval_level, substr(source_run,1,8) AS src_run, description FROM opponents"
 ```
 
 ## Hardware

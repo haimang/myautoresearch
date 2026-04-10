@@ -121,6 +121,8 @@ def print_checkpoints():
 def main():
     parser = argparse.ArgumentParser(description="MAG Gomoku - Play")
     parser.add_argument("--list", action="store_true", help="List all checkpoints")
+    parser.add_argument("--list-opponents", action="store_true",
+                        help="List all registered NN opponents")
     parser.add_argument("--checkpoint", "-c", type=str, default=None,
                         help="Checkpoint tag or path (human plays BLACK vs this AI)")
     parser.add_argument("--black", type=str, default=None,
@@ -137,6 +139,24 @@ def main():
 
     if args.list:
         print_checkpoints()
+        return
+
+    if args.list_opponents:
+        conn = tracker.init_db()
+        opponents = tracker.list_opponents(conn)
+        conn.close()
+        if not opponents:
+            print("No registered opponents. Use train.py --register-opponent to register one.")
+            return
+        print(f"{'Alias':<12} {'WR':>6} {'Level':>6} {'Source':>10} {'Description'}")
+        print("─" * 60)
+        for o in opponents:
+            alias = o["alias"]
+            wr = f"{o['win_rate']:.0%}" if o.get("win_rate") else "—"
+            lv = f"L{o['eval_level']}" if o.get("eval_level") is not None else "—"
+            src = o["source_run"][:8] if o.get("source_run") else "—"
+            desc = o.get("description") or ""
+            print(f"{alias:<12} {wr:>6} {lv:>6} {src:>10} {desc}")
         return
 
     # Determine players

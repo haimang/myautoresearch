@@ -232,11 +232,14 @@ def run_self_play(model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE):
 
     # Collect training data from all completed games
     all_training_data = []
+    game_lengths = []
     for i in range(num_games):
         game_data = _collect_game_with_policies(batch, i, move_policies[i])
         all_training_data.extend(game_data)
+        game_lengths.append(int(batch.move_counts[i]))
 
-    return all_training_data, num_games
+    avg_game_len = sum(game_lengths) / len(game_lengths) if game_lengths else 0.0
+    return all_training_data, num_games, avg_game_len
 
 
 def _collect_game_with_policies(batch, game_idx, policies):
@@ -378,6 +381,7 @@ def train(args):
         "target_win_rate": target_win_rate,
         "target_games": target_games,
         "eval_level": eval_level,
+        "eval_opponent": args.eval_opponent,
     }
     _tracker.create_run(db_conn, run_id, hyperparams, hw_info,
                         resumed_from=resumed_from, output_dir=output_dir)
@@ -410,6 +414,23 @@ def train(args):
     last_ckpt_wr: float = initial_ckpt_wr
     num_checkpoints = 0
     stop_reason = "time_budget"
+    avg_game_length = 0.0
+
+    # NN opponent (if --eval-opponent specified)
+    eval_opponent_alias: str | None = args.eval_opponent
+    opponent_model = None
+    if eval_opponent_alias:
+        opp = _tracker.get_opponent(db_conn, eval_opponent_alias)
+        if not opp:
+            print(f"Error: opponent '{eval_opponent_alias}' not found")
+            sys.exit(1)
+        if not os.path.exists(opp["model_path"]):
+            print(f"Error: opponent model file not found: {opp['model_path']}")
+            sys.exit(1)
+        opponent_model = load_model(opp["model_path"])
+        opponent_model.eval()
+        mx.eval(opponent_model.parameters())
+        print(f"Loaded NN opponent '{eval_opponent_alias}' from {opp['model_path']}")
 
     # History for sparklines
     loss_history: list[float] = []
@@ -423,6 +444,7 @@ def train(args):
     events: list[str] = []
 
     def _sparkline(values: list[float], width: int = 30) -> str:
+        """Single-row sparkline for compact display."""
         if not values:
             return ""
         chars = "▁▂▃▄▅▆▇█"
@@ -430,6 +452,30 @@ def train(args):
         lo, hi = min(recent), max(recent)
         span = hi - lo if hi > lo else 1.0
         return "".join(chars[min(int((v - lo) / span * 7), 7)] for v in recent)
+
+    def _sparkline2(values: list[float], width: int = 40) -> tuple[str, str]:
+        """Double-height sparkline — returns (upper_row, lower_row)."""
+        if not values:
+            return ("", "")
+        # Block elements for upper/lower halves
+        # Lower row uses full blocks ▁▂▃▄▅▆▇█ for values 0-7
+        # Upper row uses spaces for low values, blocks for values 8-15
+        lo_chars = " ▁▂▃▄▅▆▇"  # 0-7: lower half
+        hi_chars = " ▁▂▃▄▅▆▇"  # 8-15: upper half (shifted)
+        recent = values[-width:]
+        lo, hi = min(recent), max(recent)
+        span = hi - lo if hi > lo else 1.0
+        upper = []
+        lower = []
+        for v in recent:
+            level = min(int((v - lo) / span * 15), 15)
+            if level >= 8:
+                lower.append("█")
+                upper.append(hi_chars[level - 8])
+            else:
+                lower.append(lo_chars[level])
+                upper.append(" ")
+        return ("".join(upper), "".join(lower))
 
     def _smoothed_wr(window: int = probe_window) -> float | None:
         """Sliding average of recent probe WRs for stable decisions."""
@@ -449,46 +495,58 @@ def train(args):
         return f"{bar} {frac:3.0%} {em}:{es:02d} / {bm}:{bs:02d}"
 
     def _draw_panel():
-        """Render the full text TUI panel."""
+        """Render the full text TUI panel with fixed-width columns."""
         W = 62  # inner width
         chip = hw_info.get("chip", "")
         elapsed = _time.time() - start_time
+        gps = total_games / elapsed if elapsed > 0 else 0.0
+
+        def row(text: str) -> str:
+            """Pad or truncate text to exactly W chars inside box borders."""
+            return "│" + text[:W].ljust(W) + "│"
 
         lines = []
         lines.append("╭" + "─" * W + "╮")
-        hdr = f" Run: {run_id_short}  {chip}  {num_params/1000:.1f}K params"
-        lines.append("│" + hdr.ljust(W) + "│")
+        lines.append(row(f" Run: {run_id_short}  {chip}  {num_params/1000:.1f}K params"))
         if time_budget is not None:
-            pbar = " " + _progress_bar(elapsed, time_budget)
-            lines.append("│" + pbar.ljust(W) + "│")
+            lines.append(row(" " + _progress_bar(elapsed, time_budget)))
         else:
             tgt = f"  Target: {target_win_rate:.0%} WR" if target_win_rate else ""
             em, es = divmod(int(elapsed), 60)
-            info = f" Elapsed: {em}:{es:02d}{tgt}"
-            lines.append("│" + info.ljust(W) + "│")
+            lines.append(row(f" Elapsed: {em}:{es:02d}{tgt}"))
+
+        # --- Stats block (3 rows, fixed column widths) ---
+        # Col layout: "  {lbl} {val:>6}  │  {lbl} {val:>7}  │  {lbl} {val}"
         lines.append("├" + "─" * W + "┤")
-        wr_str = f"{last_probe_wr:.1%}" if last_probe_wr is not None else "—"
+        wr_str = f"{last_probe_wr:.0%}" if last_probe_wr is not None else "—"
         sm_wr = _smoothed_wr()
-        sm_str = f" avg:{sm_wr:.1%}" if sm_wr is not None and len(wr_history) > 1 else ""
-        r1 = f"  Cycle {cycle:5d}  │  Loss {last_loss:8.4f}  │  Games {total_games:7d}"
-        lines.append("│" + r1.ljust(W) + "│")
-        r2 = f"  Steps {total_train_steps:5d}  │  Buffer {len(replay_buffer):5d}  │  WR {wr_str}{sm_str} (L{eval_level})"
-        lines.append("│" + r2.ljust(W) + "│")
-        if loss_history or wr_history:
+        sm_str = f" avg:{sm_wr:.0%}" if sm_wr is not None and len(wr_history) > 1 else ""
+        opp_str = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
+        lines.append(row(f"  Cycle  {cycle:>6d}  │  Loss    {last_loss:>8.4f}  │  Games  {total_games:>7d}"))
+        lines.append(row(f"  Steps  {total_train_steps:>6d}  │  Buffer  {len(replay_buffer):>8d}  │  WR {wr_str:>5}{sm_str}"))
+        lines.append(row(f"  Gm/s   {gps:>6.1f}  │  AvgLen  {avg_game_length:>8.1f}  │  vs {opp_str}  Ckpts:{num_checkpoints}"))
+
+        # --- Charts block (WR + Loss, each 2-row height) ---
+        CW = 40  # chart width
+        if wr_history or loss_history:
             lines.append("├" + "─" * W + "┤")
             if wr_history:
-                spark = _sparkline(wr_history)
+                up, lo = _sparkline2(wr_history, CW)
                 wr_last = wr_history[-1]
-                sl = f"  Win Rate {spark} {wr_last:.0%}"
-                lines.append("│" + sl.ljust(W) + "│")
+                lines.append(row(f"  Win Rate{' ' * (CW - len(up) + 2)}{up} {wr_last:>4.0%}"))
+                lines.append(row(f"          {' ' * (CW - len(lo) + 2)}{lo}     "))
+            if wr_history and loss_history:
+                lines.append("│" + "╌" * W + "│")
             if loss_history:
-                spark = _sparkline(loss_history)
-                sl = f"  Loss     {spark} {last_loss:.2f}"
-                lines.append("│" + sl.ljust(W) + "│")
+                up, lo = _sparkline2(loss_history, CW)
+                lines.append(row(f"  Loss    {' ' * (CW - len(up) + 2)}{up} {last_loss:>5.2f}"))
+                lines.append(row(f"          {' ' * (CW - len(lo) + 2)}{lo}     "))
+
+        # --- Events block ---
         if events:
             lines.append("├" + "─" * W + "┤")
             for e in events[-6:]:
-                lines.append("│" + f"  {e}".ljust(W) + "│")
+                lines.append(row(f"  {e}"))
         lines.append("╰" + "─" * W + "╯")
         return "\n".join(lines)
 
@@ -524,10 +582,11 @@ def train(args):
 
             # ----- Self-play -----
             model.eval()
-            data, games_done = run_self_play(
+            data, games_done, avg_gl = run_self_play(
                 model, num_games=parallel_games, temperature=TEMPERATURE
             )
             total_games += games_done
+            avg_game_length = avg_gl
 
             for item in data:
                 if len(replay_buffer) >= REPLAY_BUFFER_SIZE:
@@ -585,7 +644,8 @@ def train(args):
             # ----- Probe evaluation -----
             if cycle % eval_interval == 0 and evaluate_win_rate is not None:
                 model.eval()
-                probe_wr = _quick_eval(model, eval_level, probe_games)
+                probe_wr = _quick_eval(model, eval_level, probe_games,
+                                       opponent_model=opponent_model)
                 last_probe_wr = probe_wr
                 wr_history.append(probe_wr)
                 metric["win_rate"] = probe_wr
@@ -595,7 +655,8 @@ def train(args):
 
                 sm_wr = _smoothed_wr()
                 sm_str = f" (avg:{sm_wr:.1%})" if sm_wr is not None and len(wr_history) > 1 else ""
-                _log_event(f"Probe: {probe_wr:.1%}{sm_str} ({probe_games} games vs L{eval_level})")
+                opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
+                _log_event(f"Probe: {probe_wr:.1%}{sm_str} ({probe_games} games vs {opp_label})")
 
                 # Check checkpoint threshold using smoothed WR
                 effective_wr = sm_wr if sm_wr is not None else probe_wr
@@ -715,31 +776,59 @@ def train(args):
     print()
     print("=" * 60)
     resumed_str = f"  (resumed from {resumed_from[:8]})" if resumed_from else ""
+    opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
     print(f"Run:        {run_id_short}{resumed_str} ({stop_reason})")
     print(f"Cycles:     {cycle - initial_cycle} (total cycle #{cycle})")
     print(f"Games:      {total_games}")
     print(f"Steps:      {total_train_steps}")
     print(f"Final loss: {last_loss:.4f}")
     if final_wr is not None:
-        print(f"Win rate:   {final_wr:.1%} (vs L{eval_level})")
+        print(f"Win rate:   {final_wr:.1%} (vs {opp_label})")
     print(f"Checkpoints:{num_checkpoints}")
     print(f"Wall time:  {total_elapsed:.1f}s")
     print(f"Output:     {output_dir}/")
     print(f"Tracker:    output/tracker.db")
+
+    # Promotion hints
+    if final_wr is not None and final_wr >= 0.65:
+        print()
+        best_tag = None
+        if num_checkpoints > 0:
+            ckpts = _tracker.init_db()
+            clist = _tracker.get_checkpoints(ckpts, run_id)
+            ckpts.close()
+            if clist:
+                best = max(clist, key=lambda c: c.get("win_rate", 0))
+                best_tag = best["tag"]
+                best_wr = best.get("win_rate", 0)
+                print(f"💡 Best checkpoint: {best_tag} (WR {best_wr:.1%})")
+        print("💡 Consider registering this model as an opponent:")
+        if best_tag:
+            print(f"   uv run python src/train.py --register-opponent my_opponent "
+                  f"--from-run {run_id_short} --from-tag {best_tag}")
+        print(f"   Then train against it: uv run python src/train.py --eval-opponent my_opponent")
     print("=" * 60)
 
 
-def _quick_eval(model, level: int, n_games: int) -> float:
-    """In-process lightweight evaluation. Returns win_rate."""
-    from prepare import OPPONENTS
-    opponent_fn = OPPONENTS[level]
+def _quick_eval(model, level: int, n_games: int,
+                opponent_model=None) -> float:
+    """In-process lightweight evaluation. Returns win_rate.
+    
+    If opponent_model is provided, plays against it instead of minimax.
+    """
+    from game import Board
+
+    use_nn_opponent = opponent_model is not None
+    opponent_fn = None
+    if not use_nn_opponent:
+        from prepare import OPPONENTS
+        opponent_fn = OPPONENTS[level]
 
     wins = 0
     for game_i in range(n_games):
         nn_is_black = game_i < n_games // 2
         nn_player = BLACK if nn_is_black else WHITE
 
-        from game import Board
         board = Board()
         while not board.is_terminal():
             if board.current_player == nn_player:
@@ -751,6 +840,8 @@ def _quick_eval(model, level: int, n_games: int) -> float:
                 masked = mx.where(legal_mask > 0, policy, mx.array(float("-inf")))
                 action = int(mx.argmax(masked).item())
                 row, col = divmod(action, BOARD_SIZE)
+            elif use_nn_opponent:
+                row, col = _nn_opponent_move(opponent_model, board)
             else:
                 row, col = opponent_fn(board)
             board.place(row, col)
@@ -762,6 +853,19 @@ def _quick_eval(model, level: int, n_games: int) -> float:
             mx.clear_cache()
 
     return wins / n_games if n_games > 0 else 0.0
+
+
+def _nn_opponent_move(opp_model, board) -> tuple[int, int]:
+    """Make a move using an NN opponent model (argmax policy)."""
+    encoded = board.encode()
+    x = mx.array(encoded[np.newaxis, ...])
+    policy_logits, _ = opp_model(x)
+    policy = policy_logits[0]
+    legal_mask = mx.array(board.get_legal_mask())
+    masked = mx.where(legal_mask > 0, policy, mx.array(float("-inf")))
+    action = int(mx.argmax(masked).item())
+    row, col = divmod(action, BOARD_SIZE)
+    return row, col
 
 
 def _subprocess_eval(model_path: str, level: int, n_games: int,
@@ -885,6 +989,8 @@ def parse_args() -> argparse.Namespace:
                    help="Stop after this many self-play games")
     p.add_argument("--eval-level", type=int, default=EVAL_LEVEL,
                    help=f"Evaluation opponent level 0-3 (default: {EVAL_LEVEL})")
+    p.add_argument("--eval-opponent", type=str, default=None,
+                   help="Evaluate against a registered NN opponent alias")
     p.add_argument("--eval-interval", type=int, default=15,
                    help="Probe evaluation every N cycles (default: 15)")
     p.add_argument("--probe-games", type=int, default=50,
@@ -897,9 +1003,74 @@ def parse_args() -> argparse.Namespace:
                    help=f"Number of simultaneous self-play games (default: {PARALLEL_GAMES})")
     p.add_argument("--resume", type=str, default=None,
                    help="UUID of a previous run to resume from its last checkpoint")
+    # Opponent registration (non-training mode)
+    p.add_argument("--register-opponent", type=str, default=None, metavar="ALIAS",
+                   help="Register a checkpoint as a named NN opponent")
+    p.add_argument("--from-run", type=str, default=None,
+                   help="Source run UUID for --register-opponent")
+    p.add_argument("--from-tag", type=str, default=None,
+                   help="Source checkpoint tag for --register-opponent")
+    p.add_argument("--description", type=str, default=None,
+                   help="Description for --register-opponent")
     return p.parse_args()
+
+
+def _handle_register_opponent(args: argparse.Namespace) -> None:
+    """Register a checkpoint model as a named opponent, then exit."""
+    import tracker as _tracker
+    import shutil
+
+    alias = args.register_opponent
+    if not args.from_run or not args.from_tag:
+        print("Error: --register-opponent requires --from-run and --from-tag")
+        sys.exit(1)
+
+    conn = _tracker.init_db()
+    run = _tracker.get_run(conn, args.from_run)
+    if not run:
+        print(f"Error: run '{args.from_run}' not found")
+        sys.exit(1)
+
+    resolved_run_id = run["id"]
+    ckpt = _tracker.find_checkpoint_by_tag(conn, args.from_tag)
+    if not ckpt or ckpt["run_id"] != resolved_run_id:
+        # Try run-scoped search
+        ckpts = _tracker.get_checkpoints(conn, resolved_run_id)
+        ckpt = next((c for c in ckpts if args.from_tag in c["tag"]), None)
+        if not ckpt:
+            print(f"Error: checkpoint '{args.from_tag}' not found in run {resolved_run_id[:8]}")
+            sys.exit(1)
+
+    src_path = ckpt["model_path"]
+    if not os.path.exists(src_path):
+        print(f"Error: model file not found: {src_path}")
+        sys.exit(1)
+
+    dst_dir = os.path.join("output", "opponents", alias)
+    os.makedirs(dst_dir, exist_ok=True)
+    dst_path = os.path.join(dst_dir, "model.safetensors")
+    shutil.copy2(src_path, dst_path)
+
+    _tracker.register_opponent(
+        conn, alias, dst_path,
+        source_run=resolved_run_id,
+        source_tag=ckpt["tag"],
+        win_rate=ckpt.get("win_rate"),
+        eval_level=ckpt.get("eval_level"),
+        description=args.description,
+    )
+    conn.close()
+
+    print(f"✓ Registered opponent '{alias}'")
+    print(f"  Source: run {resolved_run_id[:8]} / {ckpt['tag']}")
+    print(f"  WR: {ckpt.get('win_rate', 0):.1%}  Level: L{ckpt.get('eval_level', '?')}")
+    print(f"  Model: {dst_path}")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train(args)
+    if args.register_opponent:
+        _handle_register_opponent(args)
+    else:
+        train(args)
