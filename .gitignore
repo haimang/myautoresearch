@@ -16,3 +16,6 @@ uv.lock
 # ── Python tooling ──
 .venv/
 .vscode/
+
+# Plan docs (not tracked)
+update-v2.md

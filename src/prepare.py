@@ -4,20 +4,15 @@ Evaluation infrastructure for MAG-Gomoku autoresearch.
 Provides:
   - Minimax opponents (L0-L3) for benchmarking neural-network agents
   - evaluate_win_rate():  play N games against a given opponent level
-  - Checkpoint archival and metrics logging
   - Frame capture for notable game moments
 
 This module is READ-ONLY evaluation code — it never modifies model weights.
 """
 
-import csv
 import json
 import os
 import random
-import shutil
 import time
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -38,7 +33,6 @@ from game import (
 
 TIME_BUDGET = 300  # 5 minutes training wall clock
 EVAL_GAMES = 200  # games per evaluation
-CHECKPOINT_DIR = os.path.expanduser("~/.cache/mag-gomoku/checkpoints")
 RECORDING_DIR = "output/recordings"
 
 # ---------------------------------------------------------------------------
@@ -380,19 +374,23 @@ OPPONENTS = {0: opponent_l0, 1: opponent_l1, 2: opponent_l2, 3: opponent_l3}
 
 def evaluate_win_rate(
     model_path: str,
-    level: int = 2,
+    level: int = 0,
     n_games: int = EVAL_GAMES,
-    record_games: int = 5,
-    experiment_id: int = 0,
+    record_games: int = 0,
+    tag: str = "",
+    run_id: str = "",
 ) -> dict:
     """
     Play `n_games` between a trained NN model and a minimax opponent.
 
     The NN plays as BLACK for the first half and as WHITE for the second half.
-    Returns a dict with win_rate, wins, losses, draws, avg_game_length, level.
+    Returns a dict with win_rate, wins, losses, draws, avg_game_length, level,
+    recorded_files (list of paths), and eval_elapsed_s.
     """
     import mlx.core as mx
     from train import GomokuNet, load_model
+
+    eval_start = time.time()
 
     model = load_model(model_path)
     model.eval()  # Crucial: disable BatchNorm running stats updates during inference
@@ -402,49 +400,50 @@ def evaluate_win_rate(
     losses = 0
     draws = 0
     total_length = 0
+    recorded_files: list[str] = []
+
     games_dir = os.path.join(RECORDING_DIR, "games")
     os.makedirs(games_dir, exist_ok=True)
+
+    # Per-game detail for data analysis
+    game_details: list[dict] = []
 
     for game_i in range(n_games):
         nn_is_black = game_i < n_games // 2
         nn_player = BLACK if nn_is_black else WHITE
 
         board = Board()
-        record = GameRecord(
-            black_name="nn" if nn_is_black else f"minimax_L{level}",
-            white_name=f"minimax_L{level}" if nn_is_black else "nn",
-        )
+        black_name = "nn" if nn_is_black else f"minimax_L{level}"
+        white_name = f"minimax_L{level}" if nn_is_black else "nn"
+        record = GameRecord(black_name=black_name, white_name=white_name)
 
         step = 0
         while not board.is_terminal():
             if board.current_player == nn_player:
-                # NN move
                 encoded = board.encode()
-                x = mx.array(encoded[np.newaxis, ...])  # [1, 3, 15, 15]
+                x = mx.array(encoded[np.newaxis, ...])
                 policy_logits, value = model(x)
-                policy = policy_logits[0]  # [225]
+                policy = policy_logits[0]
 
-                # Mask illegal moves
                 legal_mask = mx.array(board.get_legal_mask())
                 masked = mx.where(legal_mask > 0, policy, mx.array(float("-inf")))
                 action = int(mx.argmax(masked).item())
                 row, col = divmod(action, BOARD_SIZE)
             else:
-                # Opponent move
                 row, col = opponent_fn(board)
 
             board.place(row, col)
             record.add_move(step=step, row=row, col=col, player=board.history[-1][2])
             step += 1
 
-        # Periodically clear Metal cache to avoid resource limit exhaustion
         if game_i % 20 == 0:
             mx.clear_cache()
 
-        # Record result
         total_length += board.move_count
+        nn_won = 0
         if board.winner == nn_player:
             wins += 1
+            nn_won = 1
             record.result = board.winner
         elif board.winner == -1:
             draws += 1
@@ -453,13 +452,33 @@ def evaluate_win_rate(
             losses += 1
             record.result = board.winner
 
-        # Save the first few games
-        if game_i < record_games:
-            save_path = os.path.join(
-                games_dir, f"exp{experiment_id}_game{game_i}.json"
-            )
-            record.save(save_path)
+        # Determine result string
+        result_map = {BLACK: "black_win", WHITE: "white_win", -1: "draw", 0: "ongoing"}
+        result_str = result_map.get(board.winner, "unknown")
 
+        nn_side = "black" if nn_is_black else "white"
+        game_details.append({
+            "game_index": game_i,
+            "result": result_str,
+            "total_moves": board.move_count,
+            "black": black_name,
+            "white": white_name,
+            "nn_side": nn_side,
+            "nn_won": nn_won,
+        })
+
+        # Save recordings
+        if game_i < record_games:
+            if tag:
+                filename = f"{tag}_game{game_i:03d}.json"
+            else:
+                filename = f"game{game_i:03d}.json"
+            save_path = os.path.join(games_dir, filename)
+            record.save(save_path)
+            recorded_files.append(save_path)
+            game_details[-1]["game_file"] = save_path
+
+    eval_elapsed = time.time() - eval_start
     win_rate = wins / n_games if n_games > 0 else 0.0
     avg_length = total_length / n_games if n_games > 0 else 0.0
 
@@ -470,6 +489,10 @@ def evaluate_win_rate(
         "draws": draws,
         "avg_game_length": avg_length,
         "level": level,
+        "n_games": n_games,
+        "recorded_files": recorded_files,
+        "game_details": game_details,
+        "eval_elapsed_s": eval_elapsed,
     }
 
     # Print standard output format
@@ -480,110 +503,11 @@ def evaluate_win_rate(
     print(f"losses:           {losses}")
     print(f"draws:            {draws}")
     print(f"avg_game_length:  {avg_length:.1f}")
+    print(f"eval_time:        {eval_elapsed:.1f}s")
+    if recorded_files:
+        print(f"recorded_games:   {len(recorded_files)}")
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint archive
-# ---------------------------------------------------------------------------
-
-def archive_checkpoint(model_path: str, tag: str, metadata: dict):
-    """
-    Copy a model checkpoint to the archive directory with a human-readable tag.
-
-    Parameters
-    ----------
-    model_path : str   — path to the .safetensors file to archive
-    tag : str          — human-readable tag (e.g. "L2_wr73_ep50")
-    metadata : dict    — arbitrary metadata to store in the manifest
-    """
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    dest = os.path.join(CHECKPOINT_DIR, f"{tag}.safetensors")
-    shutil.copy2(model_path, dest)
-
-    manifest_path = os.path.join(CHECKPOINT_DIR, "manifest.json")
-    if os.path.exists(manifest_path):
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-    else:
-        manifest = []
-
-    manifest.append({
-        "tag": tag,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source_path": os.path.abspath(model_path),
-        "archived_path": os.path.abspath(dest),
-        **metadata,
-    })
-
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-
-
-def list_checkpoints() -> list[dict]:
-    """Read and return all entries from the checkpoint manifest."""
-    manifest_path = os.path.join(CHECKPOINT_DIR, "manifest.json")
-    if not os.path.exists(manifest_path):
-        return []
-    with open(manifest_path) as f:
-        return json.load(f)
-
-
-# ---------------------------------------------------------------------------
-# Metrics logging
-# ---------------------------------------------------------------------------
-
-_METRIC_COLUMNS = [
-    "experiment", "timestamp", "win_rate", "eval_level",
-    "num_params", "status", "description",
-]
-
-
-def log_metrics(experiment_id: int, metrics: dict):
-    """
-    Append a metrics row to the training log CSV.
-
-    Always-present columns: experiment, timestamp, win_rate, eval_level,
-    num_params, status, description.  Extra keys from `metrics` are
-    appended as additional columns.
-    """
-    metrics_dir = os.path.join(RECORDING_DIR, "metrics")
-    os.makedirs(metrics_dir, exist_ok=True)
-    csv_path = os.path.join(metrics_dir, "training_log.csv")
-
-    # Build the row
-    row = {
-        "experiment": experiment_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    for col in _METRIC_COLUMNS[2:]:
-        row[col] = metrics.get(col, "")
-    # Extra keys not in the standard columns
-    for k, v in metrics.items():
-        if k not in row:
-            row[k] = v
-
-    all_columns = list(row.keys())
-
-    file_exists = os.path.exists(csv_path)
-    if file_exists:
-        # Read existing header to preserve column order and detect new columns
-        with open(csv_path, "r", newline="") as f:
-            reader = csv.reader(f)
-            existing_header = next(reader, None)
-        if existing_header:
-            # Add any new columns at the end
-            new_cols = [c for c in all_columns if c not in existing_header]
-            all_columns = existing_header + new_cols
-        else:
-            file_exists = False
-
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction="ignore")
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
 
 
 # ---------------------------------------------------------------------------

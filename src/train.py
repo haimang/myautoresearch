@@ -5,9 +5,15 @@ This is the MUTABLE training script for the autoresearch loop.
 The agent modifies hyperparameters and architecture between runs.
 """
 
+import argparse
+import json
 import os
 import random
+import shutil
+import subprocess
+import sys
 import time as _time
+import uuid
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -17,11 +23,10 @@ import numpy as np
 from game import BatchBoards, BOARD_SIZE, BLACK, WHITE, EMPTY
 
 # Try to import TIME_BUDGET and evaluate_win_rate from prepare.py.
-# If prepare.py doesn't exist yet, use defaults.
 try:
     from prepare import TIME_BUDGET
 except ImportError:
-    TIME_BUDGET = 300  # 5 minutes default
+    TIME_BUDGET = 300
 
 try:
     from prepare import evaluate_win_rate
@@ -297,26 +302,63 @@ def compute_loss(model, batch_boards, batch_policies, batch_values):
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train():
-    """Main training function with fixed time budget."""
+def train(args):
+    """Main training function with checkpoint tracking and Rich TUI."""
+    import tracker as _tracker
+
+    run_id = str(uuid.uuid4())
+    run_id_short = run_id[:8]
     start_time = _time.time()
 
+    # Resolve effective parameters (CLI args override module constants)
+    time_budget = args.time_budget
+    eval_level = args.eval_level
+    eval_interval = args.eval_interval
+    probe_games = args.probe_games
+    full_eval_games = args.full_eval_games
+    target_win_rate = args.target_win_rate
+    target_games = args.target_games
+
+    # Initialize tracker DB
+    db_conn = _tracker.init_db()
+    hw_info = _tracker.collect_hardware_info()
+
+    hyperparams = {
+        "num_res_blocks": NUM_RES_BLOCKS,
+        "num_filters": NUM_FILTERS,
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "batch_size": BATCH_SIZE,
+        "parallel_games": PARALLEL_GAMES,
+        "mcts_simulations": MCTS_SIMULATIONS,
+        "temperature": TEMPERATURE,
+        "temp_threshold": TEMP_THRESHOLD,
+        "replay_buffer_size": REPLAY_BUFFER_SIZE,
+        "train_steps_per_cycle": TRAIN_STEPS_PER_CYCLE,
+        "time_budget": time_budget,
+        "target_win_rate": target_win_rate,
+        "target_games": target_games,
+        "eval_level": eval_level,
+    }
+    _tracker.create_run(db_conn, run_id, hyperparams, hw_info)
+
     # Initialize model
-    model = GomokuNet()
-    # Warm up model parameters by doing a dummy forward pass
+    if args.resume and os.path.exists(args.resume):
+        model = load_model(args.resume)
+    else:
+        model = GomokuNet()
     dummy = mx.zeros((1, 3, BOARD_SIZE, BOARD_SIZE))
     _ = model(dummy)
     mx.eval(model.parameters())
 
     num_params = count_parameters(model)
-    print(f"Parameters: {num_params / 1000:.1f}K")
 
     # Optimizer
     optimizer = optim.AdamW(
         learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
 
-    # Replay buffer: list of (board_encoding, policy_target, value_target)
+    # Replay buffer
     replay_buffer: list[tuple[np.ndarray, np.ndarray, float]] = []
 
     # Training state
@@ -324,154 +366,505 @@ def train():
     total_train_steps = 0
     cycle = 0
     last_loss = 0.0
+    last_probe_wr: float | None = None
+    last_ckpt_wr: float = 0.0
+    num_checkpoints = 0
+    stop_reason = "time_budget"
+
+    # History for sparklines
+    loss_history: list[float] = []
+    wr_history: list[float] = []
 
     # Loss and grad function
     loss_and_grad = nn.value_and_grad(model, compute_loss)
 
-    print(f"Time budget: {TIME_BUDGET}s")
-    print(f"Starting training loop...")
-    print()
+    # --- Rich TUI setup ---
+    use_tui = sys.stdout.isatty()
+    live = None
+    events: list[str] = []
 
-    while True:
-        elapsed = _time.time() - start_time
-        if elapsed >= TIME_BUDGET:
-            break
+    if use_tui:
+        try:
+            from rich.live import Live
+            from rich.layout import Layout
+            from rich.panel import Panel
+            from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+            from rich.table import Table
+            from rich.text import Text
 
-        cycle += 1
-
-        # ----- Self-play cycle -----
-        model.eval()
-        data, games_done = run_self_play(
-            model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE
-        )
-        total_games += games_done
-
-        # Add data to replay buffer
-        for item in data:
-            if len(replay_buffer) >= REPLAY_BUFFER_SIZE:
-                # Replace a random entry
-                idx = random.randint(0, len(replay_buffer) - 1)
-                replay_buffer[idx] = item
-            else:
-                replay_buffer.append(item)
-
-        # ----- Training cycle -----
-        if len(replay_buffer) >= BATCH_SIZE:
-            model.train()
-            cycle_loss = 0.0
-            steps_this_cycle = min(
-                TRAIN_STEPS_PER_CYCLE,
-                len(replay_buffer) // BATCH_SIZE
+            progress = Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(bar_width=40),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                TextColumn("/"),
+                TimeRemainingColumn(),
             )
-            steps_this_cycle = max(steps_this_cycle, 1)
+            task_id = progress.add_task("Training", total=time_budget)
 
-            for step in range(steps_this_cycle):
-                # Check time budget during training
-                if _time.time() - start_time >= TIME_BUDGET:
+            def _sparkline(values: list[float], width: int = 30) -> str:
+                if not values:
+                    return ""
+                chars = "▁▂▃▄▅▆▇█"
+                recent = values[-width:]
+                lo, hi = min(recent), max(recent)
+                span = hi - lo if hi > lo else 1.0
+                return "".join(chars[min(int((v - lo) / span * 7), 7)] for v in recent)
+
+            def build_display() -> Panel:
+                # Metrics table
+                tbl = Table(show_header=False, box=None, padding=(0, 2))
+                tbl.add_column(style="bold cyan", width=12)
+                tbl.add_column(width=12)
+                tbl.add_column(style="bold cyan", width=12)
+                tbl.add_column(width=12)
+                tbl.add_column(style="bold cyan", width=14)
+                tbl.add_column(width=14)
+
+                wr_str = f"{last_probe_wr:.1%}" if last_probe_wr is not None else "—"
+                next_t = _tracker.next_threshold(last_ckpt_wr)
+                next_str = f"→ {next_t:.0%}" if next_t else "—"
+
+                tbl.add_row(
+                    "Cycle", str(cycle),
+                    "Loss", f"{last_loss:.4f}" if last_loss else "—",
+                    "Games", str(total_games),
+                )
+                tbl.add_row(
+                    "Steps", str(total_train_steps),
+                    "Buffer", str(len(replay_buffer)),
+                    f"WinRate(L{eval_level})", f"{wr_str} {next_str}",
+                )
+
+                # Sparklines
+                lines = Text()
+                if loss_history:
+                    lines.append("  Loss  ", style="bold cyan")
+                    lines.append(_sparkline(loss_history))
+                    lines.append(f" {last_loss:.3f}\n")
+                if wr_history:
+                    lines.append("  WR    ", style="bold cyan")
+                    lines.append(_sparkline(wr_history))
+                    wr_last = wr_history[-1] if wr_history else 0
+                    lines.append(f" {wr_last:.1%}\n")
+
+                # Event log (last 8)
+                evt_text = Text()
+                for e in events[-8:]:
+                    evt_text.append(f"  {e}\n")
+
+                # Assemble
+                layout = Layout()
+                layout.split_column(
+                    Layout(progress, size=1),
+                    Layout(tbl, size=3),
+                    Layout(lines, size=3) if (loss_history or wr_history) else Layout("", size=0),
+                    Layout(evt_text, size=min(len(events[-8:]) + 1, 9)),
+                )
+
+                return Panel(
+                    layout,
+                    title=f"[bold]MAG-Gomoku Training[/bold]  "
+                          f"[dim]Run {run_id_short}  {hw_info.get('chip', '')}  "
+                          f"{num_params/1000:.1f}K params[/dim]",
+                    border_style="blue",
+                )
+
+            live = Live(build_display(), refresh_per_second=2)
+            live.start()
+        except Exception:
+            use_tui = False
+
+    def _log_event(msg: str):
+        ts = _time.strftime("%H:%M:%S")
+        events.append(f"[{ts}] {msg}")
+        if not use_tui:
+            print(f"[{ts}] {msg}")
+
+    def _update_tui():
+        if live:
+            elapsed = _time.time() - start_time
+            progress.update(task_id, completed=min(elapsed, time_budget))
+            live.update(build_display())
+
+    _log_event(f"Started run {run_id_short} | {num_params/1000:.1f}K params | budget {time_budget}s")
+
+    # -----------------------------------------------------------------------
+    # Training loop
+    # -----------------------------------------------------------------------
+    try:
+        while True:
+            elapsed = _time.time() - start_time
+            if elapsed >= time_budget:
+                stop_reason = "time_budget"
+                break
+            if target_games and total_games >= target_games:
+                stop_reason = "target_games"
+                break
+
+            cycle += 1
+
+            # ----- Self-play -----
+            model.eval()
+            data, games_done = run_self_play(
+                model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE
+            )
+            total_games += games_done
+
+            for item in data:
+                if len(replay_buffer) >= REPLAY_BUFFER_SIZE:
+                    idx = random.randint(0, len(replay_buffer) - 1)
+                    replay_buffer[idx] = item
+                else:
+                    replay_buffer.append(item)
+
+            # ----- Training -----
+            if len(replay_buffer) >= BATCH_SIZE:
+                model.train()
+                cycle_loss = 0.0
+                steps_this_cycle = min(
+                    TRAIN_STEPS_PER_CYCLE,
+                    len(replay_buffer) // BATCH_SIZE
+                )
+                steps_this_cycle = max(steps_this_cycle, 1)
+
+                for step in range(steps_this_cycle):
+                    if _time.time() - start_time >= time_budget:
+                        break
+
+                    indices = random.sample(range(len(replay_buffer)), BATCH_SIZE)
+                    batch_boards_np = np.stack([replay_buffer[i][0] for i in indices])
+                    batch_policies_np = np.stack([replay_buffer[i][1] for i in indices])
+                    batch_values_np = np.array(
+                        [replay_buffer[i][2] for i in indices], dtype=np.float32
+                    )
+
+                    batch_boards_mx = mx.array(batch_boards_np)
+                    batch_policies_mx = mx.array(batch_policies_np)
+                    batch_values_mx = mx.array(batch_values_np)
+
+                    loss, grads = loss_and_grad(
+                        model, batch_boards_mx, batch_policies_mx, batch_values_mx
+                    )
+                    optimizer.update(model, grads)
+                    mx.eval(model.parameters(), optimizer.state)
+
+                    cycle_loss += loss.item()
+                    total_train_steps += 1
+
+                last_loss = cycle_loss / steps_this_cycle if steps_this_cycle > 0 else 0.0
+
+            # Record cycle metrics
+            metric = {
+                "cycle": cycle,
+                "timestamp_s": _time.time() - start_time,
+                "loss": last_loss,
+                "total_games": total_games,
+                "total_steps": total_train_steps,
+                "buffer_size": len(replay_buffer),
+            }
+
+            # ----- Probe evaluation -----
+            if cycle % eval_interval == 0 and evaluate_win_rate is not None:
+                model.eval()
+                probe_wr = _quick_eval(model, eval_level, probe_games)
+                last_probe_wr = probe_wr
+                wr_history.append(probe_wr)
+                metric["win_rate"] = probe_wr
+                metric["eval_type"] = "probe"
+                metric["eval_games"] = probe_games
+                metric["eval_level"] = eval_level
+
+                _log_event(f"Probe: {probe_wr:.1%} ({probe_games} games vs L{eval_level})")
+
+                # Check checkpoint threshold
+                if _tracker.should_checkpoint(probe_wr, last_ckpt_wr):
+                    _do_checkpoint(
+                        model, db_conn, run_id, run_id_short, cycle,
+                        total_train_steps, last_loss, probe_wr,
+                        eval_level, full_eval_games, num_params,
+                        start_time, events, _log_event,
+                    )
+                    last_ckpt_wr = probe_wr
+                    num_checkpoints += 1
+
+                # Early stop on target win rate
+                if target_win_rate and probe_wr >= target_win_rate:
+                    _log_event(f"🎯 Target win rate {target_win_rate:.0%} reached!")
+                    stop_reason = "target_win_rate"
+                    _update_tui()
                     break
 
-                # Sample a batch
-                indices = random.sample(range(len(replay_buffer)), BATCH_SIZE)
-                batch_boards_np = np.stack([replay_buffer[i][0] for i in indices])
-                batch_policies_np = np.stack([replay_buffer[i][1] for i in indices])
-                batch_values_np = np.array(
-                    [replay_buffer[i][2] for i in indices], dtype=np.float32
+            if last_loss > 0:
+                loss_history.append(last_loss)
+
+            _tracker.save_cycle_metric(db_conn, run_id, metric)
+
+            # Update TUI or print
+            if use_tui:
+                _update_tui()
+            elif cycle % CYCLES_PER_REPORT == 0:
+                elapsed = _time.time() - start_time
+                wr_str = f" | WR: {last_probe_wr:.1%}" if last_probe_wr is not None else ""
+                print(
+                    f"Cycle {cycle:4d} | "
+                    f"Loss: {last_loss:.4f} | "
+                    f"Games: {total_games:6d} | "
+                    f"Steps: {total_train_steps:6d} | "
+                    f"Buffer: {len(replay_buffer):6d}{wr_str} | "
+                    f"Time: {elapsed:.1f}s"
                 )
 
-                # Convert to MLX arrays
-                batch_boards_mx = mx.array(batch_boards_np)
-                batch_policies_mx = mx.array(batch_policies_np)
-                batch_values_mx = mx.array(batch_values_np)
+    except KeyboardInterrupt:
+        stop_reason = "interrupted"
+        _log_event("Training interrupted by user")
+    finally:
+        if live:
+            _update_tui()
+            live.stop()
 
-                # Forward + backward + update
-                loss, grads = loss_and_grad(
-                    model, batch_boards_mx, batch_policies_mx, batch_values_mx
-                )
-                optimizer.update(model, grads)
-                mx.eval(model.parameters(), optimizer.state)
-
-                cycle_loss += loss.item()
-                total_train_steps += 1
-
-            last_loss = cycle_loss / steps_this_cycle if steps_this_cycle > 0 else 0.0
-
-        # ----- Periodic reporting -----
-        if cycle % CYCLES_PER_REPORT == 0:
-            elapsed = _time.time() - start_time
-            print(
-                f"Cycle {cycle:4d} | "
-                f"Buffer: {len(replay_buffer):6d} | "
-                f"Loss: {last_loss:.4f} | "
-                f"Games: {total_games:6d} | "
-                f"Steps: {total_train_steps:6d} | "
-                f"Time: {elapsed:.1f}s"
-            )
-
-    # ----- Save model -----
+    # ----- Save final model -----
     total_elapsed = _time.time() - start_time
-    print()
-    print(f"Training complete. Saving model to {MODEL_PATH}")
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     save_model(model, MODEL_PATH)
+    _log_event(f"Model saved to {MODEL_PATH}")
 
-    # ----- Estimate peak VRAM -----
-    # MLX doesn't have a direct peak VRAM query; estimate from param size.
-    # On Apple Silicon, this is unified memory usage.
-    param_bytes = num_params * 4  # float32
-    estimated_vram_mb = param_bytes / (1024 * 1024) * 10  # rough 10x multiplier for activations + optimizer
+    # ----- Final evaluation (subprocess) -----
+    final_wr = last_probe_wr
+    if evaluate_win_rate is not None:
+        print(f"\nRunning final evaluation vs L{eval_level} ({full_eval_games} games)...")
+        tag = f"{run_id_short}_final_c{cycle:04d}"
+        result = _subprocess_eval(
+            MODEL_PATH, eval_level, full_eval_games, tag, run_id
+        )
+        if result:
+            final_wr = result.get("win_rate", final_wr)
+            print(f"Final win_rate: {final_wr:.1%}")
+
+            # Save as checkpoint
+            ckpt_path = f"output/checkpoints/{tag}.safetensors"
+            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+            shutil.copy2(MODEL_PATH, ckpt_path)
+
+            ckpt_id = _tracker.save_checkpoint(db_conn, run_id, {
+                "tag": tag,
+                "cycle": cycle,
+                "step": total_train_steps,
+                "loss": last_loss,
+                "win_rate": final_wr,
+                "eval_level": eval_level,
+                "eval_games": full_eval_games,
+                "wins": result.get("wins"),
+                "losses": result.get("losses"),
+                "draws": result.get("draws"),
+                "avg_game_length": result.get("avg_game_length"),
+                "num_params": num_params,
+                "model_path": ckpt_path,
+                "model_size_bytes": os.path.getsize(ckpt_path),
+                "train_elapsed_s": total_elapsed,
+                "eval_elapsed_s": result.get("eval_elapsed_s"),
+            })
+            # Save recording metadata
+            for gd in result.get("game_details", []):
+                if "game_file" in gd:
+                    _tracker.save_recording(db_conn, ckpt_id, run_id, gd)
+            db_conn.commit()
+            num_checkpoints += 1
+
+    # ----- Finalize run -----
+    _tracker.finish_run(db_conn, run_id, {
+        "status": "completed" if stop_reason != "interrupted" else "interrupted",
+        "total_cycles": cycle,
+        "total_games": total_games,
+        "total_steps": total_train_steps,
+        "final_loss": last_loss,
+        "final_win_rate": final_wr,
+        "num_params": num_params,
+        "num_checkpoints": num_checkpoints,
+        "wall_time_s": total_elapsed,
+        "peak_memory_mb": None,
+    })
+    db_conn.close()
 
     # ----- Print summary -----
     print()
-    print("---")
-    print(f"training_seconds: {total_elapsed:.1f}")
-    print(f"total_seconds:    {total_elapsed:.1f}")
-    print(f"peak_vram_mb:     {estimated_vram_mb:.1f}")
-    print(f"num_params_K:     {num_params / 1000:.1f}")
-    print(f"total_games:      {total_games}")
-    print(f"total_train_steps: {total_train_steps}")
-    print(f"final_loss:       {last_loss:.4f}")
-    print()
+    print("=" * 60)
+    print(f"Run:        {run_id_short} ({stop_reason})")
+    print(f"Cycles:     {cycle}")
+    print(f"Games:      {total_games}")
+    print(f"Steps:      {total_train_steps}")
+    print(f"Final loss: {last_loss:.4f}")
+    if final_wr is not None:
+        print(f"Win rate:   {final_wr:.1%} (vs L{eval_level})")
+    print(f"Checkpoints:{num_checkpoints}")
+    print(f"Wall time:  {total_elapsed:.1f}s")
+    print(f"Model:      {MODEL_PATH}")
+    print(f"Tracker:    output/tracker.db")
+    print("=" * 60)
 
-    # ----- Evaluation -----
-    # Run evaluation in a subprocess to get a clean Metal GPU state.
-    # The training process accumulates Metal buffers; a fresh process avoids
-    # contention with any residual allocations.
-    if evaluate_win_rate is not None:
-        print(f"Running evaluation vs L{EVAL_LEVEL}...")
-        import subprocess, sys
-        src_dir = os.path.dirname(os.path.abspath(__file__))
-        env = {**os.environ, 'PYTHONPATH': src_dir}
-        eval_cmd = [
-            sys.executable, "-c",
-            f"from prepare import evaluate_win_rate; evaluate_win_rate('{MODEL_PATH}', level={EVAL_LEVEL})"
-        ]
-        proc = subprocess.run(eval_cmd, capture_output=True, text=True, env=env)
-        if proc.stdout:
-            print(proc.stdout, end="")
-        if proc.returncode != 0:
-            print(f"Evaluation error (exit {proc.returncode}):")
-            if proc.stderr:
-                print(proc.stderr.strip())
+
+def _quick_eval(model, level: int, n_games: int) -> float:
+    """In-process lightweight evaluation. Returns win_rate."""
+    from prepare import OPPONENTS
+    opponent_fn = OPPONENTS[level]
+
+    wins = 0
+    for game_i in range(n_games):
+        nn_is_black = game_i < n_games // 2
+        nn_player = BLACK if nn_is_black else WHITE
+
+        from game import Board
+        board = Board()
+        while not board.is_terminal():
+            if board.current_player == nn_player:
+                encoded = board.encode()
+                x = mx.array(encoded[np.newaxis, ...])
+                policy_logits, _ = model(x)
+                policy = policy_logits[0]
+                legal_mask = mx.array(board.get_legal_mask())
+                masked = mx.where(legal_mask > 0, policy, mx.array(float("-inf")))
+                action = int(mx.argmax(masked).item())
+                row, col = divmod(action, BOARD_SIZE)
+            else:
+                row, col = opponent_fn(board)
+            board.place(row, col)
+
+        if board.winner == nn_player:
+            wins += 1
+
+        if game_i % 20 == 0:
+            mx.clear_cache()
+
+    return wins / n_games if n_games > 0 else 0.0
+
+
+def _subprocess_eval(model_path: str, level: int, n_games: int,
+                     tag: str, run_id: str) -> dict | None:
+    """Run full evaluation in subprocess, return parsed result dict."""
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    env = {**os.environ, "PYTHONPATH": src_dir, "PYTHONUNBUFFERED": "1"}
+    code = (
+        f"import json; from prepare import evaluate_win_rate; "
+        f"r = evaluate_win_rate('{model_path}', level={level}, "
+        f"n_games={n_games}, record_games={n_games}, "
+        f"tag='{tag}', run_id='{run_id}'); "
+        f"print('JSON_RESULT:' + json.dumps(r, default=str))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, env=env,
+    )
+    if proc.returncode != 0:
+        print(f"Evaluation error (exit {proc.returncode}):")
+        if proc.stderr:
+            print(proc.stderr.strip()[:500])
+        return None
+
+    # Parse JSON result from stdout
+    for line in proc.stdout.splitlines():
+        if line.startswith("JSON_RESULT:"):
+            return json.loads(line[len("JSON_RESULT:"):])
+
+    # Fallback: print raw output
+    if proc.stdout:
+        print(proc.stdout)
+    return None
+
+
+def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
+                   total_steps, loss, win_rate, eval_level,
+                   full_eval_games, num_params, start_time,
+                   events, log_event_fn):
+    """Save checkpoint, run full eval in subprocess, record to DB."""
+    import tracker as _tracker
+
+    tag = f"{run_id_short}_wr{int(win_rate * 100):03d}_c{cycle:04d}"
+    ckpt_path = f"output/checkpoints/{tag}.safetensors"
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+    save_model(model, ckpt_path)
+
+    log_event_fn(f"✓ Checkpoint {tag}  wr={win_rate:.1%}")
+
+    # Full eval in subprocess
+    elapsed = _time.time() - start_time
+    result = _subprocess_eval(
+        ckpt_path, eval_level, full_eval_games, tag, run_id
+    )
+
+    if result:
+        full_wr = result.get("win_rate", win_rate)
+        log_event_fn(
+            f"  Full eval: {full_wr:.1%} "
+            f"({result.get('wins', '?')}W/{result.get('losses', '?')}L "
+            f"in {result.get('eval_elapsed_s', 0):.1f}s)"
+        )
+
+        ckpt_id = _tracker.save_checkpoint(db_conn, run_id, {
+            "tag": tag,
+            "cycle": cycle,
+            "step": total_steps,
+            "loss": loss,
+            "win_rate": full_wr,
+            "eval_level": eval_level,
+            "eval_games": full_eval_games,
+            "wins": result.get("wins"),
+            "losses": result.get("losses"),
+            "draws": result.get("draws"),
+            "avg_game_length": result.get("avg_game_length"),
+            "num_params": num_params,
+            "model_path": ckpt_path,
+            "model_size_bytes": os.path.getsize(ckpt_path),
+            "train_elapsed_s": elapsed,
+            "eval_elapsed_s": result.get("eval_elapsed_s"),
+        })
+        # Save recording metadata
+        for gd in result.get("game_details", []):
+            if "game_file" in gd:
+                _tracker.save_recording(db_conn, ckpt_id, run_id, gd)
+        db_conn.commit()
     else:
-        print("(prepare.py not found — skipping evaluation)")
+        # Eval failed — save checkpoint without eval details
+        _tracker.save_checkpoint(db_conn, run_id, {
+            "tag": tag,
+            "cycle": cycle,
+            "step": total_steps,
+            "loss": loss,
+            "win_rate": win_rate,
+            "eval_level": eval_level,
+            "eval_games": 0,
+            "num_params": num_params,
+            "model_path": ckpt_path,
+            "model_size_bytes": os.path.getsize(ckpt_path),
+            "train_elapsed_s": elapsed,
+        })
+        db_conn.commit()
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="MAG-Gomoku Training")
+    p.add_argument("--time-budget", type=int, default=TIME_BUDGET,
+                   help=f"Training time budget in seconds (default: {TIME_BUDGET})")
+    p.add_argument("--target-win-rate", type=float, default=None,
+                   help="Stop early when this win rate is reached")
+    p.add_argument("--target-games", type=int, default=None,
+                   help="Stop early after this many self-play games")
+    p.add_argument("--eval-level", type=int, default=EVAL_LEVEL,
+                   help=f"Evaluation opponent level 0-3 (default: {EVAL_LEVEL})")
+    p.add_argument("--eval-interval", type=int, default=10,
+                   help="Probe evaluation every N cycles (default: 10)")
+    p.add_argument("--probe-games", type=int, default=50,
+                   help="Games per probe evaluation (default: 50)")
+    p.add_argument("--full-eval-games", type=int, default=200,
+                   help="Games per full evaluation at checkpoint (default: 200)")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Path to model file to resume training from")
+    return p.parse_args()
+
 
 if __name__ == "__main__":
-    print(f"Training with {PARALLEL_GAMES} parallel games, "
-          f"{NUM_RES_BLOCKS} res blocks, {NUM_FILTERS} filters")
-    print(f"Batch size: {BATCH_SIZE}, LR: {LEARNING_RATE}")
-
-    # Count and display params
-    model = GomokuNet()
-    dummy = mx.zeros((1, 3, BOARD_SIZE, BOARD_SIZE))
-    _ = model(dummy)
-    mx.eval(model.parameters())
-    num_params = count_parameters(model)
-    print(f"Parameters: {num_params / 1000:.1f}K")
-    del model
-
-    train()
+    args = parse_args()
+    train(args)

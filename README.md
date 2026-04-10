@@ -10,9 +10,9 @@ Requirements: Apple Silicon Mac, Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run python src/train.py         # run one 5-minute training experiment
-uv run python src/play.py --list   # list saved checkpoints
-uv run python src/play.py          # play against the trained AI
+uv run python src/train.py                     # run one 5-minute training experiment
+uv run python src/play.py --list               # list saved checkpoints
+uv run python src/play.py                      # play against the trained AI
 ```
 
 ## Project structure
@@ -21,21 +21,20 @@ uv run python src/play.py          # play against the trained AI
 mag-gomoku/
 ├── src/                         # Python source code
 │   ├── game.py                  #   board engine, pygame renderer, batched self-play (read-only)
-│   ├── prepare.py               #   minimax opponents, evaluation, checkpoint archive (read-only)
-│   ├── train.py                 #   neural network, self-play, training loop (agent-mutable)
+│   ├── prepare.py               #   minimax opponents, evaluation (read-only)
+│   ├── train.py                 #   neural network, training loop, Rich TUI (agent-mutable)
+│   ├── tracker.py               #   SQLite experiment tracking (output/tracker.db)
 │   ├── play.py                  #   human vs AI / AI vs AI gameplay
 │   └── replay.py                #   replay recorded games, export frames for video
 ├── docs/                        # documentation
 │   ├── program.md               #   autonomous experiment protocol (agent reads this)
 │   └── action-plan.md           #   project plan, dev log & troubleshooting
-├── data/                        # experiment tracking (version controlled)
-│   └── results.tsv              #   experiment log
 ├── output/                      # generated artifacts (gitignored)
-│   ├── model.safetensors        #   trained model weights
-│   ├── run.log                  #   latest training run output
-│   └── recordings/              #   training game recordings
-│       ├── games/               #     full game records (JSON)
-│       ├── metrics/             #     training metrics (CSV)
+│   ├── tracker.db               #   SQLite database (single source of truth)
+│   ├── model.safetensors        #   latest trained model weights
+│   ├── checkpoints/             #   model snapshots at win-rate milestones
+│   └── recordings/
+│       ├── games/               #     full game records (JSON, bound to checkpoints)
 │       └── frames/              #     key frame captures (PNG)
 ├── .gitignore
 ├── README.md
@@ -43,14 +42,44 @@ mag-gomoku/
 └── uv.lock
 ```
 
+## Training
+
+The training script features a Rich TUI dashboard, automatic checkpoint export at win-rate milestones, and full experiment tracking via SQLite.
+
+```bash
+# Default: 5-minute training run
+uv run python src/train.py
+
+# Custom parameters
+uv run python src/train.py \
+  --time-budget 600 \           # 10 minutes
+  --target-win-rate 0.95 \      # stop when 95% win rate reached
+  --eval-level 0 \              # opponent: 0=random, 1=minimax2, 2=minimax4, 3=minimax6
+  --eval-interval 10 \          # probe eval every 10 cycles
+  --probe-games 50 \            # games per probe
+  --full-eval-games 200 \       # games per checkpoint evaluation
+  --resume output/model.safetensors  # continue from existing model
+```
+
+### Checkpoint milestones
+
+Checkpoints are automatically saved when win rate crosses these thresholds:
+- **< 80%**: every 5% (50%, 55%, 60%, 65%, 70%, 75%)
+- **80–90%**: every 2% (80%, 82%, 84%, 86%, 88%)
+- **> 90%**: every 1% (90%, 91%, ..., 99%, 100%)
+
+Each checkpoint includes: model weights, 200-game full evaluation, and all game recordings.
+
 ## How it works
 
 ```
 autoresearch loop (agent modifies src/train.py → self-play + train → evaluate win_rate → keep/revert)
         ↓
-  output/model.safetensors (a few MB of weights)
+  output/checkpoints/*.safetensors  (snapshots at milestones)
+  output/tracker.db                 (full experiment history)
         ↓
   src/play.py (human vs AI game)
+  src/replay.py (video production)
 ```
 
 The single metric is **win_rate** against fixed minimax opponents. The agent promotes through increasingly strong opponents:
@@ -84,12 +113,35 @@ uv run python src/play.py --list                       # list all checkpoints
 
 ## Recording and replay
 
-Training automatically records games, metrics, and key frames to `output/recordings/`.
+Training automatically records all evaluation games at each checkpoint. Recordings are bound to checkpoints in the SQLite database.
 
 ```bash
-uv run python src/replay.py output/recordings/games/exp001_game0.json          # replay a game
-uv run python src/replay.py output/recordings/games/exp001_game0.json --export  # export PNG frames
-uv run python src/replay.py --montage                                           # growth montage
+# Replay a specific game
+uv run python src/replay.py output/recordings/games/abc12345_wr070_c0045_game003.json
+
+# Export frames for video
+uv run python src/replay.py output/recordings/games/abc12345_wr070_c0045_game003.json --export
+
+# Growth montage
+uv run python src/replay.py --montage
+```
+
+## Querying experiment data
+
+All experiment data is stored in `output/tracker.db` (SQLite):
+
+```bash
+# List all training runs
+sqlite3 -header -column output/tracker.db "SELECT id, status, total_cycles, final_win_rate, wall_time_s FROM runs"
+
+# List checkpoints for a run
+sqlite3 -header -column output/tracker.db "SELECT tag, cycle, win_rate, eval_games FROM checkpoints ORDER BY cycle"
+
+# Win rate progression
+sqlite3 -header -csv output/tracker.db "SELECT cycle, win_rate FROM cycle_metrics WHERE win_rate IS NOT NULL" > wr_curve.csv
+
+# Export all recordings for a checkpoint
+sqlite3 -header -csv output/tracker.db "SELECT game_file, result, total_moves, nn_side, nn_won FROM recordings WHERE checkpoint_id = 1"
 ```
 
 ## Hardware
