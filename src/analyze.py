@@ -11,12 +11,17 @@ Usage:
     uv run python src/analyze.py --lineage RUN_ID
     uv run python src/analyze.py --opponents
     uv run python src/analyze.py --runs
+    uv run python src/analyze.py --report
+    uv run python src/analyze.py --report --format json
 """
 
 import argparse
+import json as _json
+import math
 import sqlite3
 import sys
 import os
+from datetime import datetime, timezone
 
 DB_PATH = os.path.join("output", "tracker.db")
 
@@ -241,7 +246,6 @@ def cmd_opponents(conn: sqlite3.Connection) -> None:
 
 def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
     """Show sweep results grouped by tag prefix with aggregated metrics."""
-    import math
 
     rows = conn.execute(
         "SELECT id, status, sweep_tag, total_cycles, total_games, "
@@ -322,7 +326,6 @@ def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
 
 def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
     """Show training stability metrics for a run."""
-    import math
 
     row = conn.execute(
         "SELECT id, total_cycles, total_games, final_win_rate, final_loss "
@@ -411,6 +414,477 @@ def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Report generation (dual format: markdown / JSON)
+# ---------------------------------------------------------------------------
+
+# Stage promotion ladder
+_STAGES = [
+    {"level": 0, "opponent": "L0 (random)",        "threshold": 0.95, "next": "L1 (minimax depth 2)"},
+    {"level": 1, "opponent": "L1 (minimax depth 2)","threshold": 0.80, "next": "L2 (minimax depth 4)"},
+    {"level": 2, "opponent": "L2 (minimax depth 4)","threshold": 0.60, "next": "L3 (minimax depth 6)"},
+    {"level": 3, "opponent": "L3 (minimax depth 6)","threshold": None,  "next": None},
+]
+
+
+def _gather_report_data(conn: sqlite3.Connection, n_recent: int = 5) -> dict:
+    """Gather all data needed for report generation."""
+
+    # --- Section 1: Recent runs ---
+    recent = conn.execute(
+        "SELECT id, status, started_at, total_cycles, total_games, total_steps,"
+        " final_loss, final_win_rate, wall_time_s, eval_level, eval_opponent,"
+        " is_benchmark, num_res_blocks, num_filters, num_params,"
+        " learning_rate, train_steps_per_cycle, replay_buffer_size,"
+        " parallel_games, seed, sweep_tag"
+        " FROM runs WHERE status='completed'"
+        " ORDER BY started_at DESC LIMIT ?", (n_recent,)
+    ).fetchall()
+
+    # --- Section 2: Best checkpoint (highest WR across all runs) ---
+    best_ckpt = conn.execute(
+        "SELECT c.run_id, c.tag, c.win_rate, c.eval_games, c.cycle,"
+        " c.num_params, r.eval_level, r.eval_opponent"
+        " FROM checkpoints c JOIN runs r ON c.run_id = r.id"
+        " ORDER BY c.win_rate DESC LIMIT 1"
+    ).fetchone()
+
+    # Best benchmark WR
+    best_bm = conn.execute(
+        "SELECT id, final_win_rate, num_res_blocks, num_filters, wall_time_s"
+        " FROM runs WHERE status='completed' AND is_benchmark=1"
+        " ORDER BY final_win_rate DESC LIMIT 1"
+    ).fetchone()
+
+    # --- Section 3: Frontier (monotonically improving checkpoints) ---
+    all_ckpts = conn.execute(
+        "SELECT c.run_id, c.tag, c.win_rate, c.created_at, c.cycle,"
+        " r.eval_level, r.eval_opponent"
+        " FROM checkpoints c JOIN runs r ON c.run_id = r.id"
+        " ORDER BY c.created_at ASC"
+    ).fetchall()
+    frontier = []
+    best_wr = -1.0
+    for c in all_ckpts:
+        if c["win_rate"] is not None and c["win_rate"] > best_wr:
+            best_wr = c["win_rate"]
+            frontier.append(dict(c))
+
+    # --- Section 4: Stability of latest completed run ---
+    latest_run = conn.execute(
+        "SELECT id, total_cycles FROM runs WHERE status='completed'"
+        " ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+
+    stability = {"run_id": None, "wr": None, "loss": None}
+    if latest_run:
+        lid = latest_run["id"]
+        stability["run_id"] = lid
+
+        wr_rows = conn.execute(
+            "SELECT cycle, win_rate FROM cycle_metrics"
+            " WHERE run_id=? AND win_rate IS NOT NULL ORDER BY cycle", (lid,)
+        ).fetchall()
+        if len(wr_rows) >= 3:
+            wrs = [r["win_rate"] for r in wr_rows]
+            mean_wr = sum(wrs) / len(wrs)
+            std_wr = math.sqrt(sum((w - mean_wr)**2 for w in wrs) / len(wrs))
+            stability["wr"] = {
+                "n": len(wrs), "mean": mean_wr, "std": std_wr,
+                "min": min(wrs), "max": max(wrs),
+                "last_5": wrs[-5:],
+            }
+
+        loss_rows = conn.execute(
+            "SELECT cycle, loss FROM cycle_metrics"
+            " WHERE run_id=? AND loss IS NOT NULL ORDER BY cycle", (lid,)
+        ).fetchall()
+        if loss_rows:
+            losses = [r["loss"] for r in loss_rows]
+            n = len(losses)
+            mean_l = sum(losses) / n
+            std_l = math.sqrt(sum((l - mean_l)**2 for l in losses) / n) if n > 1 else 0
+            q = max(n // 4, 1)
+            first_q = sum(losses[:q]) / q
+            last_q = sum(losses[-q:]) / q
+            reduction = (first_q - last_q) / first_q * 100 if first_q > 0 else 0
+            stability["loss"] = {
+                "n": n, "mean": mean_l, "std": std_l,
+                "min": min(losses), "max": max(losses),
+                "reduction_pct": reduction,
+                "last_5": losses[-5:],
+            }
+
+    # --- Section 5: Opponents ---
+    try:
+        opponents = conn.execute(
+            "SELECT alias, source_run, source_tag, win_rate, description"
+            " FROM opponents ORDER BY created_at"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        opponents = []
+
+    # --- Section 6: Stage assessment ---
+    # Determine current stage from most recent run's eval_level
+    cur_level = 0
+    if recent:
+        cur_level = recent[0]["eval_level"] or 0
+
+    stage_info = _STAGES[min(cur_level, len(_STAGES) - 1)]
+    best_bm_wr = best_bm["final_win_rate"] if best_bm else None
+    gap = (stage_info["threshold"] - best_bm_wr) if (stage_info["threshold"] and best_bm_wr) else None
+
+    stage = {
+        "current": cur_level,
+        "opponent": stage_info["opponent"],
+        "best_benchmark_wr": best_bm_wr,
+        "promotion_threshold": stage_info["threshold"],
+        "promotion_target": stage_info["next"],
+        "gap_to_promotion": gap,
+    }
+
+    # --- Section 7: Signals ---
+    signals = _generate_signals(conn, recent, best_bm, stage, stability)
+
+    # --- Hyperparams summary ---
+    all_completed = conn.execute(
+        "SELECT num_res_blocks, num_filters, learning_rate FROM runs"
+        " WHERE status='completed'"
+    ).fetchall()
+    archs = sorted(set(f"{r['num_res_blocks']}x{r['num_filters']}" for r in all_completed
+                       if r["num_res_blocks"] and r["num_filters"]))
+    lrs = sorted(set(r["learning_rate"] for r in all_completed if r["learning_rate"]))
+
+    hp_summary = {
+        "architectures_tested": archs,
+        "learning_rates_tested": lrs,
+    }
+
+    return {
+        "recent": [dict(r) for r in recent],
+        "best_checkpoint": dict(best_ckpt) if best_ckpt else None,
+        "best_benchmark": dict(best_bm) if best_bm else None,
+        "frontier": frontier,
+        "stability": stability,
+        "opponents": [dict(o) for o in opponents],
+        "stage": stage,
+        "signals": signals,
+        "hyperparams_summary": hp_summary,
+    }
+
+
+def _generate_signals(conn, recent, best_bm, stage, stability) -> list[dict]:
+    """Rule-based signal generation."""
+    signals = []
+
+    # CLOSE_TO_PROMOTION
+    if stage["gap_to_promotion"] is not None and stage["gap_to_promotion"] <= 0.05:
+        signals.append({
+            "type": "CLOSE_TO_PROMOTION", "severity": "high",
+            "message": f"最佳 benchmark 胜率 {stage['best_benchmark_wr']:.1%}，"
+                       f"距晋级阈值（{stage['promotion_threshold']:.0%}）仅差 {stage['gap_to_promotion']:.1%}",
+            "suggestion": "专注可靠性提升，不冒险",
+        })
+
+    # WR_PLATEAU (last 3 completed runs, WR not improving)
+    if len(recent) >= 3:
+        last3_wr = [r["final_win_rate"] for r in recent[:3] if r["final_win_rate"] is not None]
+        if len(last3_wr) >= 3:
+            if max(last3_wr) - min(last3_wr) < 0.03:
+                signals.append({
+                    "type": "WR_PLATEAU", "severity": "medium",
+                    "message": f"最近 3 次运行胜率无明显提升（{min(last3_wr):.1%} — {max(last3_wr):.1%}）",
+                    "suggestion": "考虑更激进的架构变更，而非仅调超参",
+                })
+
+    # LOSS_DIVERGENCE
+    if len(recent) >= 2:
+        r0, r1 = recent[0], recent[1]
+        if (r0["final_loss"] and r1["final_loss"] and
+                r0["final_loss"] > r1["final_loss"] * 2):
+            signals.append({
+                "type": "LOSS_DIVERGENCE", "severity": "high",
+                "message": f"最新运行 loss {r0['final_loss']:.3f} 是前次 {r1['final_loss']:.3f} 的 "
+                           f"{r0['final_loss']/r1['final_loss']:.1f} 倍",
+                "suggestion": "降低学习率或增大 buffer",
+            })
+
+    # INSUFFICIENT_BENCHMARKS
+    bm_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM runs WHERE status='completed' AND is_benchmark=1"
+    ).fetchone()["n"]
+    if bm_count < 3:
+        signals.append({
+            "type": "INSUFFICIENT_BENCHMARKS", "severity": "medium",
+            "message": f"仅 {bm_count} 次 benchmark 运行，前沿追踪不够可靠",
+            "suggestion": "运行更多 benchmark 以建立可靠的前沿数据",
+        })
+
+    # ARCHITECTURE_PATTERN — check if one arch consistently outperforms
+    arch_rows = conn.execute(
+        "SELECT num_res_blocks, num_filters, final_win_rate FROM runs"
+        " WHERE status='completed' AND final_win_rate IS NOT NULL"
+    ).fetchall()
+    arch_wrs: dict[str, list[float]] = {}
+    for r in arch_rows:
+        if r["num_res_blocks"] and r["num_filters"]:
+            key = f"{r['num_res_blocks']}x{r['num_filters']}"
+            arch_wrs.setdefault(key, []).append(r["final_win_rate"])
+    if len(arch_wrs) >= 2:
+        best_arch = max(arch_wrs, key=lambda k: sum(arch_wrs[k]) / len(arch_wrs[k]))
+        best_mean = sum(arch_wrs[best_arch]) / len(arch_wrs[best_arch])
+        others = {k: sum(v)/len(v) for k, v in arch_wrs.items() if k != best_arch}
+        if others:
+            second_best = max(others.values())
+            if best_mean - second_best > 0.05:
+                signals.append({
+                    "type": "ARCHITECTURE_PATTERN", "severity": "info",
+                    "message": f"{best_arch} 架构平均胜率 {best_mean:.1%} 明显优于其他架构",
+                    "suggestion": f"在 {best_arch} 基础上增加容量（更深或更宽）",
+                })
+
+    # REGRESSION_WARNING
+    if recent and best_bm:
+        latest_wr = recent[0]["final_win_rate"]
+        best_wr = best_bm["final_win_rate"]
+        if latest_wr is not None and best_wr is not None and best_wr - latest_wr > 0.20:
+            signals.append({
+                "type": "REGRESSION_WARNING", "severity": "high",
+                "message": f"最新运行胜率 {latest_wr:.1%} 远低于最佳 {best_wr:.1%}",
+                "suggestion": "检查最近的代码变更，考虑回退",
+            })
+
+    return signals
+
+
+def _format_report_md(data: dict) -> str:
+    """Format report as Chinese markdown for human consumption."""
+    lines = []
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    lines.append("# MAG-Gomoku 实验报告")
+    lines.append(f"\n> 生成命令: `uv run python src/analyze.py --report`")
+    lines.append(f"> 时间戳: {ts}")
+
+    # Section 1: Recent Runs
+    recent = data["recent"]
+    lines.append("\n## 1. 近期训练运行")
+    if recent:
+        lines.append(f"\n| {'运行':>8} | {'模型':>5} | {'周期':>4} | {'对局':>5} | "
+                     f"{'Loss':>7} | {'胜率':>6} | {'耗时':>6} | {'对手':>6} | {'类型':>10} |")
+        lines.append(f"|{'-'*10}|{'-'*7}|{'-'*6}|{'-'*7}|{'-'*9}|{'-'*8}|{'-'*8}|{'-'*8}|{'-'*12}|")
+        for r in recent:
+            rid = r["id"][:8]
+            model = f"{r['num_res_blocks'] or '?'}x{r['num_filters'] or '?'}"
+            cyc = r["total_cycles"] or "-"
+            gm = r["total_games"] or "-"
+            loss = f"{r['final_loss']:.3f}" if r["final_loss"] else "-"
+            wr = f"{r['final_win_rate']:.1%}" if r["final_win_rate"] is not None else "-"
+            wt = f"{r['wall_time_s']:.0f}s" if r["wall_time_s"] else "-"
+            opp = r["eval_opponent"] or f"L{r['eval_level'] or 0}"
+            typ = "benchmark" if r["is_benchmark"] else "exploratory"
+            lines.append(f"| {rid:>8} | {model:>5} | {str(cyc):>4} | {str(gm):>5} | "
+                         f"{loss:>7} | {wr:>6} | {wt:>6} | {opp:>6} | {typ:>10} |")
+    else:
+        lines.append("\n无已完成的运行。")
+
+    # Section 2: Best Checkpoint
+    lines.append("\n## 2. 当前最佳检查点")
+    bc = data["best_checkpoint"]
+    if bc:
+        opp = bc.get("eval_opponent") or f"L{bc.get('eval_level', 0)}"
+        lines.append(f"\n- 运行: {bc['run_id'][:8]}, 标签: {bc['tag']}, "
+                     f"胜率: {bc['win_rate']:.1%}, 周期: {bc['cycle']}, 对手: {opp}")
+    bm = data["best_benchmark"]
+    if bm:
+        lines.append(f"- 历史最佳 benchmark: **{bm['final_win_rate']:.1%}**"
+                     f"（运行 {bm['id'][:8]}，"
+                     f"{bm['num_res_blocks']}x{bm['num_filters']}，"
+                     f"{bm['wall_time_s']:.0f}s）")
+
+    # Section 3: Frontier
+    lines.append("\n## 3. 胜率前沿")
+    if data["frontier"]:
+        lines.append(f"\n| {'运行':>8} | {'标签':>16} | {'胜率':>6} | {'周期':>4} | {'对手':>6} |")
+        lines.append(f"|{'-'*10}|{'-'*18}|{'-'*8}|{'-'*6}|{'-'*8}|")
+        for f in data["frontier"]:
+            rid = f["run_id"][:8]
+            opp = f.get("eval_opponent") or f"L{f.get('eval_level', 0)}"
+            lines.append(f"| {rid:>8} | {f['tag']:>16} | {f['win_rate']:>5.1%} | "
+                         f"{f['cycle']:>4} | {opp:>6} |")
+
+    # Section 4: Stability
+    lines.append("\n## 4. 最新运行稳定性")
+    stab = data["stability"]
+    if stab["run_id"]:
+        lines.append(f"\n运行: {stab['run_id'][:8]}")
+        if stab["wr"]:
+            w = stab["wr"]
+            lines.append(f"\n胜率（{w['n']} 次探测）: 均值 {w['mean']:.1%}, "
+                         f"标准差 {w['std']:.1%}, 范围 {w['min']:.1%}–{w['max']:.1%}")
+        else:
+            lines.append("\n胜率: 探测数据不足")
+        if stab["loss"]:
+            lo = stab["loss"]
+            lines.append(f"Loss（{lo['n']} 周期）: 均值 {lo['mean']:.3f}, "
+                         f"标准差 {lo['std']:.3f}, 下降 {lo['reduction_pct']:.0f}%")
+    else:
+        lines.append("\n无已完成的运行。")
+
+    # Section 5: Opponents
+    lines.append("\n## 5. 对手注册表")
+    if data["opponents"]:
+        lines.append(f"\n| {'别名':>6} | {'来源':>8} | {'标签':>16} | {'胜率':>6} | {'说明'} |")
+        lines.append(f"|{'-'*8}|{'-'*10}|{'-'*18}|{'-'*8}|{'-'*20}|")
+        for o in data["opponents"]:
+            src = o["source_run"][:8] if o["source_run"] else "-"
+            wr = f"{o['win_rate']:.1%}" if o["win_rate"] is not None else "-"
+            lines.append(f"| {o['alias']:>6} | {src:>8} | {o['source_tag'] or '-':>16} | "
+                         f"{wr:>6} | {o['description'] or ''} |")
+    else:
+        lines.append("\n无注册对手。")
+
+    # Section 6: Stage
+    lines.append("\n## 6. 阶段评估")
+    s = data["stage"]
+    lines.append(f"\n- 当前阶段: **Stage {s['current']}**（{s['opponent']}）")
+    if s["best_benchmark_wr"] is not None:
+        lines.append(f"- 最佳 benchmark 胜率: {s['best_benchmark_wr']:.1%}")
+    if s["promotion_threshold"]:
+        lines.append(f"- 晋级阈值: {s['promotion_threshold']:.0%} → {s['promotion_target']}")
+    if s["gap_to_promotion"] is not None:
+        lines.append(f"- 距晋级差距: **{s['gap_to_promotion']:.1%}**")
+
+    # Section 7: Signals
+    lines.append("\n## 7. 信号与观察")
+    if data["signals"]:
+        icons = {"high": "🔴", "medium": "🟡", "info": "🔵"}
+        for sig in data["signals"]:
+            icon = icons.get(sig["severity"], "⚪")
+            lines.append(f"\n- {icon} **{sig['type']}**: {sig['message']}")
+            lines.append(f"  → {sig['suggestion']}")
+    else:
+        lines.append("\n无特殊信号。一切正常。")
+
+    return "\n".join(lines) + "\n"
+
+
+def _format_report_json(data: dict) -> str:
+    """Format report as structured JSON for agent consumption."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    recent_runs = []
+    for r in data["recent"]:
+        recent_runs.append({
+            "run_id": r["id"][:8],
+            "status": r["status"],
+            "type": "benchmark" if r["is_benchmark"] else "exploratory",
+            "hyperparams": {
+                "num_res_blocks": r["num_res_blocks"],
+                "num_filters": r["num_filters"],
+                "num_params": r["num_params"],
+                "learning_rate": r["learning_rate"],
+                "steps_per_cycle": r["train_steps_per_cycle"],
+                "replay_buffer_size": r["replay_buffer_size"],
+                "parallel_games": r["parallel_games"],
+                "seed": r["seed"],
+            },
+            "results": {
+                "total_cycles": r["total_cycles"],
+                "total_games": r["total_games"],
+                "final_loss": round(r["final_loss"], 4) if r["final_loss"] else None,
+                "final_win_rate": round(r["final_win_rate"], 4) if r["final_win_rate"] is not None else None,
+                "wall_time_s": round(r["wall_time_s"], 1) if r["wall_time_s"] else None,
+            },
+            "eval": {
+                "level": r["eval_level"],
+                "opponent": r["eval_opponent"],
+            },
+            "sweep_tag": r["sweep_tag"],
+        })
+
+    bc = data["best_checkpoint"]
+    best_checkpoint = None
+    if bc:
+        best_checkpoint = {
+            "run_id": bc["run_id"][:8],
+            "tag": bc["tag"],
+            "win_rate": round(bc["win_rate"], 4) if bc["win_rate"] is not None else None,
+            "eval_games": bc["eval_games"],
+            "cycle": bc["cycle"],
+            "num_params": bc["num_params"],
+        }
+
+    frontier_list = []
+    for f in data["frontier"]:
+        frontier_list.append({
+            "run_id": f["run_id"][:8],
+            "tag": f["tag"],
+            "win_rate": round(f["win_rate"], 4),
+            "cycle": f["cycle"],
+        })
+
+    stab = data["stability"]
+    stability_out = {"run_id": stab["run_id"][:8] if stab["run_id"] else None}
+    if stab["wr"]:
+        w = stab["wr"]
+        stability_out["win_rate"] = {
+            "n": w["n"], "mean": round(w["mean"], 4), "std": round(w["std"], 4),
+            "min": round(w["min"], 4), "max": round(w["max"], 4),
+            "last_5": [round(x, 4) for x in w["last_5"]],
+        }
+    else:
+        stability_out["win_rate"] = {"status": "insufficient_data"}
+    if stab["loss"]:
+        lo = stab["loss"]
+        stability_out["loss"] = {
+            "n": lo["n"], "mean": round(lo["mean"], 4), "std": round(lo["std"], 4),
+            "min": round(lo["min"], 4), "max": round(lo["max"], 4),
+            "reduction_pct": round(lo["reduction_pct"], 1),
+            "last_5": [round(x, 4) for x in lo["last_5"]],
+        }
+
+    opponents_out = []
+    for o in data["opponents"]:
+        opponents_out.append({
+            "alias": o["alias"],
+            "source_run": o["source_run"][:8] if o["source_run"] else None,
+            "source_tag": o["source_tag"],
+            "win_rate": round(o["win_rate"], 4) if o["win_rate"] is not None else None,
+            "description": o["description"],
+        })
+
+    report = {
+        "report_version": "1.0",
+        "generated_by": "analyze.py --report --format json",
+        "timestamp": ts,
+        "stage": data["stage"],
+        "recent_runs": recent_runs,
+        "best_checkpoint": best_checkpoint,
+        "frontier": frontier_list,
+        "stability": stability_out,
+        "opponents": opponents_out,
+        "hyperparams_summary": data["hyperparams_summary"],
+        "signals": data["signals"],
+    }
+
+    # Round floats in stage
+    if report["stage"]["best_benchmark_wr"] is not None:
+        report["stage"]["best_benchmark_wr"] = round(report["stage"]["best_benchmark_wr"], 4)
+    if report["stage"]["gap_to_promotion"] is not None:
+        report["stage"]["gap_to_promotion"] = round(report["stage"]["gap_to_promotion"], 4)
+
+    return _json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+
+
+def cmd_report(conn: sqlite3.Connection, n_recent: int = 5, fmt: str = "md") -> None:
+    """Generate structured experiment report (dual format)."""
+    data = _gather_report_data(conn, n_recent)
+    if fmt == "json":
+        print(_format_report_json(data), end="")
+    else:
+        print(_format_report_md(data), end="")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -436,6 +910,13 @@ def main():
                        help="Training stability report for a run")
     group.add_argument("--matrix", metavar="TAG_PREFIX",
                        help="Sweep matrix results grouped by tag prefix")
+    group.add_argument("--report", action="store_true",
+                       help="Generate structured experiment report for agent/human")
+
+    parser.add_argument("--format", choices=["md", "json"], default="md",
+                        help="Report format: md (Chinese markdown) or json (structured)")
+    parser.add_argument("--recent", type=int, default=5,
+                        help="Number of recent runs in report (default: 5)")
 
     args = parser.parse_args()
     conn = _connect()
@@ -456,6 +937,8 @@ def main():
         cmd_stability(conn, args.stability)
     elif args.matrix:
         cmd_matrix(conn, args.matrix)
+    elif args.report:
+        cmd_report(conn, n_recent=args.recent, fmt=args.format)
 
     conn.close()
 

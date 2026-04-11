@@ -2,6 +2,13 @@
 
 Train a Gomoku (五子棋) AI using the autoresearch experiment loop on Apple Silicon (MLX). The agent autonomously modifies `src/train.py` to discover the best neural network architecture and training strategy for beating increasingly strong opponents.
 
+## Project phase
+
+- **v1–v9**: Infrastructure Phase — building the experiment system (complete)
+- **v10+**: Autoresearch Phase — agent-driven research loop (current)
+
+You are the research director. The codebase is your laboratory.
+
 ## Repository layout
 
 ```
@@ -14,7 +21,8 @@ mag-gomoku/
 │   ├── tui.py         # Terminal UI helpers (sparklines, panels)          [READ-ONLY]
 │   ├── play.py        # Human vs AI / AI vs AI                           [READ-ONLY]
 │   ├── replay.py      # Replay recorded games, export video frames       [READ-ONLY]
-│   └── analyze.py     # Query tracker.db for analysis                    [READ-ONLY]
+│   ├── analyze.py     # Query tracker.db + experiment reports             [READ-ONLY]
+│   └── sweep.py       # Batch hyperparameter sweep (optional tool)       [READ-ONLY]
 ├── docs/
 │   ├── program.md     # THIS FILE — agent operating instructions
 │   └── caveats.md     # Known pitfalls and troubleshooting
@@ -33,6 +41,37 @@ mag-gomoku/
 
 **`src/train.py` is the ONLY file you modify.** All other source files are read-only.
 
+## Available tools
+
+These are read-only commands you can invoke at any time:
+
+| Command | Purpose | When to use |
+|---------|---------|-------------|
+| `analyze.py --report` | Full experiment report (markdown) | **START HERE** each iteration |
+| `analyze.py --report --format json` | Structured report for parsing | When you need precise numbers |
+| `analyze.py --compare RUN_A RUN_B` | Side-by-side run comparison | After an experiment |
+| `analyze.py --stability RUN_ID` | Detailed stability metrics | To diagnose training issues |
+| `analyze.py --frontier` | Win-rate progression frontier | To see historical progress |
+| `analyze.py --runs` | List all runs | Overview of experiment history |
+| `sweep.py --dry-run ...` | Preview sweep configurations | Before delegating local search |
+| `sweep.py ...` | Run batch hyperparameter search | When you want systematic exploration |
+| `analyze.py --matrix TAG` | View sweep results | After a sweep completes |
+
+### Using sweep.py (optional local search tool)
+
+When you have a hypothesis that requires systematic exploration of a narrow parameter range, you can delegate to sweep.py:
+
+```bash
+# Example: test 3 learning rates × 2 seeds
+uv run python src/sweep.py --learning-rate 3e-4,5e-4,7e-4 --seeds 42,137 \
+  --time-budget 120 --tag lr_search
+
+# View results
+uv run python src/analyze.py --matrix lr_search
+```
+
+This is a tool for you to use, not a replacement for your judgment. You decide the search space; sweep executes it.
+
 ## Setup
 
 1. Read the in-scope files:
@@ -40,8 +79,8 @@ mag-gomoku/
    - `src/prepare.py` — minimax opponents, `evaluate_win_rate()` harness
    - `src/train.py` — the file you edit: model architecture, self-play, training loop, hyperparameters
 2. Install dependencies: `uv sync`
-3. Run one baseline experiment: `uv run python src/train.py --time-budget 300`
-4. Confirm baseline win_rate in the output summary, then begin the experiment loop.
+3. Read the current experiment report: `uv run python src/analyze.py --report --format json`
+4. Begin the experiment loop.
 
 ## Experimentation
 
@@ -131,26 +170,33 @@ Tracker:    output/tracker.db
 ============================================================
 ```
 
-Query results from DB:
-```bash
-sqlite3 -header -column output/tracker.db "SELECT substr(id,1,8) AS run, status, total_cycles, final_win_rate FROM runs ORDER BY created_at DESC LIMIT 10"
-```
-
 ## The experiment loop
 
 LOOP FOREVER:
 
-1. Read the current state: last run's win_rate, loss trajectory, any regressions
-2. Form a hypothesis and modify `src/train.py`
-3. `git add src/train.py && git commit -m "experiment: <description>"`
-4. Run: `uv run python src/train.py --time-budget 300`
-5. Read the output summary (win_rate, loss, cycles)
-6. If crashed: `tail -n 50` of terminal output for stack trace
-7. If win_rate improved: keep the commit
-8. If win_rate same/worse: `git reset --hard <previous kept commit>`
-9. Check for stage promotion: if win_rate exceeds threshold, promote in next run
+1. **Read experiment report**: `uv run python src/analyze.py --report --format json`
+2. **Analyze the report** — identify patterns in signals, win-rate frontier, stability
+3. **Form a hypothesis** based on the signals and data
+4. **Modify `src/train.py`** to test the hypothesis
+5. `git add src/train.py && git commit -m "experiment: <description>"`
+6. **Run**: `uv run python src/train.py --time-budget 300`
+7. **Read new report**: `uv run python src/analyze.py --report --format json`
+8. **Compare**: If win_rate improved → keep. If worse → `git reset --hard <previous kept commit>`
+9. **Check stage promotion**: if win_rate exceeds threshold, update `--eval-level` in next run
+10. GOTO 1
 
-**Timeout**: Each benchmark experiment should take ~6-8 minutes total (5 min training + eval). Kill after 15 minutes.
+## Decision guide
+
+Use the report signals to guide your next action:
+
+| Signal | Recommended action |
+|--------|-------------------|
+| `CLOSE_TO_PROMOTION` | Focus on reliability — fine-tune, don't redesign |
+| `WR_PLATEAU` | Try radical architecture change, not just hyperparams |
+| `LOSS_DIVERGENCE` | Reduce learning rate or increase replay buffer |
+| `ARCHITECTURE_PATTERN` | Build on the winning architecture — go deeper or wider |
+| `REGRESSION_WARNING` | Revert latest changes, investigate what broke |
+| `INSUFFICIENT_BENCHMARKS` | Run more benchmark experiments for reliable data |
 
 ## Hints for the agent
 

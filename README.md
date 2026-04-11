@@ -1,8 +1,17 @@
 # MAG Gomoku
 
-Train a Gomoku (五子棋) AI from scratch using the [autoresearch](https://github.com/karpathy/autoresearch) paradigm on Apple Silicon (MLX). An AI agent autonomously modifies the training code, runs experiments, and evolves the neural network — all while you sleep.
+Train a Gomoku (五子棋) AI from scratch using the [autoresearch](https://github.com/karpathy/autoresearch) paradigm on Apple Silicon (MLX). An AI agent reads experiment reports, forms hypotheses, modifies the training code, and drives the research loop — all autonomously.
 
 Inspired by [Code Bullet](https://www.youtube.com/@CodeBullet) — the project includes a full game implementation, training recording system, and replay tools for video production.
+
+## Project phases
+
+| Phase | Versions | Status | Description |
+|-------|----------|--------|-------------|
+| Infrastructure | v1–v9 | ✅ Complete | Board engine, training loop, TUI, experiment tracking, sweep tools |
+| Autoresearch | v10+ | 🔄 Active | Agent-driven research loop: report → hypothesize → experiment → evaluate |
+
+The agent (Claude Code, Cursor, Copilot CLI, etc.) reads `docs/program.md`, consumes experiment reports via `analyze.py --report`, and drives the research loop by modifying `src/train.py`.
 
 ## Quick start
 
@@ -26,7 +35,7 @@ mag-gomoku/
 │   ├── prepare.py               #   minimax opponents, evaluation (read-only)
 │   ├── train.py                 #   neural network, training loop, plain-text TUI (agent-mutable)
 │   ├── tracker.py               #   SQLite experiment tracking (output/tracker.db)
-│   ├── analyze.py               #   training analysis & sweep matrix (read-only queries)
+│   ├── analyze.py               #   experiment reports + training analysis (read-only queries)
 │   ├── sweep.py                 #   hyperparameter sweep tool (batch experiments)
 │   ├── tui.py                   #   TUI rendering helpers (sparklines, progress bar)
 │   ├── play.py                  #   human vs AI / AI vs AI gameplay
@@ -165,15 +174,29 @@ Resume creates a **new run** with its own UUID directory. The model weights are 
 ## How it works
 
 ```
-autoresearch loop (agent modifies src/train.py → self-play + train → evaluate win_rate → keep/revert)
-        ↓
-  output/<uuid>/checkpoints/*.safetensors  (snapshots at milestones)
-  output/tracker.db                        (full experiment history across all runs)
-        ↓
-  src/play.py     (human vs AI game)
-  src/analyze.py  (tracker data analysis)
-  src/replay.py   (video production)
-  src/tui.py      (TUI rendering helpers)
+┌─────────────────────────────────────────────────────────┐
+│  AI Agent (Claude Code / Cursor / Copilot CLI)          │
+│  = Research Director                                     │
+│                                                         │
+│  LOOP:                                                  │
+│    1. Read report (analyze.py --report --format json)   │
+│    2. Form hypothesis from signals + data               │
+│    3. Edit src/train.py                                 │
+│    4. git commit                                        │
+│    5. Run training (train.py --time-budget 300)         │
+│    6. Read new report → compare → keep or revert        │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+         ↑ reads output              ↓ modifies code
+┌─────────────────────────────────────────────────────────┐
+│  MAG-Gomoku Codebase                                    │
+│                                                         │
+│  src/train.py      ← agent edits this (only mutable)   │
+│  src/analyze.py    ← experiment reports + analysis      │
+│  src/sweep.py      ← batch hyperparam search (tool)    │
+│  output/tracker.db ← persistent experiment history      │
+│  src/prepare.py    ← fixed benchmark (judge)            │
+└─────────────────────────────────────────────────────────┘
 ```
 
 The single metric is **win_rate** against fixed minimax opponents. The agent promotes through increasingly strong opponents:
@@ -190,10 +213,24 @@ The single metric is **win_rate** against fixed minimax opponents. The agent pro
 ```bash
 git checkout -b autoresearch/gomoku-v1
 uv run python src/train.py   # establish baseline
-# Point Claude Code at docs/program.md and let it run
+# Point Claude Code (or any coding agent) at docs/program.md and let it run
 ```
 
+The agent reads `docs/program.md`, runs `analyze.py --report --format json` to understand the current state, then enters the experiment loop: hypothesize → edit `train.py` → train → evaluate → keep/revert → repeat.
+
 Each experiment takes ~8 minutes (5 min training + eval). Expect ~7 experiments/hour, ~70 overnight.
+
+### Experiment reports
+
+The agent consumes structured experiment reports before each iteration:
+
+```bash
+uv run python src/analyze.py --report                    # Chinese markdown (human-readable)
+uv run python src/analyze.py --report --format json      # Structured JSON (agent-consumable)
+uv run python src/analyze.py --report --recent 10        # More history context
+```
+
+Reports include: recent runs with full hyperparameters, best checkpoint, win-rate frontier, training stability, opponent registry, stage assessment, and auto-generated signals with suggested actions.
 
 ## Playing against the AI
 
@@ -226,6 +263,8 @@ uv run python src/replay.py --montage
 `analyze.py` provides read-only queries against the tracker database:
 
 ```bash
+uv run python src/analyze.py --report                        # experiment report (markdown, Chinese)
+uv run python src/analyze.py --report --format json          # experiment report (JSON, for agent)
 uv run python src/analyze.py --runs                          # list all runs with stats
 uv run python src/analyze.py --best                          # best checkpoint per run
 uv run python src/analyze.py --frontier                      # WR progression frontier

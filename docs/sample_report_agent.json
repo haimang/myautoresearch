@@ -1,0 +1,245 @@
+{
+  "report_version": "1.0",
+  "generated_by": "analyze.py --report --format json",
+  "timestamp": "2026-04-11T10:05:32",
+
+  "stage": {
+    "current": 0,
+    "opponent": "L0 (random)",
+    "best_benchmark_wr": 0.933,
+    "promotion_threshold": 0.95,
+    "promotion_target": "L1 (minimax depth 2)",
+    "gap_to_promotion": 0.017
+  },
+
+  "recent_runs": [
+    {
+      "run_id": "c8726821",
+      "status": "completed",
+      "type": "exploratory",
+      "hyperparams": {
+        "num_res_blocks": 6,
+        "num_filters": 64,
+        "num_params": 564467,
+        "learning_rate": 0.0005,
+        "steps_per_cycle": 30,
+        "replay_buffer_size": 50000,
+        "parallel_games": 16,
+        "seed": 42
+      },
+      "results": {
+        "total_cycles": 11,
+        "total_games": 176,
+        "total_steps": 251,
+        "final_loss": 1.327,
+        "final_win_rate": 0.37,
+        "wall_time_s": 36
+      },
+      "eval": {
+        "level": 0,
+        "opponent": null
+      },
+      "sweep_tag": "test1_f64_sd42"
+    },
+    {
+      "run_id": "556f91a6",
+      "status": "completed",
+      "type": "exploratory",
+      "hyperparams": {
+        "num_res_blocks": 6,
+        "num_filters": 32,
+        "num_params": 229651,
+        "learning_rate": 0.0005,
+        "steps_per_cycle": 30,
+        "replay_buffer_size": 50000,
+        "parallel_games": 16,
+        "seed": 42
+      },
+      "results": {
+        "total_cycles": 15,
+        "total_games": 240,
+        "total_steps": 392,
+        "final_loss": 4.906,
+        "final_win_rate": 0.53,
+        "wall_time_s": 46
+      },
+      "eval": {
+        "level": 0,
+        "opponent": null
+      },
+      "sweep_tag": "test1_f32_sd42"
+    },
+    {
+      "run_id": "a8ab550d",
+      "status": "completed",
+      "type": "exploratory",
+      "hyperparams": {
+        "num_res_blocks": 6,
+        "num_filters": 64,
+        "num_params": 564467,
+        "learning_rate": 0.0003,
+        "steps_per_cycle": 20,
+        "replay_buffer_size": 50000,
+        "parallel_games": 16,
+        "seed": 42
+      },
+      "results": {
+        "total_cycles": 14,
+        "total_games": 224,
+        "total_steps": 242,
+        "final_loss": 1.288,
+        "final_win_rate": 0.62,
+        "wall_time_s": 29
+      },
+      "eval": {
+        "level": 0,
+        "opponent": null
+      },
+      "sweep_tag": null
+    },
+    {
+      "run_id": "9facdc1b",
+      "status": "completed",
+      "type": "exploratory",
+      "hyperparams": {
+        "num_res_blocks": 8,
+        "num_filters": 64,
+        "num_params": 713203,
+        "learning_rate": 0.0005,
+        "steps_per_cycle": 30,
+        "replay_buffer_size": 50000,
+        "parallel_games": 64,
+        "seed": null
+      },
+      "results": {
+        "total_cycles": 39,
+        "total_games": 624,
+        "total_steps": 1016,
+        "final_loss": 1.874,
+        "final_win_rate": 0.805,
+        "wall_time_s": 180
+      },
+      "eval": {
+        "level": 0,
+        "opponent": "L0"
+      },
+      "sweep_tag": null
+    },
+    {
+      "run_id": "b4f8e1bc",
+      "status": "completed",
+      "type": "benchmark",
+      "hyperparams": {
+        "num_res_blocks": 8,
+        "num_filters": 64,
+        "num_params": 713203,
+        "learning_rate": 0.0005,
+        "steps_per_cycle": 30,
+        "replay_buffer_size": 50000,
+        "parallel_games": 64,
+        "seed": null
+      },
+      "results": {
+        "total_cycles": 20,
+        "total_games": 640,
+        "total_steps": 470,
+        "final_loss": 4.728,
+        "final_win_rate": 0.933,
+        "wall_time_s": 300
+      },
+      "eval": {
+        "level": 0,
+        "opponent": null
+      },
+      "sweep_tag": null
+    }
+  ],
+
+  "best_checkpoint": {
+    "run_id": "b4f8e1bc",
+    "tag": "wr088_c0020",
+    "win_rate": 0.889,
+    "eval_games": 0,
+    "cycle": 20,
+    "eval_level": 0,
+    "num_params": 713203
+  },
+
+  "frontier": [
+    {"run_id": "001394ef", "tag": "final_c0002", "win_rate": 0.40, "cycle": 2},
+    {"run_id": "5db239e6", "tag": "final_c0010", "win_rate": 0.71, "cycle": 10},
+    {"run_id": "9facdc1b", "tag": "wr070_c0030", "win_rate": 0.765, "cycle": 30},
+    {"run_id": "9facdc1b", "tag": "final_c0039", "win_rate": 0.805, "cycle": 39},
+    {"run_id": "b4f8e1bc", "tag": "wr065_c0009", "win_rate": 0.86, "cycle": 9},
+    {"run_id": "b4f8e1bc", "tag": "wr088_c0020", "win_rate": 0.889, "cycle": 20}
+  ],
+
+  "stability": {
+    "run_id": "a8ab550d",
+    "win_rate": {
+      "status": "insufficient_data",
+      "probes": 0
+    },
+    "loss": {
+      "n_cycles": 14,
+      "mean": 5.424,
+      "std": 1.193,
+      "min": 1.288,
+      "max": 6.330,
+      "reduction_pct": 37,
+      "last_5": [5.484, 5.347, 5.298, 5.196, 1.288]
+    }
+  },
+
+  "opponents": [
+    {
+      "alias": "L0",
+      "source_run": "374d567f",
+      "source_tag": "wr065_c0310",
+      "win_rate": 0.675,
+      "description": "5000-game baseline"
+    }
+  ],
+
+  "hyperparams_summary": {
+    "architectures_tested": ["6x32", "6x64", "6x96", "8x64"],
+    "learning_rates_tested": [0.0003, 0.0005],
+    "best_architecture": "8x64",
+    "best_learning_rate": 0.0005,
+    "default_config": {
+      "num_res_blocks": 6,
+      "num_filters": 64,
+      "learning_rate": 0.0005,
+      "steps_per_cycle": 30,
+      "replay_buffer_size": 50000,
+      "parallel_games": 64
+    }
+  },
+
+  "signals": [
+    {
+      "type": "CLOSE_TO_PROMOTION",
+      "severity": "high",
+      "message": "Best benchmark WR 93.3% is within 2% of L1 promotion threshold (95%)",
+      "suggestion": "Focus on reliability improvements to push past 95%"
+    },
+    {
+      "type": "ARCHITECTURE_PATTERN",
+      "severity": "info",
+      "message": "8x64 (713K params) consistently outperforms 6x64 (565K)",
+      "suggestion": "Try 10x64 or 8x96 for more capacity"
+    },
+    {
+      "type": "LOSS_VARIANCE",
+      "severity": "medium",
+      "message": "Final loss ranges from 0.49 to 4.91 across runs",
+      "suggestion": "Consider learning rate scheduling or warmup"
+    },
+    {
+      "type": "INSUFFICIENT_BENCHMARKS",
+      "severity": "medium",
+      "message": "Only 1 benchmark run exists",
+      "suggestion": "Run 2-3 more benchmarks to establish reliable frontier"
+    }
+  ]
+}
