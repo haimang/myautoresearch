@@ -1642,16 +1642,21 @@ def _subprocess_eval(model_path: str, level: int, n_games: int,
     # Domain dir MUST come before framework dir so gomoku/prepare.py shadows framework/prepare.py
     env = {**os.environ, "PYTHONPATH": f"{src_dir}:{fw_dir}", "PYTHONUNBUFFERED": "1"}
     rec_arg = f", recording_dir='{recording_dir}'" if recording_dir else ""
-    # Monkey-patch load_model so prepare.py uses correct architecture
+    # Monkey-patch load_model in BOTH train and prepare modules.
+    # Circular import: `import train` triggers `import prepare` which binds
+    # prepare.load_model to the ORIGINAL before our patch runs. So we must
+    # also patch prepare.load_model after import.
     patch = (
-        f"import train; "
+        f"import train; import prepare; "
         f"_orig = train.load_model; "
-        f"train.load_model = lambda p, **kw: _orig(p, num_blocks={num_blocks}, num_filters={num_filters}); "
+        f"_patched = lambda p, **kw: _orig(p, num_blocks={num_blocks}, num_filters={num_filters}); "
+        f"train.load_model = _patched; "
+        f"prepare.load_model = _patched; "
     )
     code = (
         f"{patch}"
-        f"import json; from prepare import evaluate_win_rate; "
-        f"r = evaluate_win_rate('{model_path}', level={level}, "
+        f"import json; "
+        f"r = prepare.evaluate_win_rate('{model_path}', level={level}, "
         f"n_games={n_games}, record_games={n_games}, "
         f"tag='{tag}', run_id='{run_id}'{rec_arg}); "
         f"print('JSON_RESULT:' + json.dumps(r, default=str))"
