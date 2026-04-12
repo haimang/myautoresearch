@@ -33,7 +33,7 @@ from game import (
     BOARD_SIZE, BLACK, WHITE, EMPTY,
     Board, Renderer, GameRecord,
 )
-from play_service import load_nn_player, resolve_checkpoint
+from play_service import load_nn_player, load_registered_opponent, resolve_checkpoint
 from prepare import OPPONENTS
 import core.db as tracker
 
@@ -71,6 +71,8 @@ def main():
                         help="List all registered NN opponents")
     parser.add_argument("--checkpoint", "-c", type=str, default=None,
                         help="Checkpoint tag or path (human plays BLACK vs this AI)")
+    parser.add_argument("--opponent", "-o", type=str, default=None,
+                        help="Play against a registered NN opponent by alias (e.g., S0)")
     parser.add_argument("--black", type=str, default=None,
                         help="Black player checkpoint (for AI vs AI)")
     parser.add_argument("--white", type=str, default=None,
@@ -116,6 +118,25 @@ def main():
         white_fn = load_nn_player(white_path, args.mcts)
         title = f"AI ({args.black}) vs AI ({args.white})"
         human_player = None
+    elif args.opponent is not None:
+        # Human vs registered NN opponent
+        try:
+            opp_fn, opp_info = load_registered_opponent(args.opponent, mcts_sims=args.mcts)
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        opp_label = f"{args.opponent}"
+        if args.mcts:
+            opp_label += f" (MCTS-{args.mcts})"
+        title = f"Human vs {opp_label}"
+        if args.swap:
+            black_fn = opp_fn
+            white_fn = None
+            human_player = WHITE
+        else:
+            black_fn = None
+            white_fn = opp_fn
+            human_player = BLACK
     elif args.level is not None:
         # Human vs minimax
         if args.level not in OPPONENTS:

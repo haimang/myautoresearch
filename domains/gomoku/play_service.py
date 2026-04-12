@@ -73,13 +73,43 @@ def _load_cached_model(checkpoint_path: str,
 def load_nn_player(checkpoint_path: str, mcts_sims: int = 0,
                    num_blocks: Optional[int] = None,
                    num_filters: Optional[int] = None) -> PlayerFn:
-    """Load a NN model and return a player function (board) -> (row, col)."""
+    """Load a NN model and return a player function (board) -> (row, col).
+
+    When mcts_sims > 0, each move runs MCTS search for stronger play.
+    """
     import mlx.core as mx
 
-    if mcts_sims:
-        raise NotImplementedError("MCTS is not supported in the web/CLI shared player yet")
-
     model = _load_cached_model(checkpoint_path, num_blocks, num_filters)
+
+    if mcts_sims > 0:
+        from core.mcts import mcts_search_batched
+
+        def _evaluate_batch(states):
+            encodings = np.stack([s.encode() for s in states])
+            enc_mx = mx.array(encodings)
+            logits, values = model(enc_mx)
+            mx.eval(logits, values)
+            priors_all = np.array(mx.softmax(logits, axis=-1))
+            values_np = np.array(values).flatten()
+            return [(priors_all[i], float(values_np[i])) for i in range(len(states))]
+
+        def mcts_move(board: Board) -> tuple[int, int]:
+            visits = mcts_search_batched(
+                root_state=board,
+                evaluate_batch_fn=_evaluate_batch,
+                copy_fn=lambda s: s.copy(),
+                legal_mask_fn=lambda s: s.get_legal_mask(),
+                apply_fn=lambda s, a: s.place(a // BOARD_SIZE, a % BOARD_SIZE),
+                terminal_fn=lambda s: s.is_terminal(),
+                terminal_value_fn=lambda s: 0.0 if s.winner == -1 else 1.0,
+                action_size=BOARD_SIZE * BOARD_SIZE,
+                num_simulations=mcts_sims,
+                batch_size=min(8, mcts_sims),
+            )
+            action = int(np.argmax(visits))
+            return divmod(action, BOARD_SIZE)
+
+        return mcts_move
 
     def nn_move(board: Board) -> tuple[int, int]:
         encoded = board.encode()
