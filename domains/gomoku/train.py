@@ -32,7 +32,7 @@ import numpy as np
 
 from game import BatchBoards, BOARD_SIZE, BLACK, WHITE, EMPTY
 from core.tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, sparkline4 as _sparkline4_fn, progress_bar as _progress_bar_fn
-from core.mcts import MCTSNode, mcts_search as _mcts_search_generic, mcts_search_batched as _mcts_search_batched
+from core.mcts import MCTSNode, mcts_search as _mcts_search_generic, mcts_search_batched as _mcts_search_batched, mcts_search_multi_root as _mcts_search_multi_root
 
 # Try to import TIME_BUDGET and evaluate_win_rate from prepare.py.
 try:
@@ -391,9 +391,9 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
                         temperature: float = TEMPERATURE) -> tuple[list, int, float, dict]:
     """Run self-play games using MCTS for policy target generation.
 
-    All games run concurrently: each "round" advances every active board
-    by one move. MCTS search per board uses batched leaf evaluation
-    (mcts_search_batched) for GPU efficiency.
+    Uses mcts_search_multi_root() to run ALL boards' MCTS searches with a
+    shared GPU batch — leaves from all N trees are merged into one batch call.
+    This maximizes GPU utilization (batch~N vs batch~1 per board).
 
     Returns (training_data, games_completed, avg_game_length, mcts_stats).
     """
@@ -401,10 +401,26 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
 
     model.eval()
 
-    # Initialize all boards concurrently
+    def _evaluate_batch(states):
+        """Shared batch evaluate for all boards' MCTS trees."""
+        if not states:
+            return []
+        encodings = np.stack([s.encode() for s in states])
+        enc_mx = mx.array(encodings)
+        logits, values = model(enc_mx)
+        mx.eval(logits, values)
+        priors_all = np.array(mx.softmax(logits, axis=-1))
+        values_np = np.array(values).flatten()
+        return [(priors_all[i], float(values_np[i])) for i in range(len(states))]
+
+    def _apply(state, action):
+        state.place(action // BOARD_SIZE, action % BOARD_SIZE)
+
+    def _terminal_value(state):
+        return 0.0 if state.winner == -1 else 1.0
+
     boards = [Board() for _ in range(num_games)]
     move_data: list[list[tuple[np.ndarray, int, np.ndarray]]] = [[] for _ in range(num_games)]
-    # move_data[i] = [(encoded, player, policy_dist), ...] per game
     finished = [False] * num_games
 
     total_search_time = 0.0
@@ -414,19 +430,41 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
 
     # Play all games concurrently, one move at a time
     while not all(finished):
-        for i in range(num_games):
-            if finished[i]:
-                continue
-            board = boards[i]
-            if board.is_terminal():
-                finished[i] = True
-                continue
+        # Collect active boards for this round's multi-root MCTS
+        active_indices = [i for i in range(num_games) if not finished[i] and not boards[i].is_terminal()]
+        if not active_indices:
+            # Mark remaining as finished
+            for i in range(num_games):
+                if boards[i].is_terminal():
+                    finished[i] = True
+            break
 
-            # Run MCTS search (already batched internally via mcts_search_batched)
-            t0 = _time.time()
-            visits = mcts_search(board, model, mcts_sims)
-            total_search_time += _time.time() - t0
-            total_moves += 1
+        active_boards = [boards[i] for i in active_indices]
+
+        # Run MCTS on ALL active boards simultaneously — shared GPU batch
+        t0 = _time.time()
+        all_visits = _mcts_search_multi_root(
+            root_states=active_boards,
+            evaluate_batch_fn=_evaluate_batch,
+            copy_fn=lambda s: s.copy(),
+            legal_mask_fn=lambda s: s.get_legal_mask(),
+            apply_fn=_apply,
+            terminal_fn=lambda s: s.is_terminal(),
+            terminal_value_fn=_terminal_value,
+            action_size=BOARD_SIZE * BOARD_SIZE,
+            num_simulations=mcts_sims,
+            virtual_loss=MCTS_VIRTUAL_LOSS,
+            c_puct=C_PUCT,
+            dirichlet_alpha=DIRICHLET_ALPHA,
+            dirichlet_frac=DIRICHLET_FRAC,
+        )
+        total_search_time += _time.time() - t0
+        total_moves += len(active_indices)
+
+        # Process each board's search result
+        for board_pos, board_idx in enumerate(active_indices):
+            board = boards[board_idx]
+            visits = all_visits[board_pos]
 
             # Track visit concentration
             visit_sum = visits.sum()
@@ -459,21 +497,16 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
                         policy_dist /= lsum
 
             action = np.random.choice(BOARD_SIZE * BOARD_SIZE, p=policy_dist)
-
-            # Record state before move
-            move_data[i].append((board.encode(), board.current_player, policy_dist.copy()))
-
-            # Apply the move
-            row, col = action // BOARD_SIZE, action % BOARD_SIZE
-            board.place(row, col)
+            move_data[board_idx].append((board.encode(), board.current_player, policy_dist.copy()))
+            board.place(action // BOARD_SIZE, action % BOARD_SIZE)
 
             if board.is_terminal():
-                finished[i] = True
+                finished[board_idx] = True
 
         # Periodic Metal cache cleanup
         mx.clear_cache()
 
-    # Collect training data from all completed games
+    # Collect training data
     all_training_data = []
     game_lengths = []
     for i in range(num_games):

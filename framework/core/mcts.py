@@ -292,3 +292,121 @@ def mcts_search_batched(
     for child in root.children:
         visits[child.action] = child.visit_count
     return visits
+
+
+def mcts_search_multi_root(
+    root_states: list[Any],
+    evaluate_batch_fn: Callable[[list[Any]], list[tuple[np.ndarray, float]]],
+    copy_fn: Callable[[Any], Any],
+    legal_mask_fn: Callable[[Any], np.ndarray],
+    apply_fn: Callable[[Any, int], None],
+    terminal_fn: Callable[[Any], bool],
+    terminal_value_fn: Callable[[Any], float],
+    action_size: int,
+    num_simulations: int,
+    virtual_loss: float = 3.0,
+    c_puct: float = 1.5,
+    dirichlet_alpha: float = 0.03,
+    dirichlet_frac: float = 0.25,
+) -> list[np.ndarray]:
+    """Multi-root MCTS — run N independent search trees sharing one GPU batch.
+
+    Instead of calling mcts_search N times (each with its own small GPU batch),
+    this function interleaves simulations across all N trees and merges their
+    leaf evaluations into a single large GPU batch call.
+
+    For N=8 boards × 50 sims: ~50 GPU calls of batch ~8 each.
+    The key gain: ONE gpu call per simulation round across ALL boards,
+    not one per board per batch.
+
+    Args:
+        root_states: list of N game states to search from
+        (all other args identical to mcts_search_batched)
+
+    Returns:
+        list of N visit distributions (np.ndarray[action_size])
+    """
+    n_roots = len(root_states)
+    if n_roots == 0:
+        return []
+
+    # Initialize all roots — batch evaluate them together
+    roots: list[MCTSNode] = []
+    legal_masks = [legal_mask_fn(s) for s in root_states]
+    root_results = evaluate_batch_fn(root_states)
+
+    for i in range(n_roots):
+        root = MCTSNode()
+        priors, value = root_results[i]
+        root.expand(priors, legal_masks[i])
+        if dirichlet_frac > 0 and root.children:
+            noise = np.random.dirichlet([dirichlet_alpha] * len(root.children))
+            for j, child in enumerate(root.children):
+                child.prior = (1 - dirichlet_frac) * child.prior + dirichlet_frac * noise[j]
+        root.visit_count = 1
+        root.value_sum = value
+        roots.append(root)
+
+    # Run simulations: one sim per tree per round, merge leaves across trees
+    for _ in range(num_simulations):
+        leaf_eval_indices: list[int] = []
+        leaf_eval_states: list[Any] = []
+        terminal_results: list[tuple[int, float]] = []
+        all_paths: list[list[MCTSNode]] = []
+
+        for tree_idx in range(n_roots):
+            node = roots[tree_idx]
+            sim_state = copy_fn(root_states[tree_idx])
+            path = [node]
+
+            while node.is_expanded and not terminal_fn(sim_state):
+                node.apply_virtual_loss(virtual_loss)
+                node = node.select_child(c_puct)
+                apply_fn(sim_state, node.action)
+                path.append(node)
+            node.apply_virtual_loss(virtual_loss)
+
+            all_paths.append(path)
+
+            if terminal_fn(sim_state):
+                terminal_results.append((tree_idx, terminal_value_fn(sim_state)))
+            else:
+                leaf_eval_indices.append(tree_idx)
+                leaf_eval_states.append(sim_state)
+
+        # ONE GPU batch call for ALL trees' leaves this round
+        if leaf_eval_states:
+            eval_results = evaluate_batch_fn(leaf_eval_states)
+        else:
+            eval_results = []
+
+        # Expand + backup non-terminal leaves
+        for i, (priors, value) in enumerate(eval_results):
+            tree_idx = leaf_eval_indices[i]
+            path = all_paths[tree_idx]
+            leaf_node = path[-1]
+            sim_state = leaf_eval_states[i]
+
+            lm = legal_mask_fn(sim_state)
+            leaf_node.expand(priors, lm)
+            leaf_value = -value
+
+            for n in path:
+                n.revert_virtual_loss(virtual_loss)
+            leaf_node.backup(leaf_value)
+
+        # Backup terminal paths
+        for tree_idx, tv in terminal_results:
+            path = all_paths[tree_idx]
+            for n in path:
+                n.revert_virtual_loss(virtual_loss)
+            path[-1].backup(tv)
+
+    # Build visit distributions for all trees
+    all_visits = []
+    for root in roots:
+        visits = np.zeros(action_size, dtype=np.float32)
+        for child in root.children:
+            visits[child.action] = child.visit_count
+        all_visits.append(visits)
+    return all_visits
