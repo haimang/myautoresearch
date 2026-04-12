@@ -1615,7 +1615,11 @@ def _subprocess_eval(model_path: str, level: int, n_games: int,
                      num_filters: int = NUM_FILTERS) -> dict | None:
     """Run full evaluation in subprocess, return parsed result dict."""
     src_dir = os.path.dirname(os.path.abspath(__file__))
-    env = {**os.environ, "PYTHONPATH": src_dir, "PYTHONUNBUFFERED": "1"}
+    fw_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          os.pardir, os.pardir, "framework")
+    fw_dir = os.path.abspath(fw_dir)
+    # Domain dir MUST come before framework dir so gomoku/prepare.py shadows framework/prepare.py
+    env = {**os.environ, "PYTHONPATH": f"{src_dir}:{fw_dir}", "PYTHONUNBUFFERED": "1"}
     rec_arg = f", recording_dir='{recording_dir}'" if recording_dir else ""
     # Monkey-patch load_model so prepare.py uses correct architecture
     patch = (
