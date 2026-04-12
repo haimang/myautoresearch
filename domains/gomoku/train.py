@@ -6,6 +6,7 @@ The agent modifies hyperparameters and architecture between runs.
 """
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import random
@@ -15,13 +16,22 @@ import sys
 import time as _time
 import uuid
 
+# ── path setup for decoupled project structure ──
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+if os.path.join(_PROJECT_ROOT, "framework") not in sys.path:
+    sys.path.insert(0, os.path.join(_PROJECT_ROOT, "framework"))
+os.chdir(_PROJECT_ROOT)  # ensure output/ paths resolve correctly
+
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 
 from game import BatchBoards, BOARD_SIZE, BLACK, WHITE, EMPTY
-from tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, progress_bar as _progress_bar_fn
+from tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, sparkline4 as _sparkline4_fn, progress_bar as _progress_bar_fn
 
 # Try to import TIME_BUDGET and evaluate_win_rate from prepare.py.
 try:
@@ -50,6 +60,25 @@ CYCLES_PER_REPORT = 5     # print stats every N cycles
 POLICY_LOSS_WEIGHT = 1.0
 VALUE_LOSS_WEIGHT = 1.0
 EVAL_LEVEL = 0            # opponent level for evaluation (0=random, 1=minimax2, 2=minimax4, 3=minimax6)
+
+# Signal-density replay tuning. These keep the win/loss objective intact,
+# but make the model learn more often from states that expose weaknesses.
+OPPONENT_SAMPLE_BOOST = 4.0
+LOSS_SAMPLE_BOOST = 2.5
+WIN_OPPONENT_SAMPLE_BOOST = 1.5
+FOCUSED_SAMPLE_RATIO = 0.25
+FAST_WIN_LEN_1 = 85
+FAST_WIN_LEN_2 = 75
+FAST_WIN_LEN_3 = 60
+SLOW_WIN_LEN_1 = 85
+SLOW_WIN_LEN_2 = 90
+FAST_WIN_BOOST_1 = 1.08
+FAST_WIN_BOOST_2 = 1.15
+FAST_WIN_BOOST_3 = 1.25
+SLOW_WIN_DAMP_1 = 0.96
+SLOW_WIN_DAMP_2 = 0.90
+FAST_LOSS_LEN = 60
+FAST_LOSS_BOOST = 1.15
 
 # ---------------------------------------------------------------------------
 # D4 symmetry augmentation (8-fold: 4 rotations x 2 reflections)
@@ -170,6 +199,132 @@ def count_parameters(model: GomokuNet) -> int:
     return total
 
 
+@dataclass(slots=True)
+class ReplaySample:
+    board: np.ndarray
+    policy: np.ndarray
+    value: float
+    source: str
+    game_length: int
+    priority: float
+
+
+def _length_priority_multiplier(value_target: float, game_length: int) -> float:
+    """Low-risk length shaping applied only to replay priority.
+
+    We deliberately keep this mild and bounded. The objective is still win/loss;
+    game length only changes how often a sample is revisited.
+    """
+    multiplier = 1.0
+    if value_target > 0.0:
+        if game_length < FAST_WIN_LEN_3:
+            multiplier *= FAST_WIN_BOOST_3
+        elif game_length < FAST_WIN_LEN_2:
+            multiplier *= FAST_WIN_BOOST_2
+        elif game_length < FAST_WIN_LEN_1:
+            multiplier *= FAST_WIN_BOOST_1
+        elif game_length > SLOW_WIN_LEN_2:
+            multiplier *= SLOW_WIN_DAMP_2
+        elif game_length > SLOW_WIN_LEN_1:
+            multiplier *= SLOW_WIN_DAMP_1
+    elif value_target < 0.0 and game_length < FAST_LOSS_LEN:
+        multiplier *= FAST_LOSS_BOOST
+    return multiplier
+
+
+def _compute_sample_priority(value_target: float, source: str, game_length: int) -> float:
+    """Higher priority means the sample is drawn more often from replay."""
+    priority = 1.0
+    if source == "opponent":
+        priority *= OPPONENT_SAMPLE_BOOST
+        if value_target > 0:
+            priority *= WIN_OPPONENT_SAMPLE_BOOST
+    if value_target < 0:
+        priority *= LOSS_SAMPLE_BOOST
+    priority *= _length_priority_multiplier(value_target, game_length)
+    return priority
+
+
+def _make_replay_sample(board: np.ndarray, policy: np.ndarray,
+                        value_target: float, source: str,
+                        game_length: int) -> ReplaySample:
+    return ReplaySample(
+        board=board,
+        policy=policy,
+        value=float(value_target),
+        source=source,
+        game_length=int(game_length),
+        priority=_compute_sample_priority(float(value_target), source, int(game_length)),
+    )
+
+
+def _sample_replay_indices(replay_buffer: list[ReplaySample],
+                           batch_size: int) -> tuple[np.ndarray, dict[str, float]]:
+    """Sample a batch with a guaranteed quota of corrective examples.
+
+    Corrective examples are samples from opponent-play or from trajectories
+    that eventually lost. This increases signal density without inventing a
+    shaped reward.
+    """
+    buf_len = len(replay_buffer)
+    recency_w = np.linspace(1.0, 3.0, buf_len, dtype=np.float64)
+    priority_w = np.array([sample.priority for sample in replay_buffer], dtype=np.float64)
+    weights = recency_w * priority_w
+
+    focus_mask = np.array(
+        [sample.source == "opponent" or sample.value < 0.0 for sample in replay_buffer],
+        dtype=bool,
+    )
+    focus_quota = 0
+    focus_count = int(focus_mask.sum())
+    if focus_count > 0:
+        focus_quota = min(max(1, int(batch_size * FOCUSED_SAMPLE_RATIO)), focus_count)
+
+    chosen = np.empty(0, dtype=np.int64)
+    if focus_quota > 0:
+        focus_idx = np.flatnonzero(focus_mask)
+        focus_w = weights[focus_idx]
+        focus_sum = focus_w.sum()
+        focus_p = (focus_w / focus_sum) if focus_sum > 0 else None
+        chosen = np.random.choice(focus_idx, size=focus_quota, replace=False, p=focus_p)
+
+    remaining = batch_size - chosen.size
+    if remaining > 0:
+        if chosen.size > 0:
+            pool_mask = np.ones(buf_len, dtype=bool)
+            pool_mask[chosen] = False
+            pool_idx = np.flatnonzero(pool_mask)
+        else:
+            pool_idx = np.arange(buf_len)
+        pool_w = weights[pool_idx]
+        pool_sum = pool_w.sum()
+        pool_p = (pool_w / pool_sum) if pool_sum > 0 else None
+        extra = np.random.choice(pool_idx, size=remaining, replace=False, p=pool_p)
+        chosen = np.concatenate([chosen, extra])
+
+    np.random.shuffle(chosen)
+
+    chosen_samples = [replay_buffer[i] for i in chosen]
+    chosen_count = len(chosen_samples)
+    focus_hits = sum(
+        1 for sample in chosen_samples
+        if sample.source == "opponent" or sample.value < 0.0
+    )
+    len_multipliers = [
+        _length_priority_multiplier(sample.value, sample.game_length)
+        for sample in chosen_samples
+    ]
+    boost_hits = sum(1 for mult in len_multipliers if mult > 1.001)
+    damp_hits = sum(1 for mult in len_multipliers if mult < 0.999)
+    stats = {
+        "corrective_ratio": focus_hits / chosen_count if chosen_count > 0 else 0.0,
+        "len_boost_ratio": boost_hits / chosen_count if chosen_count > 0 else 0.0,
+        "len_damp_ratio": damp_hits / chosen_count if chosen_count > 0 else 0.0,
+        "len_priority_avg": sum(len_multipliers) / chosen_count if chosen_count > 0 else 1.0,
+    }
+    return chosen, stats
+
+
 # ---------------------------------------------------------------------------
 # Self-play
 # ---------------------------------------------------------------------------
@@ -184,7 +339,7 @@ def run_self_play(model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE):
     batched forward passes and finishes in seconds.
 
     Returns (training_data, games_completed):
-      training_data: list of (board_encoding, policy_target, value_target)
+    training_data: list of replay samples
       games_completed: int
     """
     model.eval()
@@ -261,9 +416,12 @@ def run_self_play(model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE):
     all_training_data = []
     game_lengths = []
     for i in range(num_games):
-        game_data = _collect_game_with_policies(batch, i, move_policies[i])
+        game_length = int(batch.move_counts[i])
+        game_data = _collect_game_with_policies(
+            batch, i, move_policies[i], source="self", game_length=game_length
+        )
         all_training_data.extend(game_data)
-        game_lengths.append(int(batch.move_counts[i]))
+        game_lengths.append(game_length)
 
     avg_game_len = sum(game_lengths) / len(game_lengths) if game_lengths else 0.0
     return all_training_data, num_games, avg_game_len
@@ -283,7 +441,7 @@ def run_opponent_play(model, opponent_model, num_games: int,
     model.eval()
     opponent_model.eval()
 
-    all_data: list[tuple[np.ndarray, np.ndarray, float]] = []
+    all_data: list[ReplaySample] = []
     game_lengths: list[int] = []
 
     for game_i in range(num_games):
@@ -347,7 +505,12 @@ def run_opponent_play(model, opponent_model, num_games: int,
                 value_target = 1.0
             else:
                 value_target = -1.0
-            all_data.append((encoded, policy_dist, value_target))
+            all_data.append(
+                _make_replay_sample(
+                    encoded, policy_dist, value_target,
+                    source="opponent", game_length=board.move_count,
+                )
+            )
 
         if game_i % 20 == 0:
             mx.clear_cache()
@@ -356,16 +519,18 @@ def run_opponent_play(model, opponent_model, num_games: int,
     return all_data, num_games, avg_game_len
 
 
-def _collect_game_with_policies(batch, game_idx, policies):
+def _collect_game_with_policies(batch, game_idx, policies, source: str = "self",
+                                game_length: int | None = None):
     """
     Collect training data for a finished game, pairing each move's
     board encoding with its policy distribution and value target.
 
-    Returns list of (board_encoding [3,15,15], policy_target [225], value_target float).
+    Returns list of replay samples.
     """
     winner = batch.winners[game_idx]
     history = batch.histories[game_idx]
     data = []
+    resolved_game_length = game_length if game_length is not None else len(history)
 
     for move_idx, (encoded, action, player) in enumerate(history):
         # Value target from this player's perspective
@@ -384,7 +549,12 @@ def _collect_game_with_policies(batch, game_idx, policies):
             policy_target = np.zeros(BOARD_SIZE * BOARD_SIZE, dtype=np.float32)
             policy_target[action] = 1.0
 
-        data.append((encoded, policy_target, value_target))
+        data.append(
+            _make_replay_sample(
+                encoded, policy_target, value_target,
+                source=source, game_length=resolved_game_length,
+            )
+        )
 
     return data
 
@@ -546,7 +716,7 @@ def train(args):
     )
 
     # Replay buffer
-    replay_buffer: list[tuple[np.ndarray, np.ndarray, float]] = []
+    replay_buffer: list[ReplaySample] = []
 
     # Training state
     total_games = 0
@@ -603,6 +773,15 @@ def train(args):
     # History for sparklines
     loss_history: list[float] = []
     wr_history: list[float] = []
+    corrective_ratio_history: list[float] = []
+    len_boost_ratio_history: list[float] = []
+    len_damp_ratio_history: list[float] = []
+    len_priority_avg_history: list[float] = []
+
+    last_corrective_ratio: float | None = None
+    last_len_boost_ratio: float | None = None
+    last_len_damp_ratio: float | None = None
+    last_len_priority_avg: float | None = None
 
     # Loss and grad function
     loss_and_grad = nn.value_and_grad(model, compute_loss)
@@ -620,6 +799,9 @@ def train(args):
     def _sparkline3(values: list[float], width: int = 40) -> tuple[str, str, str]:
         return _sparkline3_fn(values, width)
 
+    def _sparkline4(values: list[float], width: int = 40) -> tuple[str, str, str, str]:
+        return _sparkline4_fn(values, width)
+
     def _smoothed_wr(window: int = probe_window) -> float | None:
         """Sliding average of recent probe WRs for stable decisions."""
         if not wr_history:
@@ -627,12 +809,18 @@ def train(args):
         w = min(window, len(wr_history))
         return sum(wr_history[-w:]) / w
 
-    def _progress_bar(elapsed: float, budget: float | None, width: int = 34) -> str:
+    def _recent_avg(values: list[float], window: int = 5) -> float | None:
+        if not values:
+            return None
+        w = min(window, len(values))
+        return sum(values[-w:]) / w
+
+    def _progress_bar(elapsed: float, budget: float | None, width: int = 46) -> str:
         return _progress_bar_fn(elapsed, budget, width)
 
     def _draw_panel():
         """Render the full text TUI panel with fixed-width columns."""
-        W = 62  # inner width
+        W = 76  # inner width (~20% wider than before)
         chip = hw_info.get("chip", "")
         elapsed = _time.time() - start_time
         gps = total_games / elapsed if elapsed > 0 else 0.0
@@ -645,7 +833,7 @@ def train(args):
         lines.append("╭" + "─" * W + "╮")
         prov = "[benchmark]" if is_benchmark else "[exploratory]"
         resumed = " resumed" if resumed_from else ""
-        lines.append(row(f" Run: {run_id_short}  {chip}  {num_params/1000:.1f}K params  {prov}{resumed}"))
+        lines.append(row(f" Run: {run_id_short}   {chip}   {num_params/1000:.1f}K params   {prov}{resumed}"))
         if time_budget is not None:
             lines.append(row(" " + _progress_bar(elapsed, time_budget)))
         else:
@@ -661,27 +849,48 @@ def train(args):
         sm_str = f" avg:{sm_wr:.0%}" if sm_wr is not None and len(wr_history) > 1 else ""
         opp_str = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
         mix_str = f" mix:{train_opponent_alias}({opponent_mix:.0%})" if train_opponent_alias else ""
-        lines.append(row(f"  Cycle  {cycle:>6d}  │  Loss    {last_loss:>8.4f}  │  Games  {total_games:>7d}"))
-        lines.append(row(f"  Steps  {total_train_steps:>6d}  │  Buffer  {len(replay_buffer):>8d}  │  WR {wr_str:>5}{sm_str}"))
-        lines.append(row(f"  Gm/s   {gps:>6.1f}  │  AvgLen  {avg_game_length:>8.1f}  │  vs {opp_str}{mix_str}"))
+        lines.append(row(f"  Cycle   {cycle:>6d}   │   Loss     {last_loss:>8.4f}   │   Games   {total_games:>7d}"))
+        lines.append(row(f"  Steps   {total_train_steps:>6d}   │   Buffer   {len(replay_buffer):>8d}   │   WR  {wr_str:>5}{sm_str}"))
+        lines.append(row(f"  Gm/s    {gps:>6.1f}   │   AvgLen   {avg_game_length:>8.1f}   │   vs {opp_str}{mix_str}"))
 
-        # --- Charts block (WR + Loss, each 3-row height) ---
-        CW = 40  # chart width
+        # --- Charts block (WR + Loss, each 4-row height) ---
+        CW = 52  # chart width
         if wr_history or loss_history:
             lines.append("├" + "─" * W + "┤")
             if wr_history:
-                up, mid, lo = _sparkline3(wr_history, CW)
+                top, up, mid, lo = _sparkline4(wr_history, CW)
                 wr_last = wr_history[-1]
-                lines.append(row(f"  Win Rate{' ' * (CW - len(up) + 2)}{up} {wr_last:>4.0%}"))
-                lines.append(row(f"          {' ' * (CW - len(mid) + 2)}{mid}     "))
-                lines.append(row(f"          {' ' * (CW - len(lo) + 2)}{lo}     "))
+                lines.append(row(f"  Win Rate   {' ' * (CW - len(top) + 2)}{top}   {wr_last:>4.0%}"))
+                lines.append(row(f"             {' ' * (CW - len(up) + 2)}{up}        "))
+                lines.append(row(f"             {' ' * (CW - len(mid) + 2)}{mid}        "))
+                lines.append(row(f"             {' ' * (CW - len(lo) + 2)}{lo}        "))
             if wr_history and loss_history:
                 lines.append("│" + "╌" * W + "│")
             if loss_history:
-                up, mid, lo = _sparkline3(loss_history, CW)
-                lines.append(row(f"  Loss    {' ' * (CW - len(up) + 2)}{up} {last_loss:>5.2f}"))
-                lines.append(row(f"          {' ' * (CW - len(mid) + 2)}{mid}     "))
-                lines.append(row(f"          {' ' * (CW - len(lo) + 2)}{lo}     "))
+                top, up, mid, lo = _sparkline4(loss_history, CW)
+                lines.append(row(f"  Loss       {' ' * (CW - len(top) + 2)}{top}   {last_loss:>5.2f}"))
+                lines.append(row(f"             {' ' * (CW - len(up) + 2)}{up}        "))
+                lines.append(row(f"             {' ' * (CW - len(mid) + 2)}{mid}        "))
+                lines.append(row(f"             {' ' * (CW - len(lo) + 2)}{lo}        "))
+
+        # --- Signal-quality block ---
+        if last_corrective_ratio is not None:
+            lines.append("├" + "─" * W + "┤")
+            corr_avg = _recent_avg(corrective_ratio_history)
+            corr_avg_str = f" avg:{corr_avg:.0%}" if corr_avg is not None and len(corrective_ratio_history) > 1 else ""
+            len_avg = _recent_avg(len_priority_avg_history)
+            len_avg_str = f" avg x{len_avg:.2f}" if len_avg is not None and len(len_priority_avg_history) > 1 else ""
+            corr_str = f"{last_corrective_ratio:.0%}"
+            boost_str = f"{last_len_boost_ratio:.0%}" if last_len_boost_ratio is not None else "—"
+            damp_str = f"{last_len_damp_ratio:.0%}" if last_len_damp_ratio is not None else "—"
+            sig_up, sig_lo = _sparkline2(corrective_ratio_history, CW)
+            len_up, len_lo = _sparkline2(len_priority_avg_history, CW)
+            lines.append(row(f"  Signal     corrective {corr_str:>4}{corr_avg_str}"))
+            lines.append(row(f"             {' ' * (CW - len(sig_up) + 2)}{sig_up}   hit {corr_str:>4}"))
+            lines.append(row(f"             {' ' * (CW - len(sig_lo) + 2)}{sig_lo}        "))
+            lines.append(row(f"  Length     boost {boost_str:>4}   damp {damp_str:>4}{len_avg_str}"))
+            lines.append(row(f"             {' ' * (CW - len(len_up) + 2)}{len_up}   x{(last_len_priority_avg or 1.0):.2f}"))
+            lines.append(row(f"             {' ' * (CW - len(len_lo) + 2)}{len_lo}        "))
 
         # --- Events block ---
         if events:
@@ -757,29 +966,32 @@ def train(args):
             if len(replay_buffer) >= BATCH_SIZE:
                 model.train()
                 cycle_loss = 0.0
+                cycle_corrective_ratios: list[float] = []
+                cycle_len_boost_ratios: list[float] = []
+                cycle_len_damp_ratios: list[float] = []
+                cycle_len_priority_avgs: list[float] = []
                 steps_this_cycle = min(
                     steps_per_cycle,
                     len(replay_buffer) // BATCH_SIZE
                 )
                 steps_this_cycle = max(steps_this_cycle, 1)
 
-                # Recency-weighted sampling: newer samples ~3x more likely
-                buf_len = len(replay_buffer)
-                recency_w = np.linspace(1.0, 3.0, buf_len)
-                recency_w /= recency_w.sum()
-
                 for step in range(steps_this_cycle):
                     if time_budget is not None and _time.time() - start_time >= time_budget:
                         break
 
-                    indices = np.random.choice(buf_len, size=BATCH_SIZE,
-                                               replace=False, p=recency_w)
+                    indices, sample_stats = _sample_replay_indices(replay_buffer, BATCH_SIZE)
+                    cycle_corrective_ratios.append(sample_stats["corrective_ratio"])
+                    cycle_len_boost_ratios.append(sample_stats["len_boost_ratio"])
+                    cycle_len_damp_ratios.append(sample_stats["len_damp_ratio"])
+                    cycle_len_priority_avgs.append(sample_stats["len_priority_avg"])
                     # Apply random D4 symmetry transform to each sample
                     aug_boards = []
                     aug_policies = []
                     aug_values = []
                     for i in indices:
-                        b, p, v = replay_buffer[i]
+                        sample = replay_buffer[i]
+                        b, p, v = sample.board, sample.policy, sample.value
                         t = random.randint(0, 7)
                         if t > 0:
                             b, p = _apply_symmetry(b, p, t)
@@ -804,6 +1016,15 @@ def train(args):
                     total_train_steps += 1
 
                 last_loss = cycle_loss / steps_this_cycle if steps_this_cycle > 0 else 0.0
+                if cycle_corrective_ratios:
+                    last_corrective_ratio = sum(cycle_corrective_ratios) / len(cycle_corrective_ratios)
+                    last_len_boost_ratio = sum(cycle_len_boost_ratios) / len(cycle_len_boost_ratios)
+                    last_len_damp_ratio = sum(cycle_len_damp_ratios) / len(cycle_len_damp_ratios)
+                    last_len_priority_avg = sum(cycle_len_priority_avgs) / len(cycle_len_priority_avgs)
+                    corrective_ratio_history.append(last_corrective_ratio)
+                    len_boost_ratio_history.append(last_len_boost_ratio)
+                    len_damp_ratio_history.append(last_len_damp_ratio)
+                    len_priority_avg_history.append(last_len_priority_avg)
 
             # Record cycle metrics
             metric = {

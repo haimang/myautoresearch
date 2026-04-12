@@ -4,14 +4,14 @@ Train a Gomoku (五子棋) AI from scratch using the [autoresearch](https://gith
 
 Inspired by [Code Bullet](https://www.youtube.com/@CodeBullet) — the project includes a full game implementation, training recording system, and replay tools for video production.
 
-## Project phases
+## Architecture
 
-| Phase | Versions | Status | Description |
-|-------|----------|--------|-------------|
-| Infrastructure | v1–v9 | ✅ Complete | Board engine, training loop, TUI, experiment tracking, sweep tools |
-| Autoresearch | v10+ | 🔄 Active | Agent-driven research loop: report → hypothesize → experiment → evaluate |
+The project is split into a **domain-agnostic framework** and **domain-specific implementations**:
 
-The agent (Claude Code, Cursor, Copilot CLI, etc.) reads `docs/program.md`, consumes experiment reports via `analyze.py --report`, and drives the research loop by modifying `src/train.py`.
+- **`framework/`** — Reusable autoresearch infrastructure: experiment tracking, analysis, sweep, TUI, plus root templates (`train.py`, `prepare.py`, `program.md`) that serve as starting points for any new domain.
+- **`domains/gomoku/`** — The Gomoku-specific instantiation: game engine, minimax opponents, neural network training, play/replay tools, and browser UI.
+
+To add a new domain, copy the framework templates to `domains/<name>/` and fill in domain-specific logic.
 
 ## Quick start
 
@@ -19,30 +19,42 @@ Requirements: Apple Silicon Mac, Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run python src/train.py                     # run one 5-minute training experiment
-uv run python src/analyze.py --runs            # view all training runs
-uv run python src/play.py --list               # list saved checkpoints
-uv run python src/play.py --list-opponents     # list registered NN opponents
-uv run python src/play.py                      # play against the trained AI
+uv run python domains/gomoku/train.py                  # run one training experiment
+uv run python framework/analyze.py --runs              # view all training runs
+uv run python domains/gomoku/play.py --list            # list saved checkpoints
+uv run python domains/gomoku/play.py --list-opponents  # list registered NN opponents
+uv run python domains/gomoku/play.py                   # play against the trained AI
 ```
 
 ## Project structure
 
 ```
 mag-gomoku/
-├── src/                         # Python source code
-│   ├── game.py                  #   board engine, pygame renderer, batched self-play (read-only)
-│   ├── prepare.py               #   minimax opponents, evaluation (read-only)
-│   ├── train.py                 #   neural network, training loop, plain-text TUI (agent-mutable)
-│   ├── tracker.py               #   SQLite experiment tracking (output/tracker.db)
-│   ├── analyze.py               #   experiment reports + training analysis (read-only queries)
-│   ├── sweep.py                 #   hyperparameter sweep tool (batch experiments)
-│   ├── tui.py                   #   TUI rendering helpers (sparklines, progress bar)
-│   ├── play.py                  #   human vs AI / AI vs AI gameplay
-│   └── replay.py                #   replay recorded games, export frames for video
+├── framework/                   # ═══ autoresearch framework (domain-agnostic) ═══
+│   ├── tracker.py               #   SQLite experiment tracking              [READ-ONLY]
+│   ├── analyze.py               #   experiment reports + training analysis  [READ-ONLY]
+│   ├── sweep.py                 #   batch hyperparameter sweep              [READ-ONLY]
+│   ├── tui.py                   #   TUI rendering helpers                   [READ-ONLY]
+│   ├── train.py                 #   training loop template (root copy)      [TEMPLATE]
+│   ├── prepare.py               #   evaluation harness template (root copy) [TEMPLATE]
+│   └── program.md               #   experiment protocol template            [TEMPLATE]
+├── domains/
+│   └── gomoku/                  # ═══ Gomoku domain ═══
+│       ├── game.py              #   board engine, renderer, batch self-play [READ-ONLY]
+│       ├── prepare.py           #   minimax opponents L0-L3, eval harness   [READ-ONLY]
+│       ├── train.py             #   NN, self-play, training loop, TUI, CLI  [AGENT-EDITABLE]
+│       ├── program.md           #   Gomoku experiment protocol (agent reads this)
+│       ├── play.py              #   human vs AI / AI vs AI gameplay         [READ-ONLY]
+│       ├── play_service.py      #   shared gameplay services                [READ-ONLY]
+│       ├── replay.py            #   replay recorded games, export frames    [READ-ONLY]
+│       └── web/                 #   browser-based UI
+│           ├── web_app.py       #     FastAPI backend
+│           ├── index.html
+│           ├── app.js
+│           └── styles.css
 ├── docs/                        # documentation
-│   ├── program.md               #   autonomous experiment protocol (agent reads this)
-│   └── caveats.md               #   pitfall records & troubleshooting notes
+│   ├── program.md               #   experiment protocol template            [TEMPLATE]
+│   └── caveats.md               #   pitfall records & troubleshooting
 ├── output/                      # generated artifacts (gitignored)
 │   ├── tracker.db               #   SQLite database — global index across all runs
 │   ├── opponents/               #   registered NN opponents
@@ -51,6 +63,8 @@ mag-gomoku/
 │       ├── model.safetensors    #     final trained model
 │       ├── checkpoints/         #     model snapshots at win-rate milestones
 │       └── recordings/games/    #     full game records (JSON, bound to checkpoints)
+├── updates/                     # experiment archives & design documents
+│   └── gomoku_1st_exp.db        #   first Gomoku experiment archive (SQLite)
 ├── .gitignore
 ├── README.md
 ├── pyproject.toml
@@ -63,46 +77,46 @@ The training script features a plain-text dashboard with sparkline charts, autom
 
 ```bash
 # 默认训练（无时间限制时自动设 300 秒安全限）
-uv run python src/train.py
+uv run python domains/gomoku/train.py
 
 # 训练到 80% 胜率停止（无时间限制）
-uv run python src/train.py --target-win-rate 0.80
+uv run python domains/gomoku/train.py --target-win-rate 0.80
 
 # 10 分钟快速训练，每 5 cycle 评估一次
-uv run python src/train.py --time-budget 600 --eval-interval 5
+uv run python domains/gomoku/train.py --time-budget 600 --eval-interval 5
 
 # 长时间训练到 95% 胜率，详细评估
-uv run python src/train.py --target-win-rate 0.95 --time-budget 7200 --probe-games 100
+uv run python domains/gomoku/train.py --target-win-rate 0.95 --time-budget 7200 --probe-games 100
 
 # 低负载持久训练（16 并行对局，降低 GPU 占用）
-uv run python src/train.py --target-win-rate 0.80 --parallel-games 16
+uv run python domains/gomoku/train.py --target-win-rate 0.80 --parallel-games 16
 
 # 对战 minimax depth-2 对手训练
-uv run python src/train.py --eval-level 1 --target-win-rate 0.80
+uv run python domains/gomoku/train.py --eval-level 1 --target-win-rate 0.80
 
 # 对战注册的 NN 对手训练
-uv run python src/train.py --eval-opponent L0 --target-win-rate 0.80
+uv run python domains/gomoku/train.py --eval-opponent L0 --target-win-rate 0.80
 
 # 混合对手训练（20% 对局 vs 注册对手，80% 自对弈）
-uv run python src/train.py --eval-opponent L0 --train-opponent L0 --opponent-mix 0.2 --target-win-rate 0.80
+uv run python domains/gomoku/train.py --eval-opponent L0 --train-opponent L0 --opponent-mix 0.2 --target-win-rate 0.80
 
 # 使用更大模型（8 残差块 × 64 通道，~713K 参数）
-uv run python src/train.py --num-blocks 8 --num-filters 64 --target-win-rate 0.80
+uv run python domains/gomoku/train.py --num-blocks 8 --num-filters 64 --target-win-rate 0.80
 
 # 使用更大 replay buffer
-uv run python src/train.py --buffer-size 100000 --target-win-rate 0.80
+uv run python domains/gomoku/train.py --buffer-size 100000 --target-win-rate 0.80
 
 # 调整学习率和每 cycle 训练步数
-uv run python src/train.py --learning-rate 3e-4 --steps-per-cycle 50 --target-win-rate 0.80
+uv run python domains/gomoku/train.py --learning-rate 3e-4 --steps-per-cycle 50 --target-win-rate 0.80
 
 # 可复现实验（固定随机种子）
-uv run python src/train.py --seed 42 --time-budget 300
+uv run python domains/gomoku/train.py --seed 42 --time-budget 300
 
 # 从上一次训练断点续训（支持短 UUID 前缀）
-uv run python src/train.py --resume c8d815ac --time-budget 600
+uv run python domains/gomoku/train.py --resume c8d815ac --time-budget 600
 
 # 后台运行并记录日志
-PYTHONUNBUFFERED=1 uv run python src/train.py --target-win-rate 0.80 > output/train.log 2>&1 &
+PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py --target-win-rate 0.80 > output/train.log 2>&1 &
 ```
 
 Each run creates its own directory under `output/<uuid>/` with isolated model, checkpoints, and recordings.
@@ -137,13 +151,13 @@ Register a trained checkpoint as a named NN opponent for future training:
 
 ```bash
 # Register a checkpoint as opponent with alias
-uv run python src/train.py --register-opponent L0 --from-run 374d567f --from-tag wr065_c0310 --description "5000-game baseline"
+uv run python domains/gomoku/train.py --register-opponent L0 --from-run 374d567f --from-tag wr065_c0310 --description "5000-game baseline"
 
 # List registered opponents
-uv run python src/play.py --list-opponents
+uv run python domains/gomoku/play.py --list-opponents
 
 # Train against registered opponent
-uv run python src/train.py --eval-opponent L0 --target-win-rate 0.80
+uv run python domains/gomoku/train.py --eval-opponent L0 --target-win-rate 0.80
 ```
 
 Probe evaluations use the NN opponent for fast feedback; checkpoint full evaluations still use minimax for consistent cross-run comparison.
@@ -166,7 +180,7 @@ If a training run is interrupted, or you want to continue from a previous experi
 sqlite3 -header -column output/tracker.db "SELECT substr(id,1,8) AS run, status, total_cycles, final_win_rate FROM runs ORDER BY created_at DESC"
 
 # Resume from the last checkpoint of a specific run
-uv run python src/train.py --resume <uuid>
+uv run python domains/gomoku/train.py --resume <uuid>
 ```
 
 Resume creates a **new run** with its own UUID directory. The model weights are loaded from the previous run's last checkpoint, and training continues from the saved cycle number.
@@ -181,7 +195,7 @@ Resume creates a **new run** with its own UUID directory. The model weights are 
 │  LOOP:                                                  │
 │    1. Read report (analyze.py --report --format json)   │
 │    2. Form hypothesis from signals + data               │
-│    3. Edit src/train.py                                 │
+│    3. Edit domains/gomoku/train.py                      │
 │    4. git commit                                        │
 │    5. Run training (train.py --time-budget 300)         │
 │    6. Read new report → compare → keep or revert        │
@@ -191,11 +205,11 @@ Resume creates a **new run** with its own UUID directory. The model weights are 
 ┌─────────────────────────────────────────────────────────┐
 │  MAG-Gomoku Codebase                                    │
 │                                                         │
-│  src/train.py      ← agent edits this (only mutable)   │
-│  src/analyze.py    ← experiment reports + analysis      │
-│  src/sweep.py      ← batch hyperparam search (tool)    │
-│  output/tracker.db ← persistent experiment history      │
-│  src/prepare.py    ← fixed benchmark (judge)            │
+│  domains/gomoku/train.py   ← agent edits (only mutable)│
+│  framework/analyze.py      ← experiment reports         │
+│  framework/sweep.py        ← batch hyperparam search    │
+│  output/tracker.db         ← experiment history         │
+│  domains/gomoku/prepare.py ← fixed benchmark (judge)    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -212,11 +226,11 @@ The single metric is **win_rate** against fixed minimax opponents. The agent pro
 
 ```bash
 git checkout -b autoresearch/gomoku-v1
-uv run python src/train.py   # establish baseline
-# Point Claude Code (or any coding agent) at docs/program.md and let it run
+uv run python domains/gomoku/train.py   # establish baseline
+# Point Claude Code (or any coding agent) at domains/gomoku/program.md and let it run
 ```
 
-The agent reads `docs/program.md`, runs `analyze.py --report --format json` to understand the current state, then enters the experiment loop: hypothesize → edit `train.py` → train → evaluate → keep/revert → repeat.
+The agent reads `domains/gomoku/program.md`, runs `analyze.py --report --format json` to understand the current state, then enters the experiment loop: hypothesize → edit `train.py` → train → evaluate → keep/revert → repeat.
 
 Each experiment takes ~8 minutes (5 min training + eval). Expect ~7 experiments/hour, ~70 overnight.
 
@@ -225,9 +239,9 @@ Each experiment takes ~8 minutes (5 min training + eval). Expect ~7 experiments/
 The agent consumes structured experiment reports before each iteration:
 
 ```bash
-uv run python src/analyze.py --report                    # Chinese markdown (human-readable)
-uv run python src/analyze.py --report --format json      # Structured JSON (agent-consumable)
-uv run python src/analyze.py --report --recent 10        # More history context
+uv run python framework/analyze.py --report                    # Chinese markdown (human-readable)
+uv run python framework/analyze.py --report --format json      # Structured JSON (agent-consumable)
+uv run python framework/analyze.py --report --recent 10        # More history context
 ```
 
 Reports include: recent runs with full hyperparameters, best checkpoint, win-rate frontier, training stability, opponent registry, stage assessment, and auto-generated signals with suggested actions.
@@ -235,12 +249,12 @@ Reports include: recent runs with full hyperparameters, best checkpoint, win-rat
 ## Playing against the AI
 
 ```bash
-uv run python src/play.py                              # vs latest model
-uv run python src/play.py --checkpoint best            # vs best archived model
-uv run python src/play.py --black stage0 --white best  # watch two AIs play
-uv run python src/play.py --level 2                    # vs minimax (no NN)
-uv run python src/play.py --list                       # list all checkpoints
-uv run python src/play.py --list-opponents             # list registered NN opponents
+uv run python domains/gomoku/play.py                              # vs latest model
+uv run python domains/gomoku/play.py --checkpoint best            # vs best archived model
+uv run python domains/gomoku/play.py --black stage0 --white best  # watch two AIs play
+uv run python domains/gomoku/play.py --level 2                    # vs minimax (no NN)
+uv run python domains/gomoku/play.py --list                       # list all checkpoints
+uv run python domains/gomoku/play.py --list-opponents             # list registered NN opponents
 ```
 
 ## Recording and replay
@@ -249,13 +263,13 @@ Training automatically records all evaluation games at each checkpoint. Recordin
 
 ```bash
 # Replay a specific game
-uv run python src/replay.py output/<uuid>/recordings/games/wr070_c0045_game003.json
+uv run python domains/gomoku/replay.py output/<uuid>/recordings/games/wr070_c0045_game003.json
 
 # Export frames for video
-uv run python src/replay.py output/<uuid>/recordings/games/wr070_c0045_game003.json --export
+uv run python domains/gomoku/replay.py output/<uuid>/recordings/games/wr070_c0045_game003.json --export
 
 # Growth montage
-uv run python src/replay.py --montage
+uv run python domains/gomoku/replay.py --montage
 ```
 
 ## Analysis tool
@@ -263,16 +277,16 @@ uv run python src/replay.py --montage
 `analyze.py` provides read-only queries against the tracker database:
 
 ```bash
-uv run python src/analyze.py --report                        # experiment report (markdown, Chinese)
-uv run python src/analyze.py --report --format json          # experiment report (JSON, for agent)
-uv run python src/analyze.py --runs                          # list all runs with stats
-uv run python src/analyze.py --best                          # best checkpoint per run
-uv run python src/analyze.py --frontier                      # WR progression frontier
-uv run python src/analyze.py --compare 374d567f 1922e0f0     # side-by-side run comparison
-uv run python src/analyze.py --lineage 1922e0f0              # trace resume chain
-uv run python src/analyze.py --opponents                     # list registered opponents
-uv run python src/analyze.py --stability 374d567f            # training stability report
-uv run python src/analyze.py --matrix sweep1                 # sweep matrix results by tag prefix
+uv run python framework/analyze.py --report                        # experiment report (markdown, Chinese)
+uv run python framework/analyze.py --report --format json          # experiment report (JSON, for agent)
+uv run python framework/analyze.py --runs                          # list all runs with stats
+uv run python framework/analyze.py --best                          # best checkpoint per run
+uv run python framework/analyze.py --frontier                      # WR progression frontier
+uv run python framework/analyze.py --compare 374d567f 1922e0f0     # side-by-side run comparison
+uv run python framework/analyze.py --lineage 1922e0f0              # trace resume chain
+uv run python framework/analyze.py --opponents                     # list registered opponents
+uv run python framework/analyze.py --stability 374d567f            # training stability report
+uv run python framework/analyze.py --matrix sweep1                 # sweep matrix results by tag prefix
 ```
 
 ## Hyperparameter sweep
@@ -281,19 +295,19 @@ uv run python src/analyze.py --matrix sweep1                 # sweep matrix resu
 
 ```bash
 # Dry-run: preview the experiment matrix
-uv run python src/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
+uv run python framework/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
   --time-budget 120 --tag arch_search --dry-run
 
 # Run the sweep (2 filter × 2 lr × 2 seeds = 8 experiments)
-uv run python src/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
+uv run python framework/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
   --time-budget 120 --tag arch_search
 
 # Resume (skip already-completed configs)
-uv run python src/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
+uv run python framework/sweep.py --num-filters 32,64 --learning-rate 3e-4,5e-4 --seeds 42,137 \
   --time-budget 120 --tag arch_search --resume
 
 # View results
-uv run python src/analyze.py --matrix arch_search
+uv run python framework/analyze.py --matrix arch_search
 ```
 
 Sweep axes: `--num-blocks`, `--num-filters`, `--learning-rate`, `--steps-per-cycle`, `--buffer-size` (comma-separated values). Fixed params: `--time-budget` (required), `--seeds`, `--tag`. Passthrough: `--eval-opponent`, `--parallel-games`, `--target-win-rate`.

@@ -1,8 +1,8 @@
 """
-Experiment tracker for MAG-Gomoku — SQLite-based.
+autoresearch 实验追踪器 — 基于 SQLite。
 
-Manages: runs, cycle_metrics, checkpoints, recordings.
-All paths stored as relative to project root (e.g. "output/checkpoints/xxx.safetensors").
+管理: runs（训练运行）、cycle_metrics（周期指标）、checkpoints（检查点）、recordings（对局记录）。
+所有路径以项目根目录为基准存储（如 "output/checkpoints/xxx.safetensors"）。
 """
 
 import os
@@ -14,8 +14,8 @@ from typing import Optional
 
 DB_PATH = "output/tracker.db"
 
-# Win-rate thresholds for checkpoint export
-# <80%: every 5%, 80-90%: every 2%, >90%: every 1%
+# 检查点导出的胜率阈值
+# <80%: 每 5%, 80-90%: 每 2%, >90%: 每 1%
 CHECKPOINT_THRESHOLDS = [
     0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
     0.80, 0.82, 0.84, 0.86, 0.88,
@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS opponents (
 
 
 def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
+    """建立数据库连接，自动创建目录。"""
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -149,28 +150,28 @@ def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
 
 
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
-    """Create tables if they don't exist and return a connection."""
+    """初始化数据库（建表 + 迁移），返回连接。"""
     conn = _connect(db_path)
     conn.executescript(_SCHEMA_SQL)
-    # v3 migration: add columns for UUID output dirs and resume support
+    # v3 迁移: UUID 输出目录 + 续训支持
     for col, typ in [("resumed_from", "TEXT"), ("output_dir", "TEXT")]:
         try:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
-            pass  # column already exists
-    # v6 migration: benchmark flag and eval_opponent
+            pass  # 列已存在
+    # v6 迁移: benchmark 标记 + eval_opponent
     for col, typ in [("is_benchmark", "INTEGER DEFAULT 0"), ("eval_opponent", "TEXT")]:
         try:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
-    # v8 migration: opponent architecture metadata
+    # v8 迁移: 对手架构元数据
     for col, typ in [("num_res_blocks", "INTEGER"), ("num_filters", "INTEGER")]:
         try:
             conn.execute(f"ALTER TABLE opponents ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
-    # v9 migration: sweep tag and seed for experiment tracking
+    # v9 迁移: sweep 标签和种子
     for col, typ in [("sweep_tag", "TEXT"), ("seed", "INTEGER")]:
         try:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
@@ -181,11 +182,11 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# Hardware info
+# 硬件信息
 # ---------------------------------------------------------------------------
 
 def collect_hardware_info() -> dict:
-    """Gather chip, cores, memory, MLX version from the current machine."""
+    """收集当前机器的芯片、核心数、内存、MLX 版本。"""
     info: dict = {}
     try:
         out = subprocess.check_output(
@@ -245,7 +246,7 @@ def collect_hardware_info() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Run CRUD
+# 运行记录 CRUD
 # ---------------------------------------------------------------------------
 
 def create_run(conn: sqlite3.Connection, run_id: str,
@@ -254,7 +255,7 @@ def create_run(conn: sqlite3.Connection, run_id: str,
                output_dir: Optional[str] = None,
                is_benchmark: bool = False,
                eval_opponent: Optional[str] = None) -> None:
-    """Insert a new training run."""
+    """插入新的训练运行记录。"""
     hw = hardware or {}
     conn.execute(
         """INSERT INTO runs (
@@ -308,7 +309,7 @@ def create_run(conn: sqlite3.Connection, run_id: str,
 
 
 def finish_run(conn: sqlite3.Connection, run_id: str, summary: dict) -> None:
-    """Mark a run as completed and fill in summary fields."""
+    """标记运行完成，填充汇总字段。"""
     conn.execute(
         """UPDATE runs SET
             finished_at = ?, status = ?,
@@ -336,7 +337,7 @@ def finish_run(conn: sqlite3.Connection, run_id: str, summary: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cycle metrics
+# 周期指标
 # ---------------------------------------------------------------------------
 
 def save_cycle_metric(conn: sqlite3.Connection, run_id: str,
@@ -365,12 +366,12 @@ def save_cycle_metric(conn: sqlite3.Connection, run_id: str,
 
 
 # ---------------------------------------------------------------------------
-# Checkpoints
+# 检查点
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(conn: sqlite3.Connection, run_id: str,
                     data: dict) -> int:
-    """Insert a checkpoint record. Returns the checkpoint id."""
+    """插入检查点记录，返回 checkpoint id。"""
     cur = conn.execute(
         """INSERT INTO checkpoints (
             run_id, tag, cycle, step, loss,
@@ -405,7 +406,7 @@ def save_checkpoint(conn: sqlite3.Connection, run_id: str,
 
 
 # ---------------------------------------------------------------------------
-# Recordings
+# 对局记录
 # ---------------------------------------------------------------------------
 
 def save_recording(conn: sqlite3.Connection, checkpoint_id: int,
@@ -433,18 +434,18 @@ def save_recording(conn: sqlite3.Connection, checkpoint_id: int,
 
 def save_recordings_batch(conn: sqlite3.Connection, checkpoint_id: int,
                           run_id: str, records: list[dict]) -> None:
-    """Bulk insert recordings and commit once."""
+    """批量插入对局记录并提交。"""
     for rec in records:
         save_recording(conn, checkpoint_id, run_id, rec)
     conn.commit()
 
 
 # ---------------------------------------------------------------------------
-# Threshold logic
+# 阈值逻辑
 # ---------------------------------------------------------------------------
 
 def should_checkpoint(current_wr: float, last_ckpt_wr: float) -> bool:
-    """Return True if current_wr crosses the next threshold above last_ckpt_wr."""
+    """如果 current_wr 越过 last_ckpt_wr 之上的下一个阈值，返回 True。"""
     for t in CHECKPOINT_THRESHOLDS:
         if last_ckpt_wr < t <= current_wr:
             return True
@@ -452,7 +453,7 @@ def should_checkpoint(current_wr: float, last_ckpt_wr: float) -> bool:
 
 
 def crossed_threshold(current_wr: float, last_ckpt_wr: float) -> Optional[float]:
-    """Return the highest threshold crossed between last_ckpt_wr and current_wr, or None."""
+    """返回 last_ckpt_wr 到 current_wr 之间越过的最高阈值，无则返回 None。"""
     crossed = None
     for t in CHECKPOINT_THRESHOLDS:
         if last_ckpt_wr < t <= current_wr:
@@ -461,7 +462,7 @@ def crossed_threshold(current_wr: float, last_ckpt_wr: float) -> Optional[float]
 
 
 def next_threshold(last_ckpt_wr: float) -> Optional[float]:
-    """Return the next threshold above last_ckpt_wr, or None."""
+    """返回 last_ckpt_wr 之上的下一个阈值，无则返回 None。"""
     for t in CHECKPOINT_THRESHOLDS:
         if t > last_ckpt_wr:
             return t
@@ -469,15 +470,15 @@ def next_threshold(last_ckpt_wr: float) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# Query helpers
+# 查询辅助
 # ---------------------------------------------------------------------------
 
 def get_run(conn: sqlite3.Connection, run_id: str) -> Optional[dict]:
-    """Look up a run by exact ID or short prefix."""
+    """通过完整 ID 或短前缀查找运行记录。"""
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     if row:
         return dict(row)
-    # Try prefix match
+    # 前缀匹配
     rows = conn.execute(
         "SELECT * FROM runs WHERE id LIKE ?", (run_id + "%",)
     ).fetchall()
@@ -522,7 +523,7 @@ def count_checkpoints(conn: sqlite3.Connection, run_id: str) -> int:
 
 def get_latest_checkpoint(conn: sqlite3.Connection,
                           run_id: str) -> Optional[dict]:
-    """Return the most recent checkpoint for a run, or None."""
+    """返回某运行的最新检查点，无则返回 None。"""
     row = conn.execute(
         "SELECT * FROM checkpoints WHERE run_id = ? ORDER BY cycle DESC LIMIT 1",
         (run_id,),
@@ -532,7 +533,7 @@ def get_latest_checkpoint(conn: sqlite3.Connection,
 
 def list_all_checkpoints(conn: sqlite3.Connection,
                          limit: int = 50) -> list[dict]:
-    """List checkpoints across all runs, newest first."""
+    """列出所有运行的检查点，最新优先。"""
     rows = conn.execute(
         """SELECT c.*, r.chip, r.output_dir
            FROM checkpoints c
@@ -545,13 +546,13 @@ def list_all_checkpoints(conn: sqlite3.Connection,
 
 def find_checkpoint_by_tag(conn: sqlite3.Connection,
                            tag: str) -> Optional[dict]:
-    """Find a checkpoint by exact or partial tag match."""
+    """通过完整或部分标签匹配查找检查点。"""
     row = conn.execute(
         "SELECT * FROM checkpoints WHERE tag = ?", (tag,),
     ).fetchone()
     if row:
         return dict(row)
-    # Partial match
+    # 部分匹配
     row = conn.execute(
         "SELECT * FROM checkpoints WHERE tag LIKE ? ORDER BY created_at DESC LIMIT 1",
         (f"%{tag}%",),
@@ -560,7 +561,7 @@ def find_checkpoint_by_tag(conn: sqlite3.Connection,
 
 
 # ---------------------------------------------------------------------------
-# Opponents
+# 对手注册
 # ---------------------------------------------------------------------------
 
 def register_opponent(conn: sqlite3.Connection, alias: str,
@@ -571,7 +572,7 @@ def register_opponent(conn: sqlite3.Connection, alias: str,
                       description: Optional[str] = None,
                       num_res_blocks: Optional[int] = None,
                       num_filters: Optional[int] = None) -> None:
-    """Register a model checkpoint as a named opponent."""
+    """注册一个模型检查点作为命名对手。"""
     conn.execute(
         """INSERT OR REPLACE INTO opponents (
             alias, source_run, source_tag, model_path,
@@ -587,7 +588,7 @@ def register_opponent(conn: sqlite3.Connection, alias: str,
 
 
 def get_opponent(conn: sqlite3.Connection, alias: str) -> Optional[dict]:
-    """Look up a registered opponent by alias."""
+    """按别名查找注册对手。"""
     row = conn.execute(
         "SELECT * FROM opponents WHERE alias = ?", (alias,),
     ).fetchone()
@@ -595,7 +596,7 @@ def get_opponent(conn: sqlite3.Connection, alias: str) -> Optional[dict]:
 
 
 def list_opponents(conn: sqlite3.Connection) -> list[dict]:
-    """List all registered opponents."""
+    """列出所有注册对手。"""
     rows = conn.execute(
         "SELECT * FROM opponents ORDER BY created_at",
     ).fetchall()

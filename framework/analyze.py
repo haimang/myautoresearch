@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""MAG-Gomoku tracker analysis tool (read-only).
+"""autoresearch 训练分析工具（只读）。
 
-Queries the SQLite tracker database to report on training runs,
-checkpoints, opponents, and win-rate progression.
+查询 SQLite 追踪数据库，报告训练运行、检查点、对手和胜率进展。
 
-Usage:
-    uv run python src/analyze.py --best
-    uv run python src/analyze.py --frontier
-    uv run python src/analyze.py --compare RUN_A RUN_B
-    uv run python src/analyze.py --lineage RUN_ID
-    uv run python src/analyze.py --opponents
-    uv run python src/analyze.py --runs
-    uv run python src/analyze.py --report
-    uv run python src/analyze.py --report --format json
+用法:
+    uv run python framework/analyze.py --runs
+    uv run python framework/analyze.py --best
+    uv run python framework/analyze.py --frontier
+    uv run python framework/analyze.py --compare RUN_A RUN_B
+    uv run python framework/analyze.py --report
+    uv run python framework/analyze.py --report --format json
 """
 
 import argparse
@@ -32,7 +29,7 @@ def _connect() -> sqlite3.Connection:
         sys.exit(1)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # Ensure schema migrations are applied
+    # 暂时停用: 确保 schema 迁移已应用
     for col, typ in [("is_benchmark", "INTEGER DEFAULT 0"), ("eval_opponent", "TEXT")]:
         try:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
@@ -42,16 +39,16 @@ def _connect() -> sqlite3.Connection:
 
 
 def _col(text: str, width: int) -> str:
-    """Left-pad/truncate text to fixed width."""
+    """左对齐/截断文本到固定宽度。"""
     return str(text)[:width].ljust(width)
 
 
 # ---------------------------------------------------------------------------
-# Commands
+# 命令
 # ---------------------------------------------------------------------------
 
 def cmd_runs(conn: sqlite3.Connection) -> None:
-    """List all training runs with summary stats."""
+    """列出所有训练运行及其汇总统计。"""
     rows = conn.execute(
         """SELECT id, status, started_at, total_cycles, total_games,
                   final_loss, final_win_rate, wall_time_s, eval_level,
@@ -84,7 +81,7 @@ def cmd_runs(conn: sqlite3.Connection) -> None:
 
 
 def cmd_best(conn: sqlite3.Connection) -> None:
-    """Show the best checkpoint per completed run."""
+    """显示每个已完成运行的最佳检查点。"""
     rows = conn.execute(
         """SELECT c.run_id, c.tag, c.win_rate, c.eval_games, c.cycle,
                   r.eval_level, r.eval_opponent
@@ -108,7 +105,7 @@ def cmd_best(conn: sqlite3.Connection) -> None:
 
 
 def cmd_frontier(conn: sqlite3.Connection) -> None:
-    """Show WR progression across all runs (monotonically improving checkpoints)."""
+    """显示跨运行的胜率前沿（单调递增的检查点）。"""
     rows = conn.execute(
         """SELECT c.run_id, c.tag, c.win_rate, c.created_at, c.cycle,
                   r.eval_level, r.eval_opponent
@@ -133,7 +130,7 @@ def cmd_frontier(conn: sqlite3.Connection) -> None:
 
 
 def cmd_compare(conn: sqlite3.Connection, run_a: str, run_b: str) -> None:
-    """Compare two runs side-by-side."""
+    """并排对比两个运行。"""
     def _get_run(rid: str) -> dict:
         row = conn.execute(
             "SELECT * FROM runs WHERE id LIKE ?", (rid + "%",)
@@ -192,7 +189,7 @@ def cmd_compare(conn: sqlite3.Connection, run_a: str, run_b: str) -> None:
 
 
 def cmd_lineage(conn: sqlite3.Connection, run_id: str) -> None:
-    """Trace the resume chain for a run."""
+    """追踪某运行的续训链。"""
     chain = []
     current = run_id
     while current:
@@ -220,7 +217,7 @@ def cmd_lineage(conn: sqlite3.Connection, run_id: str) -> None:
 
 
 def cmd_opponents(conn: sqlite3.Connection) -> None:
-    """List all registered opponents."""
+    """列出所有注册对手。"""
     try:
         rows = conn.execute(
             """SELECT alias, source_run, source_tag, win_rate,
@@ -245,7 +242,7 @@ def cmd_opponents(conn: sqlite3.Connection) -> None:
 
 
 def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
-    """Show sweep results grouped by tag prefix with aggregated metrics."""
+    """按标签前缀分组展示 sweep 结果。"""
 
     rows = conn.execute(
         "SELECT id, status, sweep_tag, total_cycles, total_games, "
@@ -255,13 +252,13 @@ def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
         "FROM runs WHERE sweep_tag IS NOT NULL ORDER BY started_at"
     ).fetchall()
 
-    # Filter to runs with matching sweep_tag prefix
+    # 过滤匹配 sweep_tag 前缀的运行
     groups: dict[str, list[dict]] = {}
     for r in rows:
         sweep_tag = r["sweep_tag"] or ""
         if not sweep_tag.startswith(tag_prefix):
             continue
-        # Strip seed suffix to group by config
+        # 去除种子后缀以按配置分组
         parts = sweep_tag.rsplit("_sd", 1)
         base_tag = parts[0] if len(parts) == 2 else sweep_tag
         seed = parts[1] if len(parts) == 2 else "?"
@@ -281,7 +278,7 @@ def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
         print(f"No runs found with sweep_tag prefix '{tag_prefix}'")
         return
 
-    # Extract varying axes from hyperparams across groups
+    # 从超参中提取变化轴
     print(f"Sweep Matrix: {tag_prefix}  ({sum(len(v) for v in groups.values())} runs in {len(groups)} configs)")
     print("=" * 95)
     print(f"  {'Config':<35} {'Seeds':>5}  {'WR Mean':>7}  {'WR Std':>6}  "
@@ -325,7 +322,7 @@ def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
 
 
 def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
-    """Show training stability metrics for a run."""
+    """显示某运行的训练稳定性指标。"""
 
     row = conn.execute(
         "SELECT id, total_cycles, total_games, final_win_rate, final_loss "
@@ -353,6 +350,7 @@ def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
         std_wr = math.sqrt(var_wr)
         min_wr, max_wr = min(wrs), max(wrs)
         # Max consecutive swing
+        # 最大连续波动
         max_swing = 0.0
         for i in range(1, len(wrs)):
             max_swing = max(max_swing, abs(wrs[i] - wrs[i - 1]))
@@ -399,7 +397,7 @@ def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
     else:
         print("\nNo loss data.")
 
-    # Checkpoint distribution
+    # 检查点分布
     ckpt_rows = conn.execute(
         "SELECT tag, cycle, win_rate FROM checkpoints "
         "WHERE run_id = ? ORDER BY cycle", (full_id,)
@@ -414,10 +412,10 @@ def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Report generation (dual format: markdown / JSON)
+# 报告生成（双格式: markdown / JSON）
 # ---------------------------------------------------------------------------
 
-# Stage promotion ladder
+# 阶段晋级梯度
 _STAGES = [
     {"level": 0, "opponent": "L0 (random)",        "threshold": 0.95, "next": "L1 (minimax depth 2)"},
     {"level": 1, "opponent": "L1 (minimax depth 2)","threshold": 0.80, "next": "L2 (minimax depth 4)"},
@@ -427,7 +425,7 @@ _STAGES = [
 
 
 def _gather_report_data(conn: sqlite3.Connection, n_recent: int = 5) -> dict:
-    """Gather all data needed for report generation."""
+    """收集报告所需的所有数据。"""
 
     # --- Section 1: Recent runs ---
     recent = conn.execute(
@@ -573,10 +571,10 @@ def _gather_report_data(conn: sqlite3.Connection, n_recent: int = 5) -> dict:
 
 
 def _generate_signals(conn, recent, best_bm, stage, stability) -> list[dict]:
-    """Rule-based signal generation."""
+    """基于规则的信号生成。"""
     signals = []
 
-    # CLOSE_TO_PROMOTION
+    # CLOSE_TO_PROMOTION — 接近晋级
     if stage["gap_to_promotion"] is not None and stage["gap_to_promotion"] <= 0.05:
         signals.append({
             "type": "CLOSE_TO_PROMOTION", "severity": "high",
@@ -585,7 +583,7 @@ def _generate_signals(conn, recent, best_bm, stage, stability) -> list[dict]:
             "suggestion": "专注可靠性提升，不冒险",
         })
 
-    # WR_PLATEAU (last 3 completed runs, WR not improving)
+    # WR_PLATEAU — 胜率停滞（近 3 次运行无提升）
     if len(recent) >= 3:
         last3_wr = [r["final_win_rate"] for r in recent[:3] if r["final_win_rate"] is not None]
         if len(last3_wr) >= 3:
@@ -596,7 +594,7 @@ def _generate_signals(conn, recent, best_bm, stage, stability) -> list[dict]:
                     "suggestion": "考虑更激进的架构变更，而非仅调超参",
                 })
 
-    # LOSS_DIVERGENCE
+    # LOSS_DIVERGENCE — 损失发散
     if len(recent) >= 2:
         r0, r1 = recent[0], recent[1]
         if (r0["final_loss"] and r1["final_loss"] and
@@ -608,7 +606,7 @@ def _generate_signals(conn, recent, best_bm, stage, stability) -> list[dict]:
                 "suggestion": "降低学习率或增大 buffer",
             })
 
-    # INSUFFICIENT_BENCHMARKS
+    # INSUFFICIENT_BENCHMARKS — benchmark 数量不足
     bm_count = conn.execute(
         "SELECT COUNT(*) AS n FROM runs WHERE status='completed' AND is_benchmark=1"
     ).fetchone()["n"]
@@ -619,7 +617,7 @@ def _generate_signals(conn, recent, best_bm, stage, stability) -> list[dict]:
             "suggestion": "运行更多 benchmark 以建立可靠的前沿数据",
         })
 
-    # ARCHITECTURE_PATTERN — check if one arch consistently outperforms
+    # ARCHITECTURE_PATTERN — 检查某架构是否持续表现更优
     arch_rows = conn.execute(
         "SELECT num_res_blocks, num_filters, final_win_rate FROM runs"
         " WHERE status='completed' AND final_win_rate IS NOT NULL"
@@ -642,7 +640,7 @@ def _generate_signals(conn, recent, best_bm, stage, stability) -> list[dict]:
                     "suggestion": f"在 {best_arch} 基础上增加容量（更深或更宽）",
                 })
 
-    # REGRESSION_WARNING
+    # REGRESSION_WARNING — 回归警告
     if recent and best_bm:
         latest_wr = recent[0]["final_win_rate"]
         best_wr = best_bm["final_win_rate"]
@@ -657,11 +655,11 @@ def _generate_signals(conn, recent, best_bm, stage, stability) -> list[dict]:
 
 
 def _format_report_md(data: dict) -> str:
-    """Format report as Chinese markdown for human consumption."""
+    """将报告格式化为中文 markdown，供人类阅读。"""
     lines = []
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    lines.append("# MAG-Gomoku 实验报告")
-    lines.append(f"\n> 生成命令: `uv run python src/analyze.py --report`")
+    lines.append("# 实验报告")
+    lines.append(f"\n> 生成命令: `uv run python framework/analyze.py --report`")
     lines.append(f"> 时间戳: {ts}")
 
     # Section 1: Recent Runs
@@ -768,7 +766,7 @@ def _format_report_md(data: dict) -> str:
 
 
 def _format_report_json(data: dict) -> str:
-    """Format report as structured JSON for agent consumption."""
+    """将报告格式化为结构化 JSON，供 agent 消费。"""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     recent_runs = []
@@ -854,7 +852,7 @@ def _format_report_json(data: dict) -> str:
 
     report = {
         "report_version": "1.0",
-        "generated_by": "analyze.py --report --format json",
+        "generated_by": "framework/analyze.py --report --format json",
         "timestamp": ts,
         "stage": data["stage"],
         "recent_runs": recent_runs,
@@ -876,7 +874,7 @@ def _format_report_json(data: dict) -> str:
 
 
 def cmd_report(conn: sqlite3.Connection, n_recent: int = 5, fmt: str = "md") -> None:
-    """Generate structured experiment report (dual format)."""
+    """生成结构化实验报告（双格式）。"""
     data = _gather_report_data(conn, n_recent)
     if fmt == "json":
         print(_format_report_json(data), end="")
@@ -890,7 +888,7 @@ def cmd_report(conn: sqlite3.Connection, n_recent: int = 5, fmt: str = "md") -> 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MAG-Gomoku training analysis (read-only)")
+        description="autoresearch 训练分析工具（只读）")
     parser.add_argument("--db", default=DB_PATH, help="Path to tracker.db")
 
     group = parser.add_mutually_exclusive_group(required=True)

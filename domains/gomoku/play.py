@@ -19,77 +19,23 @@ import os
 import sys
 import time
 
+# ── path setup for decoupled project structure ──
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+if os.path.join(_PROJECT_ROOT, "framework") not in sys.path:
+    sys.path.insert(0, os.path.join(_PROJECT_ROOT, "framework"))
+
 import numpy as np
 
 from game import (
     BOARD_SIZE, BLACK, WHITE, EMPTY,
     Board, Renderer, GameRecord,
 )
+from play_service import load_nn_player, resolve_checkpoint
 from prepare import OPPONENTS
 import tracker
-
-
-def resolve_checkpoint(tag: str) -> str:
-    """Resolve a checkpoint tag to a file path.
-
-    Checks: direct file path → DB tag match → DB partial match →
-    latest model for "latest"/"local".
-    """
-    if os.path.isfile(tag):
-        return tag
-
-    # Query tracker DB
-    try:
-        conn = tracker.init_db()
-        cp = tracker.find_checkpoint_by_tag(conn, tag)
-        if cp and os.path.isfile(cp["model_path"]):
-            conn.close()
-            return cp["model_path"]
-        conn.close()
-    except Exception:
-        pass
-
-    # "latest"/"local" — find the newest checkpoint across all runs
-    if tag in ("latest", "local", "best"):
-        try:
-            conn = tracker.init_db()
-            all_cp = tracker.list_all_checkpoints(conn, limit=1)
-            conn.close()
-            if all_cp and os.path.isfile(all_cp[0]["model_path"]):
-                return all_cp[0]["model_path"]
-        except Exception:
-            pass
-
-    print(f"Error: checkpoint '{tag}' not found")
-    print("Use --list to see available checkpoints")
-    sys.exit(1)
-
-
-def load_nn_player(checkpoint_path: str, mcts_sims: int = 0):
-    """Load a NN model and return a player function (board) -> (row, col)."""
-    import mlx.core as mx
-    from train import load_model
-
-    model = load_model(checkpoint_path)
-    model.eval()
-
-    def nn_move(board: Board) -> tuple[int, int]:
-        encoded = board.encode()
-        x = mx.array(encoded[np.newaxis, ...])
-        policy_logits, value = model(x)
-        mx.eval(policy_logits, value)
-
-        policy = np.array(policy_logits[0])
-        val = float(np.array(value[0, 0]))
-
-        legal_mask = board.get_legal_mask()
-        policy[legal_mask == 0] = -1e9
-
-        action = int(np.argmax(policy))
-        row, col = divmod(action, BOARD_SIZE)
-        return row, col
-
-    return nn_move
 
 
 def print_checkpoints():

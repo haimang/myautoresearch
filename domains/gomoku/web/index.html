@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MAG Gomoku</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <aside class="panel control-panel">
+      <div class="eyebrow">Local Browser Match</div>
+      <h1>MAG Gomoku</h1>
+      <p class="lede">直接在浏览器里与任意已注册 opponent 或 minimax 对弈。</p>
+
+      <label class="field">
+        <span>Opponent</span>
+        <select id="opponent-select"></select>
+      </label>
+
+      <label class="field">
+        <span>Your Color</span>
+        <select id="color-select">
+          <option value="black">Black</option>
+          <option value="white">White</option>
+        </select>
+      </label>
+
+      <div class="actions">
+        <button id="start-button" class="primary">Start New Game</button>
+        <button id="reset-button">Reset Current Game</button>
+      </div>
+
+      <div class="status-block">
+        <div class="status-title">Session</div>
+        <div id="status-text" class="status-text">Loading opponents…</div>
+      </div>
+    </aside>
+
+    <main class="board-stage panel">
+      <div class="stage-header">
+        <div>
+          <div class="eyebrow">Interactive Board</div>
+          <h2 id="match-title">No Game</h2>
+        </div>
+        <div id="turn-pill" class="turn-pill">Idle</div>
+      </div>
+      <div class="board-wrap">
+        <canvas id="board-canvas" width="720" height="720"></canvas>
+      </div>
+    </main>
+
+    <aside class="panel info-panel">
+      <div class="eyebrow">Game State</div>
+      <div class="stat-grid">
+        <div class="stat-card">
+          <span class="stat-label">Opponent</span>
+          <strong id="opponent-name">—</strong>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Human</span>
+          <strong id="human-color">—</strong>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Moves</span>
+          <strong id="move-count">0</strong>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Result</span>
+          <strong id="result-text">—</strong>
+        </div>
+      </div>
+
+      <div class="move-panel">
+        <div class="move-panel-header">
+          <span>Move List</span>
+          <span id="last-move-text">Last: —</span>
+        </div>
+        <ol id="move-list" class="move-list"></ol>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

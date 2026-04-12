@@ -1,10 +1,9 @@
-# Autoresearch Experiment Protocol — Template
+# Autoresearch Experiment Protocol — Framework Template
 
 Train a **<<<DOMAIN>>>** AI using the autoresearch experiment loop on Apple Silicon (MLX). The agent autonomously modifies `domains/<<<domain>>>/train.py` to discover the best neural network architecture and training strategy.
 
-> **This is模板文件。** 复制到 `domains/<name>/program.md`，
-> 填入领域特定细节（对手等级、棋盘维度等）后使用。
-> 参考实现见 `domains/gomoku/program.md`。
+> **This is the framework template.** Copy to `docs/program.md` in your project
+> and fill in domain-specific details (opponent levels, board dimensions, etc.)
 
 ## Repository layout
 
@@ -19,14 +18,13 @@ project/
 │   └── prepare.py           # Evaluation template (root copy)           [TEMPLATE]
 ├── domains/
 │   └── <<<domain>>>/        # ═══ domain execution ═══
-│       ├── program.md       # Domain-specific agent instructions
 │       ├── game.py          # Game engine, renderer, batch self-play    [READ-ONLY]
 │       ├── prepare.py       # Opponents, evaluation harness             [READ-ONLY]
 │       ├── train.py         # NN, self-play, training loop              [AGENT-EDITABLE]
 │       ├── play.py          # Human vs AI / AI vs AI                    [READ-ONLY]
 │       └── replay.py        # Replay recorded games                     [READ-ONLY]
 ├── docs/
-│   └── program.md           # THIS FILE — 模板
+│   └── program.md           # THIS FILE — agent operating instructions
 ├── output/
 │   └── tracker.db           # SQLite database — experiment history
 └── pyproject.toml
