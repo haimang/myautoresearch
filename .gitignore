@@ -20,5 +20,9 @@ uv.lock
 # Plan docs & experiment archives
 # updates/ — tracked (contains experiment records like gomoku_1st_exp.db)
 
+# Compiled native extensions
+*.so
+*.dylib
+
 # Claude Code guidance (local, not tracked)
 CLAUDE.md

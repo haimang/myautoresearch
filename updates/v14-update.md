@@ -315,4 +315,85 @@ Python MCTS 树操作占 77% 时间。C 加速 15x 后：
 | ctypes 开销抵消 C 加速 | 中 | 每 sim round 只 1 次 Python↔C 调用 |
 | 800 sims 仍然 Focus <20% | 高 | 说明问题不在搜索深度，需要换算法 |
 | Board.copy() 轻量拷贝导致 bug | 低 | place() 只 append history，不读 |
-| MAX_NODES 溢出 | 低 | 200K 节点足够 800 sims × 深度 50 |
+| MAX_NODES 溢出 | 低 | 500K 节点足够 800 sims × 深度 50 |
+
+---
+
+## 10. 工作日志
+
+> 执行者：Claude Opus 4.6  
+> 执行日期：2026-04-12
+
+### 10.1 C 实现 (framework/core/mcts_c.c, ~280 行)
+
+- `MCTSNode` 结构体：pre-allocated pool，MAX_NODES=500000，零 malloc
+- `mcts_select_child()`：C 循环 PUCT，~225 子节点遍历
+- `mcts_expand()`：mask + normalize priors，填充 child 数组
+- `mcts_backup()`：树回溯 + O(1) parent sync
+- `mcts_batch_select()`：**关键优化** — K sims × N roots 全在 C 内完成，1 次 C 调用替代 K×N 次
+- `mcts_batch_expand_backup()`：批量展开+回溯，1 次 C 调用处理所有叶子
+- 静态缓冲区 `g_batch_path_*` 避免动态内存分配
+
+### 10.2 Python wrapper (framework/core/mcts_native.py, ~160 行)
+
+- 自动加载 `.dylib`(macOS) / `.so`(Linux)
+- 每 sim round 仅 **3 次 Python↔C 转换**：batch_select → Python board ops + GPU → batch_expand_backup
+- 对比第一版 per-path 调用（400 次/round）→ 减少 99% 的 ctypes 开销
+
+### 10.3 train.py 集成
+
+- 自动检测 native C 库，fallback 到 Python
+- TUI 日志显示 `[C-native]` 或 `[Python]`
+- `_fast_copy()` 轻量 Board 拷贝（跳过 history list）
+
+### 10.4 开发机 benchmark（Linux，mock GPU）
+
+| 配置 | Native C | Python | 加速比 |
+|------|---------|--------|--------|
+| 8×50 sims | 10ms | 33ms | **3.3x** |
+| 8×800 sims | 148ms | 518ms | **3.5x** |
+| Win detection (500 sims) | 85% | 69% | ✓ |
+
+### 10.5 Mac 测试命令
+
+```bash
+git pull origin main
+
+# 1. 编译 C 扩展
+cd framework/core && bash build_native.sh && cd ../..
+
+# 2. 验证 native 加载
+uv run python -c "
+import sys; sys.path.insert(0,'framework')
+from core.mcts_native import is_available
+print('Native MCTS:', 'YES' if is_available() else 'NO')
+"
+
+# 3. 测试 A: 800 sims, resume S0, vs L1 (30min)
+uv run python domains/gomoku/train.py \
+  --mcts-sims 800 --parallel-games 8 --mcts-batch 16 \
+  --num-blocks 8 --num-filters 64 \
+  --time-budget 1800 \
+  --eval-level 1 --no-eval-opponent \
+  --eval-interval 3 --probe-games 50 \
+  --resume d6c6bce4 --seed 42
+
+# 4. 测试 B: 800 sims, 从零, vs L1 (30min, 对照)
+uv run python domains/gomoku/train.py \
+  --mcts-sims 800 --parallel-games 8 --mcts-batch 16 \
+  --num-blocks 8 --num-filters 64 \
+  --time-budget 1800 \
+  --eval-level 1 --no-eval-opponent \
+  --eval-interval 3 --probe-games 50 \
+  --seed 42
+
+# 5. 带回 DB
+cp output/tracker.db <共享路径>/v14_test.db
+```
+
+**TUI 中确认 native 加载：** 事件日志应显示 `MCTS 800sims [C-native]`。如果显示 `[Python]`，说明编译失败或 .dylib 未找到。
+
+**关键观察指标：**
+- Focus：从 10% (50 sims) 应提升到 25%+
+- Entropy：应低于 2.5
+- WR vs L1：resume S0 应能从 >0% 起步

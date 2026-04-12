@@ -34,6 +34,13 @@ from game import BatchBoards, BOARD_SIZE, BLACK, WHITE, EMPTY
 from core.tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, sparkline4 as _sparkline4_fn, progress_bar as _progress_bar_fn
 from core.mcts import MCTSNode, mcts_search as _mcts_search_generic, mcts_search_batched as _mcts_search_batched, mcts_search_multi_root as _mcts_search_multi_root
 
+# Try native C MCTS — 10-20x faster tree operations
+try:
+    from core.mcts_native import mcts_search_multi_root_native as _mcts_native, is_available as _mcts_native_available
+    _USE_NATIVE_MCTS = _mcts_native_available()
+except ImportError:
+    _USE_NATIVE_MCTS = False
+
 # Try to import TIME_BUDGET and evaluate_win_rate from prepare.py.
 try:
     from prepare import TIME_BUDGET
@@ -419,6 +426,20 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
     def _terminal_value(state):
         return 0.0 if state.winner == -1 else 1.0
 
+    def _fast_copy(board):
+        """Lightweight board copy — skip history (not needed for MCTS sim)."""
+        b = Board.__new__(Board)
+        b.grid = board.grid.copy()
+        b.current_player = board.current_player
+        b.move_count = board.move_count
+        b.last_move = board.last_move
+        b.winner = board.winner
+        b.history = []
+        return b
+
+    # Select search function: native C or Python fallback
+    _search_fn = _mcts_native if _USE_NATIVE_MCTS else _mcts_search_multi_root
+
     boards = [Board() for _ in range(num_games)]
     move_data: list[list[tuple[np.ndarray, int, np.ndarray]]] = [[] for _ in range(num_games)]
     finished = [False] * num_games
@@ -433,7 +454,6 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
         # Collect active boards for this round's multi-root MCTS
         active_indices = [i for i in range(num_games) if not finished[i] and not boards[i].is_terminal()]
         if not active_indices:
-            # Mark remaining as finished
             for i in range(num_games):
                 if boards[i].is_terminal():
                     finished[i] = True
@@ -441,12 +461,12 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
 
         active_boards = [boards[i] for i in active_indices]
 
-        # Run MCTS on ALL active boards simultaneously — shared GPU batch
+        # Run MCTS on ALL active boards — native C or Python fallback
         t0 = _time.time()
-        all_visits = _mcts_search_multi_root(
+        all_visits = _search_fn(
             root_states=active_boards,
             evaluate_batch_fn=_evaluate_batch,
-            copy_fn=lambda s: s.copy(),
+            copy_fn=_fast_copy,
             legal_mask_fn=lambda s: s.get_legal_mask(),
             apply_fn=_apply,
             terminal_fn=lambda s: s.is_terminal(),
@@ -1166,9 +1186,10 @@ def train(args):
         if not use_tui:
             print(f"[{ts}] {msg}")
 
+    mcts_backend = "C-native" if (_USE_NATIVE_MCTS and mcts_sims > 0) else ("Python" if mcts_sims > 0 else "off")
     _log_event(f"Started run {run_id_short} | {num_params/1000:.1f}K params"
                + (f" | budget {time_budget}s" if time_budget else "")
-               + (f" | MCTS {mcts_sims}sims" if mcts_sims > 0 else ""))
+               + (f" | MCTS {mcts_sims}sims [{mcts_backend}]" if mcts_sims > 0 else ""))
 
     # Show TUI immediately so user sees something before first cycle
     _update_tui()
