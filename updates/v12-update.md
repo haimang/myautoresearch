@@ -446,3 +446,91 @@ cp output/tracker.db /path/to/share/v12_test.db
 v12 成功 = Phase 1 速度达标 + 长训练 WR 曲线呈收敛趋势。  
 如果达成，v13 可以开始重建对手进化链和 Pareto 集成。  
 如果 Phase 1 速度不达标，考虑 Cython 热路径作为后备。
+
+---
+
+## 11. 工作日志
+
+> 执行者：Claude Opus 4.6  
+> 执行日期：2026-04-12  
+> 环境：Linux 开发机（无 MLX，逻辑测试 + mock 验证）
+
+### 11.1 Phase 1：叶子批量合并
+
+**framework/core/mcts.py** (167 → 294 行, +127 行)
+
+新增内容：
+
+1. `MCTSNode.apply_virtual_loss(vl)` / `revert_virtual_loss(vl)` — 虚拟损失施加/撤销
+2. `mcts_search_batched()` 函数 (~110 行) — 完整的批量 MCTS 搜索：
+   - 每轮收集 `batch_size` 条搜索路径（带虚拟损失防止路径聚集）
+   - 区分终态路径和需要 evaluate 的叶子节点
+   - 一次 `evaluate_batch_fn` 调用处理所有叶子
+   - 撤销虚拟损失后执行真实 backup
+3. 保留原 `mcts_search()` 不变（向后兼容）
+
+**测试结果：**
+- 200 sims, batch_size=16: **13 次 GPU batch 调用** vs 串行 200 次 (15x 减少)
+- 500 sims, batch_size=16: **18 次 GPU batch 调用** vs 串行 500 次 (28x 减少)
+- 一步必胜局面：两个获胜走法合计获得 55% visit（与串行版 59% 接近）
+
+### 11.2 Phase 1 续：Gomoku adapter 更新
+
+**domains/gomoku/train.py** 适配改动：
+
+1. 新增 `MCTS_BATCH_SIZE = 8` 和 `MCTS_VIRTUAL_LOSS = 3.0` 常量
+2. `mcts_search()` 从调用 `_mcts_search_generic` 改为调用 `_mcts_search_batched`
+3. 新增 `_evaluate_batch(states)` — 将多个 Board 编码成 numpy batch，一次 MLX 前向传播
+4. import 更新：添加 `mcts_search_batched as _mcts_search_batched`
+
+### 11.3 Phase 2：多棋盘并行自对弈
+
+**`_run_self_play_mcts()` 完全重写：**
+
+- 旧版：`for game_idx in range(num_games)` 逐盘串行
+- 新版：所有 N 盘棋同时维护，每轮推进所有活跃棋盘各一步
+- 每轮结束后调用 `mx.clear_cache()` 清理 Metal 缓存
+- 棋局完成后立即标记 finished，不再参与后续搜索
+- MCTS stats（sims/sec, entropy, focus）汇总方式不变
+
+### 11.4 Phase 3：训练循环早停
+
+1. 新增 CLI flags：`--auto-stop-stagnation` (默认关闭) + `--stagnation-window N` (默认 10)
+2. 在 probe eval 之后检测最近 N 个 eval 的 WR 趋势
+3. 判定逻辑：对窗口内 WR 做线性回归，如果 `expected_change < wr_std` 且 `wr_std > 1%`，判定为停滞
+4. 停滞时 `stop_reason = "stagnation"`，触发正常的 run 结束流程
+
+### 11.5 Phase 4：步数归一化对比
+
+**framework/analyze.py** (+100 行)
+
+1. `cmd_compare_by_steps(conn, run_a, run_b)` — 按 `total_steps` 对齐两个 run 的 WR 曲线
+2. 使用线性插值在公共步数范围内采样 WR
+3. 输出对齐后的 WR 对比表 + 汇总（A 赢 / B 赢统计）
+4. CLI：`--compare-by-steps RUN_A RUN_B`
+
+**对 mcts_1st_exp.db 测试结果：**
+```
+MCTS-50 vs Pure: 0-123 步范围内，Pure 领先所有 5 个采样点
+但差距从 36% 缩小到 22%（MCTS 信号质量的间接证据）
+```
+
+### 11.6 最终文件变化
+
+| 文件 | 原行数 | 新行数 | 变化 |
+|------|--------|--------|------|
+| `framework/core/mcts.py` | 167 | 294 | +127 |
+| `domains/gomoku/train.py` | 1786 | 1835 | +49 |
+| `framework/analyze.py` | 1195 | 1313 | +118 |
+| **合计** | 3148 | 3442 | **+294** |
+
+### 11.7 验证清单
+
+- [x] 12 个 Python 文件全部通过 AST 语法检查
+- [x] `mcts_search_batched()` mock 测试通过（200 sims → 13 GPU calls）
+- [x] `--compare-by-steps` 对 mcts_1st_exp.db 运行正确
+- [x] `--auto-stop-stagnation` 和 `--stagnation-window` CLI 解析正确
+- [x] `MCTS_SIMULATIONS=0` 行为不变（向后兼容）
+- [x] 原 `mcts_search()` 函数保留（供 play.py 等非训练场景使用）
+- [ ] Apple Silicon 上的实际速度验证（待 Mac 测试）
+- [ ] GPU 功率验证（待 Mac 测试）

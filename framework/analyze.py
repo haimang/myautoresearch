@@ -654,6 +654,120 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md") -> None:
 
 
 # ---------------------------------------------------------------------------
+# 步数归一化对比
+# ---------------------------------------------------------------------------
+
+def cmd_compare_by_steps(conn: sqlite3.Connection, run_a: str, run_b: str) -> None:
+    """按训练步数（而非时间）对齐两个 run 的 WR 曲线，用于公平对比不同算法。
+
+    解决的问题：MCTS 每步耗时 19-35x，按时间对比不公平。按步数对齐后，
+    可以判断相同梯度更新量下哪种算法产生了更好的 WR。
+    """
+    def _resolve(run_id):
+        row = conn.execute(
+            "SELECT id, mcts_simulations, num_res_blocks, num_filters, "
+            "total_cycles, total_games, total_steps, final_win_rate, wall_time_s "
+            "FROM runs WHERE id LIKE ?", (run_id + "%",)
+        ).fetchone()
+        return row
+
+    ra = _resolve(run_a)
+    rb = _resolve(run_b)
+    if not ra:
+        print(f"Run not found: {run_a}")
+        return
+    if not rb:
+        print(f"Run not found: {run_b}")
+        return
+
+    def _get_wr_by_steps(full_id):
+        rows = conn.execute(
+            "SELECT total_steps, win_rate FROM cycle_metrics "
+            "WHERE run_id = ? AND win_rate IS NOT NULL ORDER BY cycle",
+            (full_id,)
+        ).fetchall()
+        return [(r["total_steps"], r["win_rate"]) for r in rows]
+
+    points_a = _get_wr_by_steps(ra["id"])
+    points_b = _get_wr_by_steps(rb["id"])
+
+    if not points_a or not points_b:
+        print("Insufficient WR data for comparison.")
+        return
+
+    mcts_a = ra["mcts_simulations"] or 0
+    mcts_b = rb["mcts_simulations"] or 0
+    label_a = f"{ra['id'][:8]} ({'MCTS-'+str(mcts_a) if mcts_a else 'Pure'})"
+    label_b = f"{rb['id'][:8]} ({'MCTS-'+str(mcts_b) if mcts_b else 'Pure'})"
+
+    print(f"Step-Normalized WR Comparison")
+    print(f"{'─' * 72}")
+    print(f"  A: {label_a}  ({ra['total_steps'] or 0} steps, {ra['total_games'] or 0} games, {ra['wall_time_s'] or 0:.0f}s)")
+    print(f"  B: {label_b}  ({rb['total_steps'] or 0} steps, {rb['total_games'] or 0} games, {rb['wall_time_s'] or 0:.0f}s)")
+    print()
+
+    # Find common step range
+    max_steps = min(
+        points_a[-1][0] if points_a else 0,
+        points_b[-1][0] if points_b else 0,
+    )
+    if max_steps == 0:
+        print("  No overlapping step range.")
+        return
+
+    print(f"  Comparable range: 0 — {max_steps} steps")
+    print()
+    print(f"  {'Steps':>8}  {'WR_A':>7}  {'WR_B':>7}  {'Diff':>7}  {'Better':>8}")
+    print(f"  {'─' * 48}")
+
+    # Interpolate WR at common step checkpoints
+    def _interp(points, target_step):
+        """Linear interpolation of WR at a given step count."""
+        if not points:
+            return None
+        if target_step <= points[0][0]:
+            return points[0][1]
+        if target_step >= points[-1][0]:
+            return points[-1][1]
+        for i in range(1, len(points)):
+            if points[i][0] >= target_step:
+                s0, w0 = points[i-1]
+                s1, w1 = points[i]
+                if s1 == s0:
+                    return w1
+                frac = (target_step - s0) / (s1 - s0)
+                return w0 + frac * (w1 - w0)
+        return points[-1][1]
+
+    # Sample at regular step intervals
+    n_samples = min(20, max(5, max_steps // 50))
+    step_interval = max(1, max_steps // n_samples)
+    a_wins = 0
+    b_wins = 0
+    for step in range(step_interval, max_steps + 1, step_interval):
+        wa = _interp(points_a, step)
+        wb = _interp(points_b, step)
+        if wa is None or wb is None:
+            continue
+        diff = wa - wb
+        if abs(diff) < 0.01:
+            better = "="
+        elif diff > 0:
+            better = "A"
+            a_wins += 1
+        else:
+            better = "B"
+            b_wins += 1
+        print(f"  {step:>8d}  {wa:>6.1%}  {wb:>6.1%}  {diff:>+6.1%}   {better:>6}")
+
+    print()
+    total = a_wins + b_wins
+    if total > 0:
+        print(f"  Summary: A better at {a_wins}/{total} checkpoints, B better at {b_wins}/{total}")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # 报告生成（双格式: markdown / JSON）
 # ---------------------------------------------------------------------------
 
@@ -1154,6 +1268,8 @@ def main():
                        help="Detect training stagnation (WR plateau) for a run")
     group.add_argument("--pareto", action="store_true",
                        help="Pareto non-dominated sort across completed runs")
+    group.add_argument("--compare-by-steps", nargs=2, metavar=("RUN_A", "RUN_B"),
+                       help="Compare two runs by training steps (not wall time)")
     group.add_argument("--report", action="store_true",
                        help="Generate structured experiment report for agent/human")
 
@@ -1185,6 +1301,8 @@ def main():
         cmd_stagnation(conn, args.stagnation)
     elif args.pareto:
         cmd_pareto(conn, fmt=args.format)
+    elif args.compare_by_steps:
+        cmd_compare_by_steps(conn, args.compare_by_steps[0], args.compare_by_steps[1])
     elif args.report:
         cmd_report(conn, n_recent=args.recent, fmt=args.format)
 
