@@ -37,6 +37,7 @@ class CreateSessionRequest(BaseModel):
     opponentType: str = Field(..., pattern="^(nn|minimax)$")
     opponentId: str
     humanColor: str = Field(..., pattern="^(black|white)$")
+    mctsSims: int = Field(default=0, ge=0, le=800)
 
 
 class MoveRequest(BaseModel):
@@ -52,6 +53,7 @@ class GameSession:
     black_fn: Optional[callable]
     white_fn: Optional[callable]
     board: Board
+    mcts_sims: int = 0
 
 
 app = FastAPI(title="MAG Gomoku Web")
@@ -136,6 +138,7 @@ def _new_session(req: CreateSessionRequest) -> GameSession:
     opponent_fn, opponent_meta = create_player(
         req.opponentType,
         req.opponentId,
+        mcts_sims=req.mctsSims,
     )
     human_color = BLACK if req.humanColor == "black" else WHITE
     black_fn = None if human_color == BLACK else opponent_fn
@@ -147,6 +150,7 @@ def _new_session(req: CreateSessionRequest) -> GameSession:
         black_fn=black_fn,
         white_fn=white_fn,
         board=Board(),
+        mcts_sims=req.mctsSims,
     )
     _apply_ai_turns(session)
     return session
@@ -212,6 +216,7 @@ def reset_session(session_id: str):
         opponentType=session.opponent["type"],
         opponentId=session.opponent["id"],
         humanColor=_player_name(session.human_color),
+        mctsSims=session.mcts_sims,
     )
     try:
         new_session = _new_session(req)

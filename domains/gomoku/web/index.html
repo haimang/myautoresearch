@@ -26,6 +26,17 @@
         </select>
       </label>
 
+      <label class="field">
+        <span>MCTS Sims</span>
+        <select id="mcts-select">
+          <option value="0">Off (pure network)</option>
+          <option value="25">25 (fast)</option>
+          <option value="50" selected>50 (balanced)</option>
+          <option value="100">100 (strong)</option>
+          <option value="200">200 (slow but strongest)</option>
+        </select>
+      </label>
+
       <div class="actions">
         <button id="start-button" class="primary">Start New Game</button>
         <button id="reset-button">Reset Current Game</button>

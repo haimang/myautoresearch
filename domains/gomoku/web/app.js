@@ -51,7 +51,10 @@ async function fetchOpponents() {
     option.textContent = formatOpponent(item);
     opponentSelect.appendChild(option);
   });
-  const preferred = opponents.find((item) => item.id === "L4" && item.type === "nn");
+  // Prefer registered NN opponents (S0, S1, ...), then L4, then first available
+  const preferred = opponents.find((item) => item.id === "S0" && item.type === "nn")
+    || opponents.find((item) => item.type === "nn")
+    || opponents[0];
   if (preferred) {
     opponentSelect.value = `${preferred.type}:${preferred.id}`;
   }
@@ -59,6 +62,8 @@ async function fetchOpponents() {
 
 async function createSession() {
   const [opponentType, opponentId] = opponentSelect.value.split(":");
+  const mctsSelect = document.getElementById("mcts-select");
+  const mctsSims = parseInt(mctsSelect ? mctsSelect.value : "0", 10);
   setStatus("Creating session...");
   const response = await fetch("/api/session", {
     method: "POST",
@@ -67,6 +72,7 @@ async function createSession() {
       opponentType,
       opponentId,
       humanColor: colorSelect.value,
+      mctsSims,
     }),
   });
   const payload = await response.json();
