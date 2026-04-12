@@ -532,5 +532,49 @@ MCTS-50 vs Pure: 0-123 步范围内，Pure 领先所有 5 个采样点
 - [x] `--auto-stop-stagnation` 和 `--stagnation-window` CLI 解析正确
 - [x] `MCTS_SIMULATIONS=0` 行为不变（向后兼容）
 - [x] 原 `mcts_search()` 函数保留（供 play.py 等非训练场景使用）
-- [ ] Apple Silicon 上的实际速度验证（待 Mac 测试）
-- [ ] GPU 功率验证（待 Mac 测试）
+- [x] Apple Silicon 上的实际速度验证 → **87-122 局/分钟（超额达标 2.4x）**
+- [x] GPU 功率验证 → ~5-8W（未达 15W 目标，确认为 MCTS 算法固有特征）
+
+### 11.8 追加迭代：v12-multi → v12-Ksim
+
+初始 v12 实现（叶子批量 + 多根共享）只达到 30 局/分钟（v12-batch = v12-multi，多根共享零提升）。诊断后发现瓶颈在 Python 解释器而非 GPU，追加两轮优化：
+
+**追加优化 1：K-sim 批量（sims_per_round=4）**
+- 每轮 4 sims × 8 boards = 32 叶子合并到 1 次 GPU 调用
+- GPU 调用从 ~50 降到 ~14，batch 从 8 升到 29
+- 效果：GPU 调用次数 -72%，MLX 同步开销大幅减少
+
+**追加优化 2：向量化 MCTSNode**
+- `select_child()` 用 numpy PUCT 替代 Python for-loop（~220 子节点）
+- `expand()` 用 numpy 数组替代创建 220 个 MCTSNode Python 对象
+- 每个节点通过 `parent_idx` O(1) 同步到父节点数组
+
+**追加优化 3：减少 mx.clear_cache()**
+- 从每轮调用改为每 ~10 轮
+- 消除每轮 ~60ms Metal 同步开销
+
+**追加后文件变化：**
+
+| 文件 | 最终行数 |
+|------|---------|
+| `framework/core/mcts.py` | 355 |
+| `domains/gomoku/train.py` | 1870 |
+| `framework/analyze.py` | 1313 |
+
+### 11.9 Mac 测试结果（mcts_4th_exp.db）
+
+| Run | 设置 | Cycles | Games | Wall | Gm/min | Cycle_s | Final WR |
+|-----|------|--------|-------|------|--------|---------|----------|
+| 29453c2c | MCTS-50, pg=8, 5min | 55 | 440 | 302s | 87.9 | 5.5s | 98.0% |
+| 13f7f395 | MCTS-50, pg=10, 30min | 367 | 3670 | 1800s | 122.3 | 4.9s | 99.2% |
+
+**速度对比全量历史：**
+
+| 版本 | 局/分钟 | 加速比 |
+|------|---------|--------|
+| v11 串行 | 9.5 | 1.0x |
+| v12 叶子批量 | 30.2 | 3.2x |
+| v12 多根共享 | 30.2 | 3.2x (零提升) |
+| **v12 K-sim + 向量化** | **87-122** | **9.2-12.9x** |
+
+**v12 verdict：成功。** 5/6 指标达成或超额达成。详见 [v12-findings.md](./v12-findings.md)。
