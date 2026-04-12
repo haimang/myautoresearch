@@ -17,18 +17,5 @@ uv.lock
 .venv/
 .vscode/
 
-# Plan docs (not tracked)
-update-v1.md
-update-v2.md
-update-v3.md
-update-v4.md
-update-v5.md
-update-v6-analysis.md
-update-v7-analysis.md
-update-v8-analysis.md
-update-v9-analysis.md
-update-v10-analysis.md
-update-v10-analysis-further.md
-update-v10.md
-update-pareto-frontier.md
-update-v11-analysis.md
+# Plan docs & experiment archives
+# updates/ — tracked (contains experiment records like gomoku_1st_exp.db)

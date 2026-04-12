@@ -288,3 +288,141 @@ uv run python src/train.py --resume 8b9486f4 --num-blocks 12 --num-filters 64 --
 4. 保持 1M 架构继续向更强 NN 对手推进
 
 具体命令与结果，待 Stage 2 完成后再补充。
+
+---
+
+## 2026-04-12: 信号质量修复记录
+
+> 基线 commit: `39bbdd8`  
+> 目标: 不再把问题继续归因于超参数微调，而是直接提高 1M 的训练信号密度与纠错强度。
+
+### 本轮代码修改摘要
+
+本轮没有引入手工 reward shaping，而是保持“终局胜负仍然是 truth”，只修改 replay 采样机制，让训练更频繁地学到真正有价值的样本。
+
+#### 修改 1: 为 replay sample 增加来源与优先级元数据
+
+在 `src/train.py` 中新增了 `ReplaySample` 结构，样本不再只是：
+
+1. board
+2. policy
+3. value
+
+而是额外记录：
+
+1. `source` — 样本来自 `self` 还是 `opponent`
+2. `priority` — 该样本在 replay 中的抽样优先级
+
+这一步的意义是：从现在开始，训练系统可以区分“普通自博弈样本”和“真正暴露弱点的样本”。
+
+#### 修改 2: 引入 opponent / loss priority boosting
+
+新增了以下优先级常量：
+
+1. `OPPONENT_SAMPLE_BOOST = 4.0`
+2. `LOSS_SAMPLE_BOOST = 2.5`
+3. `WIN_OPPONENT_SAMPLE_BOOST = 1.5`
+
+含义如下：
+
+1. 对手对局产生的样本，默认更常被抽到
+2. 最终落败一侧的样本，也会被更高频地学习
+3. 对强对手赢下来的样本，也会被适度保留，避免只学防守失败而不学有效反制
+
+这不是“改 reward”，而是“让模型更常学习高信息样本”。
+
+#### 修改 3: 在每个 batch 内保留纠错样本配额
+
+新增 `FOCUSED_SAMPLE_RATIO = 0.25`，并实现 `_sample_replay_indices()`：
+
+1. 每个 batch 默认预留约 `25%` 配额给纠错样本
+2. 纠错样本定义为：
+	- `opponent-play` 样本
+	- `value < 0` 的失败样本
+3. 剩余 `75%` 再从全体 replay 中按 recency × priority 抽样
+
+这一步非常关键，因为它解决的是“高价值样本在大 buffer 中被淹没”的问题。
+
+#### 修改 4: 将 avglen 以低风险方式接入 replay priority
+
+这一步没有把 avglen 直接写进 reward / value target，而是只影响样本优先级。
+
+关键原则是：
+
+1. **使用每盘棋自己的 game length**，而不是 TUI 上按 cycle 汇总的平均 `AvgLen`
+2. **只做轻微倍率调整**，避免破坏当前 value 头的 `[-1, 1]` 语义
+3. **保持终局胜负仍然是唯一 truth**，avglen 只影响“哪些样本更值得反复学习”
+
+本轮采用的低风险规则是：
+
+1. 赢棋且 `game_length < 85`：轻微上调优先级
+2. 赢棋且 `game_length < 75`：进一步上调优先级
+3. 赢棋且 `game_length < 60`：较明显上调优先级
+4. 赢棋且 `game_length > 85`：轻微下调优先级
+5. 赢棋且 `game_length > 90`：进一步下调优先级
+6. 输棋且 `game_length < 60`：额外上调优先级，用于强化“被快速击穿”的纠错价值
+
+为什么这是低风险版本：
+
+1. 不改变训练目标的数值边界
+2. 不会把 value target 推到 `1.2 / 1.5 / 2.0` 之类不可表示区间
+3. 不会把整套系统从“赢棋 truth”改成“追求短局 truth”
+4. 只是让训练更频繁地回看那些“赢得很高效”或“输得很惨”的对局
+
+### 本轮修改的预期提升
+
+这批改动对 1M 的预期提升，不是“突然多拿 10% 胜率”，而是更基础也更重要的三件事：
+
+1. **让后期训练不再只有低信息自博弈样本**
+	- 失败样本会被系统性拉高权重
+	- 后期平台期将不再完全依赖随机碰运气突破
+
+2. **让 train-opponent 真正成为教学源，而不只是混入背景噪声**
+	- 以前就算设置了 `train-opponent`，这些样本也可能被普通 self-play 快速淹没
+	- 现在 opponent-play 样本会被显式抬权
+
+3. **让 1M 在更强对手面前更容易形成“纠错循环”**
+	- 不是只知道自己输了
+	- 而是更频繁地训练那些导致失败的具体局面
+
+4. **让 1M 更快固化高效率胜局，而不是平均对所有赢局一视同仁**
+	- 快速、高质量赢下来的对局会被更频繁地重复学习
+	- 冗长、低效但侥幸获胜的样本会适度降权
+
+### 为什么这比继续调 learning rate 更值得优先做
+
+原因很直接：
+
+1. `7e-4 → 6e-4 → 5e-4` 我们已经试过多轮
+2. 结果显示 loss 还能下降，但强度迁移并没有随之持续改善
+3. 这说明优化器不是主矛盾，样本价值分布才是主矛盾
+
+因此，这一轮的正确动作不是再找一个新的学习率，而是让训练更集中地处理“模型为什么输”。
+
+### 最新推荐 CLI
+
+为了真正利用这次“signal-density replay + avglen-aware priority”改动，下一轮不再建议 `eval=L1` 但 `train=L0`。  
+如果继续这么做，提升后的 opponent 样本优先级大部分还是会浪费在低级对手上。
+
+当前更推荐的下一轮，是直接让 `L1` 同时成为评估对手和训练中的一部分教学对手：
+
+```bash
+uv run python src/train.py --resume 8b9486f4 --num-blocks 12 --num-filters 64 --learning-rate 6e-4 --target-win-rate 0.85 --eval-opponent L1 --train-opponent L1 --opponent-mix 0.2 --parallel-games 80 --probe-games 120 --probe-window 7 --full-eval-games 200 --seed 42
+```
+
+### 对这条新命令的预期
+
+1. `80%` 自博弈仍然保留通用能力生成
+2. `20%` 的 `L1` 对局现在不再是弱信号，而会被 replay 优先采样机制放大
+3. 每个 batch 都更有机会看到“为什么打不过 L1”的失败局面
+4. avglen 现在也会对优先级产生轻量作用，使高效率胜局更容易被巩固
+5. 这将比单纯继续 `eval=L1` 但 `train=L0` 更有机会形成真实提升
+
+### 本轮修改日志
+
+| 文件 | 修改点 |
+|---|---|
+| `src/train.py` | 新增 `ReplaySample`、样本优先级、focused batch sampling、avglen-aware priority |
+| `docs/1M-update-history.md` | 补充失败尝试总结、瓶颈分析、信号质量修复记录、avglen 低风险接入与最新 CLI |
+
+当前状态：这批“信号质量修复”代码已经完成，并通过语法编译与 CLI 启动级别验证。下一步应直接运行上面的新命令，观察 1M 在 `L1` 上是否开始出现比旧机制更清晰的持续改进。
