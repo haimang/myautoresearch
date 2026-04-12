@@ -1025,14 +1025,14 @@ def train(args):
         lines.append(row(f"  Gm/s    {gps:>6.1f}   │   AvgLen   {avg_game_length:>8.1f}   │   vs {opp_str}{mix_str}"))
 
         # --- MCTS stats row (only when MCTS is active) ---
-        if MCTS_SIMULATIONS > 0 and last_mcts_stats:
-            sps = last_mcts_stats.get("sims_per_sec", 0)
-            top1 = last_mcts_stats.get("avg_top1_share", 0)
-            ent = last_mcts_stats.get("avg_entropy", 0)
-            sp_t = last_mcts_stats.get("search_time_s", 0)
+        if MCTS_SIMULATIONS > 0:
+            sps = last_mcts_stats.get("sims_per_sec", 0) if last_mcts_stats else 0
+            top1 = last_mcts_stats.get("avg_top1_share", 0) if last_mcts_stats else 0
+            ent = last_mcts_stats.get("avg_entropy", 0) if last_mcts_stats else 0
+            sp_t = last_mcts_stats.get("search_time_s", 0) if last_mcts_stats else 0
             lines.append("│" + "╌" * W + "│")
-            lines.append(row(f"  MCTS    {MCTS_SIMULATIONS:>4}sims │   Sim/s   {sps:>8.0f}   │   SP time {sp_t:>5.1f}s"))
-            lines.append(row(f"  Focus   {top1:>5.0%}   │   Entropy  {ent:>8.2f}   │   c_puct  {C_PUCT:.1f}"))
+            lines.append(row(f"  MCTS    {MCTS_SIMULATIONS:>4}sims   │   Sim/s   {sps:>8.0f}   │   SP time  {sp_t:>5.1f}s"))
+            lines.append(row(f"  Focus   {top1:>6.0%}   │   Entropy  {ent:>8.2f}   │   c_puct    {C_PUCT:>4.1f}"))
 
         # --- Charts block (WR + Loss, each 4-row height) ---
         CW = 52  # chart width
@@ -1070,20 +1070,21 @@ def train(args):
         if last_corrective_ratio is not None:
             lines.append("├" + "─" * W + "┤")
             corr_avg = _recent_avg(corrective_ratio_history)
-            corr_avg_str = f" avg:{corr_avg:.0%}" if corr_avg is not None and len(corrective_ratio_history) > 1 else ""
+            corr_avg_str = f"{corr_avg:.0%}" if corr_avg is not None and len(corrective_ratio_history) > 1 else "—"
             len_avg = _recent_avg(len_priority_avg_history)
-            len_avg_str = f" avg x{len_avg:.2f}" if len_avg is not None and len(len_priority_avg_history) > 1 else ""
+            len_avg_val = f"x{len_avg:.2f}" if len_avg is not None and len(len_priority_avg_history) > 1 else "—"
             corr_str = f"{last_corrective_ratio:.0%}"
             boost_str = f"{last_len_boost_ratio:.0%}" if last_len_boost_ratio is not None else "—"
             damp_str = f"{last_len_damp_ratio:.0%}" if last_len_damp_ratio is not None else "—"
+            lp_str = f"x{(last_len_priority_avg or 1.0):.2f}"
             sig_up, sig_lo = _sparkline2(corrective_ratio_history, CW)
             len_up, len_lo = _sparkline2(len_priority_avg_history, CW)
-            lines.append(row(f"  Signal     corrective {corr_str:>4}{corr_avg_str}"))
-            lines.append(row(f"             {' ' * (CW - len(sig_up) + 2)}{sig_up}   hit {corr_str:>4}"))
-            lines.append(row(f"             {' ' * (CW - len(sig_lo) + 2)}{sig_lo}        "))
-            lines.append(row(f"  Length     boost {boost_str:>4}   damp {damp_str:>4}{len_avg_str}"))
-            lines.append(row(f"             {' ' * (CW - len(len_up) + 2)}{len_up}   x{(last_len_priority_avg or 1.0):.2f}"))
-            lines.append(row(f"             {' ' * (CW - len(len_lo) + 2)}{len_lo}        "))
+            lines.append(row(f"  Signal  {corr_str:>6}   │   Avg      {corr_avg_str:>8}   │"))
+            lines.append(row(f"          {' ' * (CW - len(sig_up) + 2)}{sig_up}        "))
+            lines.append(row(f"          {' ' * (CW - len(sig_lo) + 2)}{sig_lo}        "))
+            lines.append(row(f"  Length  {lp_str:>6}   │   Boost    {boost_str:>8}   │   Damp    {damp_str:>6}"))
+            lines.append(row(f"          {' ' * (CW - len(len_up) + 2)}{len_up}        "))
+            lines.append(row(f"          {' ' * (CW - len(len_lo) + 2)}{len_lo}        "))
 
         # --- Events block ---
         if events:
@@ -1106,7 +1107,11 @@ def train(args):
             print(f"[{ts}] {msg}")
 
     _log_event(f"Started run {run_id_short} | {num_params/1000:.1f}K params"
-               + (f" | budget {time_budget}s" if time_budget else ""))
+               + (f" | budget {time_budget}s" if time_budget else "")
+               + (f" | MCTS {mcts_sims}sims" if mcts_sims > 0 else ""))
+
+    # Show TUI immediately so user sees something before first cycle
+    _update_tui()
 
     # -----------------------------------------------------------------------
     # Training loop
