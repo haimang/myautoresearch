@@ -43,6 +43,43 @@ def sparkline2(values: list[float], width: int = 40) -> tuple[str, str]:
     return ("".join(upper), "".join(lower))
 
 
+def sparkline3(values: list[float], width: int = 40) -> tuple[str, str, str]:
+    """Triple-height sparkline — returns (upper_row, middle_row, lower_row).
+
+    Maps values to 0-23 levels across three character rows:
+    - Lower row: blocks ▁▂▃▄▅▆▇█ for levels 0-7
+    - Middle row: blocks ▁▂▃▄▅▆▇█ for levels 8-15 (lower row stays solid █)
+    - Upper row: blocks ▁▂▃▄▅▆▇█ for levels 16-23 (lower + middle stay solid █)
+    """
+    if not values:
+        return ("", "", "")
+
+    chars = " ▁▂▃▄▅▆▇"
+    recent = values[-width:]
+    lo, hi = min(recent), max(recent)
+    span = hi - lo if hi > lo else 1.0
+
+    upper = []
+    middle = []
+    lower = []
+    for v in recent:
+        level = min(int((v - lo) / span * 23), 23)
+        if level >= 16:
+            lower.append("█")
+            middle.append("█")
+            upper.append(chars[level - 16])
+        elif level >= 8:
+            lower.append("█")
+            middle.append(chars[level - 8])
+            upper.append(" ")
+        else:
+            lower.append(chars[level])
+            middle.append(" ")
+            upper.append(" ")
+
+    return ("".join(upper), "".join(middle), "".join(lower))
+
+
 def progress_bar(elapsed: float, budget: float | None, width: int = 34) -> str:
     """Render a text progress bar with time fraction."""
     if budget is None or budget <= 0:

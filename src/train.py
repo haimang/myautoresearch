@@ -21,7 +21,7 @@ import mlx.optimizers as optim
 import numpy as np
 
 from game import BatchBoards, BOARD_SIZE, BLACK, WHITE, EMPTY
-from tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, progress_bar as _progress_bar_fn
+from tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, progress_bar as _progress_bar_fn
 
 # Try to import TIME_BUDGET and evaluate_win_rate from prepare.py.
 try:
@@ -447,6 +447,10 @@ def train(args):
     learning_rate = args.learning_rate
     steps_per_cycle = args.steps_per_cycle
 
+    # Handle --no-eval-opponent: override to disable NN opponent
+    if args.no_eval_opponent:
+        args.eval_opponent = None
+
     # Detect benchmark mode: fixed budget, minimax only, no resume
     is_benchmark = (
         time_budget is not None
@@ -613,6 +617,9 @@ def train(args):
     def _sparkline2(values: list[float], width: int = 40) -> tuple[str, str]:
         return _sparkline2_fn(values, width)
 
+    def _sparkline3(values: list[float], width: int = 40) -> tuple[str, str, str]:
+        return _sparkline3_fn(values, width)
+
     def _smoothed_wr(window: int = probe_window) -> float | None:
         """Sliding average of recent probe WRs for stable decisions."""
         if not wr_history:
@@ -658,26 +665,28 @@ def train(args):
         lines.append(row(f"  Steps  {total_train_steps:>6d}  │  Buffer  {len(replay_buffer):>8d}  │  WR {wr_str:>5}{sm_str}"))
         lines.append(row(f"  Gm/s   {gps:>6.1f}  │  AvgLen  {avg_game_length:>8.1f}  │  vs {opp_str}{mix_str}"))
 
-        # --- Charts block (WR + Loss, each 2-row height) ---
+        # --- Charts block (WR + Loss, each 3-row height) ---
         CW = 40  # chart width
         if wr_history or loss_history:
             lines.append("├" + "─" * W + "┤")
             if wr_history:
-                up, lo = _sparkline2(wr_history, CW)
+                up, mid, lo = _sparkline3(wr_history, CW)
                 wr_last = wr_history[-1]
                 lines.append(row(f"  Win Rate{' ' * (CW - len(up) + 2)}{up} {wr_last:>4.0%}"))
+                lines.append(row(f"          {' ' * (CW - len(mid) + 2)}{mid}     "))
                 lines.append(row(f"          {' ' * (CW - len(lo) + 2)}{lo}     "))
             if wr_history and loss_history:
                 lines.append("│" + "╌" * W + "│")
             if loss_history:
-                up, lo = _sparkline2(loss_history, CW)
+                up, mid, lo = _sparkline3(loss_history, CW)
                 lines.append(row(f"  Loss    {' ' * (CW - len(up) + 2)}{up} {last_loss:>5.2f}"))
+                lines.append(row(f"          {' ' * (CW - len(mid) + 2)}{mid}     "))
                 lines.append(row(f"          {' ' * (CW - len(lo) + 2)}{lo}     "))
 
         # --- Events block ---
         if events:
             lines.append("├" + "─" * W + "┤")
-            for e in events[-6:]:
+            for e in events[-10:]:
                 lines.append(row(f"  {e}"))
         lines.append("╰" + "─" * W + "╯")
         return "\n".join(lines)
@@ -835,6 +844,8 @@ def train(args):
                         ckpt_dir, recording_dir,
                         threshold=crossed,
                         num_blocks=num_blocks, num_filters=num_filters,
+                        opponent_model=opponent_model,
+                        eval_opponent_alias=eval_opponent_alias,
                     )
                     last_ckpt_wr = effective_wr
                     num_checkpoints += 1
@@ -881,16 +892,25 @@ def train(args):
     save_model(model, model_path)
     _log_event(f"Model saved to {model_path}")
 
-    # ----- Final evaluation (subprocess) -----
+    # ----- Final evaluation -----
     final_wr = last_probe_wr
+    opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
     if evaluate_win_rate is not None:
-        print(f"\nRunning final evaluation vs L{eval_level} ({full_eval_games} games)...")
+        print(f"\nRunning final evaluation vs {opp_label} ({full_eval_games} games)...")
         tag = f"final_c{cycle:04d}"
-        result = _subprocess_eval(
-            model_path, eval_level, full_eval_games, tag, run_id,
-            recording_dir=recording_dir,
-            num_blocks=num_blocks, num_filters=num_filters,
-        )
+
+        if opponent_model is not None:
+            # NN vs NN: in-process eval
+            model.eval()
+            result = _in_process_eval(model, eval_level, full_eval_games,
+                                      opponent_model=opponent_model)
+        else:
+            # Minimax: subprocess eval
+            result = _subprocess_eval(
+                model_path, eval_level, full_eval_games, tag, run_id,
+                recording_dir=recording_dir,
+                num_blocks=num_blocks, num_filters=num_filters,
+            )
         if result:
             final_wr = result.get("win_rate", final_wr)
             print(f"Final win_rate: {final_wr:.1%}")
@@ -988,6 +1008,16 @@ def _quick_eval(model, level: int, n_games: int,
     
     If opponent_model is provided, plays against it instead of minimax.
     """
+    result = _in_process_eval(model, level, n_games, opponent_model)
+    return result["win_rate"]
+
+
+def _in_process_eval(model, level: int, n_games: int,
+                     opponent_model=None) -> dict:
+    """In-process evaluation returning full result dict.
+
+    If opponent_model is provided, plays against it instead of minimax.
+    """
     from game import Board
 
     use_nn_opponent = opponent_model is not None
@@ -996,7 +1026,10 @@ def _quick_eval(model, level: int, n_games: int,
         from prepare import OPPONENTS
         opponent_fn = OPPONENTS[level]
 
-    wins = 0
+    wins, losses, draws = 0, 0, 0
+    total_moves = 0
+    start = _time.time()
+
     for game_i in range(n_games):
         nn_is_black = game_i < n_games // 2
         nn_player = BLACK if nn_is_black else WHITE
@@ -1018,13 +1051,26 @@ def _quick_eval(model, level: int, n_games: int,
                 row, col = opponent_fn(board)
             board.place(row, col)
 
+        total_moves += board.move_count
         if board.winner == nn_player:
             wins += 1
+        elif board.winner is not None:
+            losses += 1
+        else:
+            draws += 1
 
         if game_i % 20 == 0:
             mx.clear_cache()
 
-    return wins / n_games if n_games > 0 else 0.0
+    elapsed = _time.time() - start
+    return {
+        "win_rate": wins / n_games if n_games > 0 else 0.0,
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "avg_game_length": total_moves / n_games if n_games > 0 else 0,
+        "eval_elapsed_s": elapsed,
+    }
 
 
 def _nn_opponent_move(opp_model, board, temperature: float = 0.5) -> tuple[int, int]:
@@ -1097,8 +1143,9 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
                    full_eval_games, num_params, start_time,
                    events, log_event_fn, ckpt_dir, recording_dir,
                    threshold=None,
-                   num_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS):
-    """Save checkpoint, run full eval in subprocess, record to DB."""
+                   num_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS,
+                   opponent_model=None, eval_opponent_alias=None):
+    """Save checkpoint, run full eval (NN or subprocess minimax), record to DB."""
     import tracker as _tracker
 
     # Tag uses the crossed threshold (not raw probe WR)
@@ -1107,15 +1154,21 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
     ckpt_path = f"{ckpt_dir}/{tag}.safetensors"
     save_model(model, ckpt_path)
 
+    opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
     log_event_fn(f"✓ Checkpoint {tag}  wr={win_rate:.1%}")
 
-    # Full eval in subprocess
+    # Full eval: use in-process NN eval if opponent_model is set, else subprocess minimax
     elapsed = _time.time() - start_time
-    result = _subprocess_eval(
-        ckpt_path, eval_level, full_eval_games, tag, run_id,
-        recording_dir=recording_dir,
-        num_blocks=num_blocks, num_filters=num_filters,
-    )
+    if opponent_model is not None:
+        model.eval()
+        result = _in_process_eval(model, eval_level, full_eval_games,
+                                  opponent_model=opponent_model)
+    else:
+        result = _subprocess_eval(
+            ckpt_path, eval_level, full_eval_games, tag, run_id,
+            recording_dir=recording_dir,
+            num_blocks=num_blocks, num_filters=num_filters,
+        )
 
     if result:
         full_wr = result.get("win_rate", win_rate)
@@ -1180,8 +1233,10 @@ def parse_args() -> argparse.Namespace:
                    help="Stop after this many self-play games")
     p.add_argument("--eval-level", type=int, default=EVAL_LEVEL,
                    help=f"Evaluation opponent level 0-3 (default: {EVAL_LEVEL})")
-    p.add_argument("--eval-opponent", type=str, default=None,
-                   help="Evaluate against a registered NN opponent alias")
+    p.add_argument("--eval-opponent", type=str, default="L4",
+                   help="Evaluate against a registered NN opponent alias (default: L4)")
+    p.add_argument("--no-eval-opponent", action="store_true",
+                   help="Disable NN opponent, use minimax only (for benchmarks)")
     p.add_argument("--eval-interval", type=int, default=15,
                    help="Probe evaluation every N cycles (default: 15)")
     p.add_argument("--probe-games", type=int, default=100,
