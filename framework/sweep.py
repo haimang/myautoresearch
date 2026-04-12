@@ -28,8 +28,7 @@ import subprocess
 import sys
 import time
 
-
-DB_PATH = "output/tracker.db"
+from core.db import DB_PATH
 
 
 def parse_args():

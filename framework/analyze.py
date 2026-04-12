@@ -20,22 +20,15 @@ import sys
 import os
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join("output", "tracker.db")
+from core.db import DB_PATH, init_db
 
 
 def _connect() -> sqlite3.Connection:
+    """Open tracker.db via core.db (shared connection + migration logic)."""
     if not os.path.exists(DB_PATH):
         print(f"Error: database not found at {DB_PATH}")
         sys.exit(1)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    # 暂时停用: 确保 schema 迁移已应用
-    for col, typ in [("is_benchmark", "INTEGER DEFAULT 0"), ("eval_opponent", "TEXT")]:
-        try:
-            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
-        except sqlite3.OperationalError:
-            pass
-    return conn
+    return init_db(DB_PATH)
 
 
 def _col(text: str, width: int) -> str:
@@ -407,6 +400,255 @@ def cmd_stability(conn: sqlite3.Connection, run_id: str) -> None:
         for c in ckpt_rows:
             wr = f"{c['win_rate']:.1%}" if c["win_rate"] is not None else "-"
             print(f"  cycle {c['cycle']:>4}  {c['tag']:<18}  WR={wr}")
+
+    print()
+
+
+# ---------------------------------------------------------------------------
+# 停滞检测（domain-agnostic）
+# ---------------------------------------------------------------------------
+
+def _linear_regression(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
+    """Simple linear regression. Returns (slope, intercept, r_squared)."""
+    n = len(xs)
+    if n < 2:
+        return 0.0, 0.0, 0.0
+    sum_x = sum(xs)
+    sum_y = sum(ys)
+    sum_xy = sum(x * y for x, y in zip(xs, ys))
+    sum_xx = sum(x * x for x in xs)
+    denom = n * sum_xx - sum_x * sum_x
+    if abs(denom) < 1e-12:
+        return 0.0, sum_y / n, 0.0
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    intercept = (sum_y - slope * sum_x) / n
+    # R-squared
+    mean_y = sum_y / n
+    ss_tot = sum((y - mean_y) ** 2 for y in ys)
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    r_sq = 1 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
+    return slope, intercept, r_sq
+
+
+def cmd_stagnation(conn: sqlite3.Connection, run_id: str) -> None:
+    """检测训练停滞：WR 时间序列在 eval 点上无趋势改善。
+
+    domain-agnostic: 只读 cycle_metrics 中的 (cycle, win_rate) 做线性回归。
+    Uses the second half of the run for detection (avoids early ramp-up noise).
+    """
+    row = conn.execute(
+        "SELECT id, total_cycles, final_win_rate FROM runs WHERE id LIKE ?",
+        (run_id + "%",)
+    ).fetchone()
+    if not row:
+        print(f"Run not found: {run_id}")
+        return
+
+    full_id = row["id"]
+    wr_rows = conn.execute(
+        "SELECT cycle, win_rate FROM cycle_metrics "
+        "WHERE run_id = ? AND win_rate IS NOT NULL ORDER BY cycle",
+        (full_id,)
+    ).fetchall()
+
+    if not wr_rows:
+        print(f"No win-rate data for run {full_id[:8]}")
+        return
+
+    cycles = [float(r["cycle"]) for r in wr_rows]
+    wrs = [r["win_rate"] for r in wr_rows]
+    n = len(wrs)
+
+    print(f"Stagnation analysis for run {full_id[:8]}")
+    print(f"  Total eval points: {n}")
+    print(f"  WR range: {min(wrs):.1%} — {max(wrs):.1%}")
+    print()
+
+    # Full-run regression
+    slope_all, _, r2_all = _linear_regression(cycles, wrs)
+    print(f"  Full-run trend:  slope={slope_all:.6f}/cycle  R²={r2_all:.3f}")
+
+    if n < 10:
+        print(f"  Not enough data for stagnation analysis (need >= 10 probes, have {n})")
+        print()
+        return
+
+    # Analyze second half of the run (skip early ramp-up)
+    half = n // 2
+    half_c = cycles[half:]
+    half_w = wrs[half:]
+    nh = len(half_w)
+    slope_half, _, r2_half = _linear_regression(half_c, half_w)
+    mean_w = sum(half_w) / nh
+    wr_std = (sum((w - mean_w) ** 2 for w in half_w) / nh) ** 0.5
+
+    print(f"  Second half ({nh} probes from cycle {int(half_c[0])}):")
+    print(f"    slope={slope_half:.6f}/cycle  R²={r2_half:.3f}  WR_std={wr_std:.1%}")
+
+    # Stagnation criteria: near-zero slope AND high variance relative to trend
+    # A meaningful slope should produce WR change >> std over the window
+    cycle_span = half_c[-1] - half_c[0]
+    expected_change = abs(slope_half * cycle_span)
+    is_stagnant = (r2_half < 0.15 and expected_change < wr_std) or abs(slope_half) < 0.0001
+
+    if is_stagnant:
+        # Find onset: scan forward with sliding window of 10 points
+        stag_start_cycle = int(half_c[0])
+        window = min(10, n // 3)
+        for i in range(window, n):
+            seg_c = cycles[i - window:i]
+            seg_w = wrs[i - window:i]
+            s, _, r2 = _linear_regression(seg_c, seg_w)
+            span = seg_c[-1] - seg_c[0]
+            seg_mean = sum(seg_w) / window
+            seg_std = (sum((w - seg_mean) ** 2 for w in seg_w) / window) ** 0.5
+            if (r2 < 0.15 and abs(s * span) < seg_std) or abs(s) < 0.0001:
+                stag_start_cycle = int(seg_c[0])
+                break
+
+        wasted_cycles = int(cycles[-1]) - stag_start_cycle
+        print()
+        print(f"  ⚠ STAGNATION DETECTED")
+        print(f"    Estimated onset: cycle {stag_start_cycle}")
+        print(f"    Wasted cycles: ~{wasted_cycles} ({wasted_cycles * 100 // max(1, int(cycles[-1]))}% of total)")
+        print(f"    WR has not shown meaningful improvement in the second half of training.")
+        print(f"    Consider: stopping this run, changing hyperparams, or switching opponent.")
+    else:
+        print()
+        print(f"  ✓ No stagnation detected (WR still trending upward)")
+
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Pareto 非支配排序（domain-agnostic）
+# ---------------------------------------------------------------------------
+
+def _pareto_front(points: list[dict], maximize: list[str],
+                  minimize: list[str]) -> tuple[list[dict], list[dict]]:
+    """Non-dominated sort. Returns (front, dominated).
+
+    A point A dominates B if A is >= B on all maximize axes and <= B on all
+    minimize axes, with at least one strict inequality.
+    """
+    front = []
+    dominated = []
+    for i, p in enumerate(points):
+        dominated_by_any = False
+        for j, q in enumerate(points):
+            if i == j:
+                continue
+            # Check if q dominates p
+            all_ge = True
+            any_strict = False
+            for k in maximize:
+                if q.get(k) is None or p.get(k) is None:
+                    all_ge = False
+                    break
+                if q[k] < p[k]:
+                    all_ge = False
+                    break
+                if q[k] > p[k]:
+                    any_strict = True
+            if not all_ge:
+                continue
+            for k in minimize:
+                if q.get(k) is None or p.get(k) is None:
+                    all_ge = False
+                    break
+                if q[k] > p[k]:
+                    all_ge = False
+                    break
+                if q[k] < p[k]:
+                    any_strict = True
+            if all_ge and any_strict:
+                dominated_by_any = True
+                break
+        if dominated_by_any:
+            dominated.append(p)
+        else:
+            front.append(p)
+    return front, dominated
+
+
+def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md") -> None:
+    """对 completed runs 执行非支配排序，输出 Pareto 前沿。
+
+    默认轴: maximize WR, minimize params 和 wall_time.
+    只分析 completed runs 且有 final_win_rate 的数据。
+    """
+    rows = conn.execute(
+        """SELECT id, num_res_blocks, num_filters, num_params,
+                  final_win_rate, wall_time_s, total_games, eval_level,
+                  eval_opponent, is_benchmark, learning_rate,
+                  train_steps_per_cycle, parallel_games
+           FROM runs
+           WHERE status = 'completed' AND final_win_rate IS NOT NULL
+           ORDER BY final_win_rate DESC"""
+    ).fetchall()
+
+    if not rows:
+        print("No completed runs with win-rate data.")
+        return
+
+    points = []
+    for r in rows:
+        points.append({
+            "run": r["id"][:8],
+            "arch": f"{r['num_res_blocks'] or '?'}x{r['num_filters'] or '?'}",
+            "params": r["num_params"],
+            "wr": r["final_win_rate"],
+            "wall_s": r["wall_time_s"],
+            "games": r["total_games"],
+            "lr": r["learning_rate"],
+            "eval_level": r["eval_level"],
+            "eval_opponent": r["eval_opponent"],
+            "is_benchmark": r["is_benchmark"],
+        })
+
+    front, dominated = _pareto_front(points, maximize=["wr"], minimize=["params", "wall_s"])
+
+    # Sort front by WR descending
+    front.sort(key=lambda p: -(p["wr"] or 0))
+    dominated.sort(key=lambda p: -(p["wr"] or 0))
+
+    if fmt == "json":
+        import json as _j
+        output = {
+            "pareto_front": front,
+            "dominated": dominated,
+            "axes": {"maximize": ["wr"], "minimize": ["params", "wall_s"]},
+            "total_runs": len(points),
+        }
+        print(_j.dumps(output, indent=2, ensure_ascii=False))
+        return
+
+    # Markdown output
+    print(f"Pareto Front (maximize WR, minimize params + wall_time)")
+    print(f"{'─' * 80}")
+    print(f"  Total runs analyzed: {len(points)}")
+    print(f"  Front points: {len(front)}  |  Dominated: {len(dominated)}")
+    print()
+
+    print("  ★ PARETO FRONT:")
+    print(f"  {'Run':>10}  {'Arch':>8}  {'Params':>8}  {'WR':>7}  {'Wall':>7}  {'Games':>7}  {'Opp':>6}")
+    print(f"  {'─' * 68}")
+    for p in front:
+        opp = p["eval_opponent"] if p["eval_opponent"] else f"L{p['eval_level'] or 0}"
+        params = f"{p['params']/1000:.0f}K" if p["params"] else "?"
+        wall = f"{p['wall_s']:.0f}s" if p["wall_s"] else "?"
+        print(f"  {p['run']:>10}  {p['arch']:>8}  {params:>8}  {p['wr']:.1%}  {wall:>7}  {str(p['games'] or '-'):>7}  {opp:>6}")
+
+    if dominated:
+        print()
+        print("  ○ DOMINATED:")
+        print(f"  {'Run':>10}  {'Arch':>8}  {'Params':>8}  {'WR':>7}  {'Wall':>7}  {'Games':>7}  {'Opp':>6}")
+        print(f"  {'─' * 68}")
+        for p in dominated:
+            opp = p["eval_opponent"] if p["eval_opponent"] else f"L{p['eval_level'] or 0}"
+            params = f"{p['params']/1000:.0f}K" if p["params"] else "?"
+            wall = f"{p['wall_s']:.0f}s" if p["wall_s"] else "?"
+            print(f"  {p['run']:>10}  {p['arch']:>8}  {params:>8}  {p['wr']:.1%}  {wall:>7}  {str(p['games'] or '-'):>7}  {opp:>6}")
 
     print()
 
@@ -908,6 +1150,10 @@ def main():
                        help="Training stability report for a run")
     group.add_argument("--matrix", metavar="TAG_PREFIX",
                        help="Sweep matrix results grouped by tag prefix")
+    group.add_argument("--stagnation", metavar="RUN_ID",
+                       help="Detect training stagnation (WR plateau) for a run")
+    group.add_argument("--pareto", action="store_true",
+                       help="Pareto non-dominated sort across completed runs")
     group.add_argument("--report", action="store_true",
                        help="Generate structured experiment report for agent/human")
 
@@ -935,6 +1181,10 @@ def main():
         cmd_stability(conn, args.stability)
     elif args.matrix:
         cmd_matrix(conn, args.matrix)
+    elif args.stagnation:
+        cmd_stagnation(conn, args.stagnation)
+    elif args.pareto:
+        cmd_pareto(conn, fmt=args.format)
     elif args.report:
         cmd_report(conn, n_recent=args.recent, fmt=args.format)
 

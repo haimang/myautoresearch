@@ -1,8 +1,11 @@
 """
-autoresearch 实验追踪器 — 基于 SQLite。
+autoresearch 数据库层 — 基于 SQLite。
 
-管理: runs（训练运行）、cycle_metrics（周期指标）、checkpoints（检查点）、recordings（对局记录）。
-所有路径以项目根目录为基准存储（如 "output/checkpoints/xxx.safetensors"）。
+框架的单一数据源：schema 定义、连接管理、迁移、全部 CRUD 操作。
+管理: runs（训练运行）、cycle_metrics（周期指标）、checkpoints（检查点）、
+recordings（对局记录）、opponents（注册对手）。
+
+所有路径以项目根目录为基准存储（如 "output/<uuid>/checkpoints/xxx.safetensors"）。
 """
 
 import os

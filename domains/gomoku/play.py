@@ -35,7 +35,7 @@ from game import (
 )
 from play_service import load_nn_player, resolve_checkpoint
 from prepare import OPPONENTS
-import tracker
+import core.db as tracker
 
 
 def print_checkpoints():

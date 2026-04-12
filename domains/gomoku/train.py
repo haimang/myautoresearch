@@ -31,7 +31,8 @@ import mlx.optimizers as optim
 import numpy as np
 
 from game import BatchBoards, BOARD_SIZE, BLACK, WHITE, EMPTY
-from tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, sparkline4 as _sparkline4_fn, progress_bar as _progress_bar_fn
+from core.tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, sparkline4 as _sparkline4_fn, progress_bar as _progress_bar_fn
+from core.mcts import MCTSNode, mcts_search as _mcts_search_generic
 
 # Try to import TIME_BUDGET and evaluate_win_rate from prepare.py.
 try:
@@ -52,6 +53,9 @@ WEIGHT_DECAY = 1e-4
 BATCH_SIZE = 256          # training batch size
 PARALLEL_GAMES = 64       # number of simultaneous self-play games
 MCTS_SIMULATIONS = 0      # 0 = pure policy network (no MCTS)
+C_PUCT = 1.5              # MCTS exploration constant
+DIRICHLET_ALPHA = 0.03    # Dirichlet noise alpha for root node exploration
+DIRICHLET_FRAC = 0.25     # fraction of Dirichlet noise mixed into root prior
 TEMPERATURE = 1.0         # self-play exploration temperature
 TEMP_THRESHOLD = 30       # moves over which temperature decays (see run_self_play)
 REPLAY_BUFFER_SIZE = 50000
@@ -326,22 +330,177 @@ def _sample_replay_indices(replay_buffer: list[ReplaySample],
 
 
 # ---------------------------------------------------------------------------
+# MCTS — Gomoku adapter for framework/core/mcts.py
+# ---------------------------------------------------------------------------
+
+def mcts_search(board, model, num_simulations: int,
+                c_puct: float = C_PUCT,
+                dirichlet_alpha: float = DIRICHLET_ALPHA,
+                dirichlet_frac: float = DIRICHLET_FRAC) -> np.ndarray:
+    """Run MCTS from the given Gomoku board state.
+
+    Thin wrapper around framework/core/mcts.mcts_search() — provides
+    Gomoku-specific evaluate_fn (MLX forward pass) and board callbacks.
+
+    Returns a [225] visit count distribution (unnormalized).
+    """
+    def _evaluate(state):
+        enc = mx.array(state.encode()[np.newaxis, ...])
+        logits, value = model(enc)
+        mx.eval(logits, value)
+        priors = np.array(mx.softmax(logits[0]))
+        return priors, float(value[0, 0])
+
+    def _apply(state, action):
+        row, col = action // BOARD_SIZE, action % BOARD_SIZE
+        state.place(row, col)
+
+    def _terminal_value(state):
+        return 0.0 if state.winner == -1 else 1.0
+
+    return _mcts_search_generic(
+        root_state=board,
+        evaluate_fn=_evaluate,
+        copy_fn=lambda s: s.copy(),
+        legal_mask_fn=lambda s: s.get_legal_mask(),
+        apply_fn=_apply,
+        terminal_fn=lambda s: s.is_terminal(),
+        terminal_value_fn=_terminal_value,
+        action_size=BOARD_SIZE * BOARD_SIZE,
+        num_simulations=num_simulations,
+        c_puct=c_puct,
+        dirichlet_alpha=dirichlet_alpha,
+        dirichlet_frac=dirichlet_frac,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Self-play
 # ---------------------------------------------------------------------------
+
+def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
+                        temperature: float = TEMPERATURE) -> tuple[list, int, float, dict]:
+    """Run self-play games using MCTS for policy target generation.
+
+    Each game is played sequentially (MCTS needs per-board tree search).
+    Policy target = normalized visit count distribution from MCTS.
+    This produces much higher quality training signal than raw network sampling.
+
+    Returns (training_data, games_completed, avg_game_length, mcts_stats).
+    mcts_stats keys: search_time_s, sims_per_sec, moves_total, avg_top1_share, avg_entropy
+    """
+    from game import Board
+
+    model.eval()
+    all_training_data = []
+    game_lengths = []
+
+    total_search_time = 0.0
+    total_moves = 0
+    top1_shares = []      # fraction of visits on most-visited action
+    entropies = []        # policy entropy (visit distribution sharpness)
+
+    for game_idx in range(num_games):
+        board = Board()
+        move_encodings = []   # (encoded_board, player) per move
+        move_policies = []    # MCTS visit distributions per move
+
+        while not board.is_terminal():
+            # Run MCTS search from current position
+            t0 = _time.time()
+            visits = mcts_search(board, model, mcts_sims)
+            total_search_time += _time.time() - t0
+            total_moves += 1
+
+            # Track visit concentration (how focused the search is)
+            visit_sum = visits.sum()
+            if visit_sum > 0:
+                top1_shares.append(float(visits.max() / visit_sum))
+                dist = visits / visit_sum
+                dist_nz = dist[dist > 0]
+                entropies.append(float(-np.sum(dist_nz * np.log(dist_nz))))
+
+            # Apply temperature to visit counts to get policy target
+            move_num = board.move_count
+            if TEMP_THRESHOLD > 0 and move_num < TEMP_THRESHOLD:
+                frac = move_num / TEMP_THRESHOLD
+                temp = temperature * (1.0 - frac) + 0.3 * frac
+            else:
+                temp = 0.3
+
+            if temp < 0.01:
+                # Greedy: pick most visited
+                policy_dist = np.zeros_like(visits)
+                policy_dist[int(np.argmax(visits))] = 1.0
+            else:
+                # Temperature-scaled visit counts
+                powered = visits ** (1.0 / temp)
+                total = powered.sum()
+                if total > 0:
+                    policy_dist = powered / total
+                else:
+                    policy_dist = board.get_legal_mask()
+                    lsum = policy_dist.sum()
+                    if lsum > 0:
+                        policy_dist /= lsum
+
+            # Sample action from the MCTS policy
+            action = np.random.choice(BOARD_SIZE * BOARD_SIZE, p=policy_dist)
+
+            # Record state before making the move
+            move_encodings.append((board.encode(), board.current_player))
+            move_policies.append(policy_dist.copy())
+
+            # Apply the move
+            row, col = action // BOARD_SIZE, action % BOARD_SIZE
+            board.place(row, col)
+
+        # Collect training data
+        game_length = board.move_count
+        winner = board.winner
+        for move_idx, ((encoded, player), policy) in enumerate(
+                zip(move_encodings, move_policies)):
+            if winner == -1:
+                value_target = 0.0
+            elif winner == player:
+                value_target = 1.0
+            else:
+                value_target = -1.0
+            all_training_data.append(
+                _make_replay_sample(encoded, policy, value_target,
+                                    source="self", game_length=game_length)
+            )
+        game_lengths.append(game_length)
+
+        # Periodic Metal cache cleanup
+        if (game_idx + 1) % 10 == 0:
+            mx.clear_cache()
+
+    avg_game_len = sum(game_lengths) / len(game_lengths) if game_lengths else 0.0
+    mcts_stats = {
+        "search_time_s": total_search_time,
+        "sims_per_sec": (total_moves * mcts_sims / total_search_time) if total_search_time > 0 else 0.0,
+        "moves_total": total_moves,
+        "avg_top1_share": float(np.mean(top1_shares)) if top1_shares else 0.0,
+        "avg_entropy": float(np.mean(entropies)) if entropies else 0.0,
+    }
+    return all_training_data, num_games, avg_game_len, mcts_stats
+
 
 def run_self_play(model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE):
     """
     Run batched self-play games using the model.
-    Uses game.BatchBoards for parallel game management.
 
-    Plays all num_games to completion (no resetting — each slot plays exactly
-    one game). With 64 parallel games at ~50 moves each, this needs ~50
-    batched forward passes and finishes in seconds.
+    When MCTS_SIMULATIONS > 0: uses MCTS for high-quality policy targets.
+    When MCTS_SIMULATIONS == 0: uses batched softmax sampling (original behavior).
 
-    Returns (training_data, games_completed):
-    training_data: list of replay samples
-      games_completed: int
+    Returns (training_data, games_completed, avg_game_length, mcts_stats).
+    mcts_stats is {} when MCTS is disabled.
     """
+    if MCTS_SIMULATIONS > 0:
+        return _run_self_play_mcts(model, num_games, MCTS_SIMULATIONS, temperature)
+
+    # --- Original batched self-play (no MCTS) ---
     model.eval()
 
     batch = BatchBoards(num_games)
@@ -424,7 +583,7 @@ def run_self_play(model, num_games=PARALLEL_GAMES, temperature=TEMPERATURE):
         game_lengths.append(game_length)
 
     avg_game_len = sum(game_lengths) / len(game_lengths) if game_lengths else 0.0
-    return all_training_data, num_games, avg_game_len
+    return all_training_data, num_games, avg_game_len, {}
 
 
 def run_opponent_play(model, opponent_model, num_games: int,
@@ -589,7 +748,7 @@ def compute_loss(model, batch_boards, batch_policies, batch_values):
 
 def train(args):
     """Main training function with checkpoint tracking and text TUI."""
-    import tracker as _tracker
+    import core.db as _tracker
 
     run_id = str(uuid.uuid4())
     run_id_short = run_id[:8]
@@ -616,6 +775,15 @@ def train(args):
     buffer_size = args.buffer_size
     learning_rate = args.learning_rate
     steps_per_cycle = args.steps_per_cycle
+    mcts_sims = args.mcts_sims
+    c_puct_val = args.c_puct
+    dirichlet_alpha_val = args.dirichlet_alpha
+
+    # Apply MCTS settings to module-level constants so run_self_play sees them
+    global MCTS_SIMULATIONS, C_PUCT, DIRICHLET_ALPHA
+    MCTS_SIMULATIONS = mcts_sims
+    C_PUCT = c_puct_val
+    DIRICHLET_ALPHA = dirichlet_alpha_val
 
     # Handle --no-eval-opponent: override to disable NN opponent
     if args.no_eval_opponent:
@@ -678,7 +846,7 @@ def train(args):
         "weight_decay": WEIGHT_DECAY,
         "batch_size": BATCH_SIZE,
         "parallel_games": parallel_games,
-        "mcts_simulations": MCTS_SIMULATIONS,
+        "mcts_simulations": mcts_sims,
         "temperature": TEMPERATURE,
         "temp_threshold": TEMP_THRESHOLD,
         "replay_buffer_size": buffer_size,
@@ -728,6 +896,9 @@ def train(args):
     num_checkpoints = 0
     stop_reason = "time_budget"
     avg_game_length = 0.0
+    last_mcts_stats: dict = {}
+    mcts_sims_per_sec_history: list[float] = []
+    mcts_entropy_history: list[float] = []
 
     # NN opponent (if --eval-opponent specified)
     eval_opponent_alias: str | None = args.eval_opponent
@@ -853,6 +1024,16 @@ def train(args):
         lines.append(row(f"  Steps   {total_train_steps:>6d}   │   Buffer   {len(replay_buffer):>8d}   │   WR  {wr_str:>5}{sm_str}"))
         lines.append(row(f"  Gm/s    {gps:>6.1f}   │   AvgLen   {avg_game_length:>8.1f}   │   vs {opp_str}{mix_str}"))
 
+        # --- MCTS stats row (only when MCTS is active) ---
+        if MCTS_SIMULATIONS > 0 and last_mcts_stats:
+            sps = last_mcts_stats.get("sims_per_sec", 0)
+            top1 = last_mcts_stats.get("avg_top1_share", 0)
+            ent = last_mcts_stats.get("avg_entropy", 0)
+            sp_t = last_mcts_stats.get("search_time_s", 0)
+            lines.append("│" + "╌" * W + "│")
+            lines.append(row(f"  MCTS    {MCTS_SIMULATIONS:>4}sims │   Sim/s   {sps:>8.0f}   │   SP time {sp_t:>5.1f}s"))
+            lines.append(row(f"  Focus   {top1:>5.0%}   │   Entropy  {ent:>8.2f}   │   c_puct  {C_PUCT:.1f}"))
+
         # --- Charts block (WR + Loss, each 4-row height) ---
         CW = 52  # chart width
         if wr_history or loss_history:
@@ -872,6 +1053,18 @@ def train(args):
                 lines.append(row(f"             {' ' * (CW - len(up) + 2)}{up}        "))
                 lines.append(row(f"             {' ' * (CW - len(mid) + 2)}{mid}        "))
                 lines.append(row(f"             {' ' * (CW - len(lo) + 2)}{lo}        "))
+
+        # --- MCTS quality block (entropy + sims/sec sparklines) ---
+        if MCTS_SIMULATIONS > 0 and len(mcts_entropy_history) > 1:
+            lines.append("├" + "─" * W + "┤")
+            ent_up, ent_lo = _sparkline2(mcts_entropy_history, CW)
+            sps_up, sps_lo = _sparkline2(mcts_sims_per_sec_history, CW)
+            ent_last = mcts_entropy_history[-1] if mcts_entropy_history else 0
+            sps_last = mcts_sims_per_sec_history[-1] if mcts_sims_per_sec_history else 0
+            lines.append(row(f"  Entropy    {' ' * (CW - len(ent_up) + 2)}{ent_up}   {ent_last:>5.2f}"))
+            lines.append(row(f"             {' ' * (CW - len(ent_lo) + 2)}{ent_lo}        "))
+            lines.append(row(f"  Sim/s      {' ' * (CW - len(sps_up) + 2)}{sps_up}   {sps_last:>5.0f}"))
+            lines.append(row(f"             {' ' * (CW - len(sps_lo) + 2)}{sps_lo}        "))
 
         # --- Signal-quality block ---
         if last_corrective_ratio is not None:
@@ -939,11 +1132,14 @@ def train(args):
                 n_opp = 0
                 n_self = parallel_games
 
-            data, games_done, avg_gl = run_self_play(
+            sp_t0 = _time.time()
+            data, games_done, avg_gl, mcts_st = run_self_play(
                 model, num_games=n_self, temperature=TEMPERATURE
             )
+            selfplay_time = _time.time() - sp_t0
             total_games += games_done
             avg_game_length = avg_gl
+            last_mcts_stats = mcts_st
 
             if n_opp > 0 and train_opponent_model is not None:
                 opp_data, opp_done, opp_gl = run_opponent_play(
@@ -961,6 +1157,13 @@ def train(args):
                     replay_buffer[idx] = item
                 else:
                     replay_buffer.append(item)
+
+            # Track MCTS stats for TUI
+            if last_mcts_stats:
+                if last_mcts_stats.get("sims_per_sec"):
+                    mcts_sims_per_sec_history.append(last_mcts_stats["sims_per_sec"])
+                if last_mcts_stats.get("avg_entropy") is not None:
+                    mcts_entropy_history.append(last_mcts_stats["avg_entropy"])
 
             # ----- Training -----
             if len(replay_buffer) >= BATCH_SIZE:
@@ -1089,12 +1292,17 @@ def train(args):
             elif cycle % CYCLES_PER_REPORT == 0:
                 elapsed = _time.time() - start_time
                 wr_str = f" | WR: {last_probe_wr:.1%}" if last_probe_wr is not None else ""
+                mcts_str = ""
+                if last_mcts_stats:
+                    sps = last_mcts_stats.get("sims_per_sec", 0)
+                    top1 = last_mcts_stats.get("avg_top1_share", 0)
+                    mcts_str = f" | MCTS: {sps:.0f}sim/s focus:{top1:.0%}"
                 print(
                     f"Cycle {cycle:4d} | "
                     f"Loss: {last_loss:.4f} | "
                     f"Games: {total_games:6d} | "
                     f"Steps: {total_train_steps:6d} | "
-                    f"Buffer: {len(replay_buffer):6d}{wr_str} | "
+                    f"Buffer: {len(replay_buffer):6d}{wr_str}{mcts_str} | "
                     f"Time: {elapsed:.1f}s"
                 )
 
@@ -1367,7 +1575,7 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
                    num_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS,
                    opponent_model=None, eval_opponent_alias=None):
     """Save checkpoint, run full eval (NN or subprocess minimax), record to DB."""
-    import tracker as _tracker
+    import core.db as _tracker
 
     # Tag uses the crossed threshold (not raw probe WR)
     wr_pct = int((threshold if threshold is not None else win_rate) * 100)
@@ -1481,6 +1689,13 @@ def parse_args() -> argparse.Namespace:
     # Replay buffer
     p.add_argument("--buffer-size", type=int, default=REPLAY_BUFFER_SIZE,
                    help=f"Replay buffer capacity (default: {REPLAY_BUFFER_SIZE})")
+    # MCTS
+    p.add_argument("--mcts-sims", type=int, default=MCTS_SIMULATIONS,
+                   help=f"MCTS simulations per move (0=disable, default: {MCTS_SIMULATIONS})")
+    p.add_argument("--c-puct", type=float, default=C_PUCT,
+                   help=f"MCTS exploration constant (default: {C_PUCT})")
+    p.add_argument("--dirichlet-alpha", type=float, default=DIRICHLET_ALPHA,
+                   help=f"Dirichlet noise alpha for MCTS root (default: {DIRICHLET_ALPHA})")
     # Reproducibility
     p.add_argument("--seed", type=int, default=None,
                    help="Random seed for reproducibility (default: None = non-deterministic)")
@@ -1508,7 +1723,7 @@ def parse_args() -> argparse.Namespace:
 
 def _handle_register_opponent(args: argparse.Namespace) -> None:
     """Register a checkpoint model as a named opponent, then exit."""
-    import tracker as _tracker
+    import core.db as _tracker
     import shutil
 
     alias = args.register_opponent

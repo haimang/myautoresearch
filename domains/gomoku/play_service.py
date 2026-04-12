@@ -19,7 +19,7 @@ import numpy as np
 
 from game import BOARD_SIZE, Board
 from prepare import OPPONENTS
-import tracker
+import core.db as tracker
 
 
 PlayerFn = Callable[[Board], tuple[int, int]]
