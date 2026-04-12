@@ -1,9 +1,10 @@
 """
 autoresearch MCTS（蒙特卡洛树搜索）— 域无关实现。
 
-提供 MCTSNode 和 mcts_search()，通过回调函数与具体游戏/模型解耦。
-任何 domain 只需提供 evaluate_fn / copy_fn / legal_mask_fn / apply_fn /
-terminal_fn / terminal_value_fn 即可复用 MCTS 搜索。
+v12: numpy-vectorized PUCT in select_child. Children stored as numpy
+arrays (actions, priors, visits, values) for batch PUCT computation.
+Child MCTSNode objects created lazily (only for visited children).
+Each child knows its index in parent's arrays → O(1) sync.
 """
 
 from typing import Any, Callable
@@ -12,85 +13,100 @@ import numpy as np
 
 
 class MCTSNode:
-    """A node in the MCTS search tree."""
-    __slots__ = ("parent", "action", "prior", "visit_count", "value_sum",
-                 "children", "is_expanded")
+    """MCTS tree node with numpy-vectorized children.
 
-    def __init__(self, parent: "MCTSNode | None" = None, action: int = -1,
-                 prior: float = 0.0):
+    Children data stored as parallel arrays for fast PUCT (no Python loop).
+    Child MCTSNode objects are created lazily on first visit.
+    """
+    __slots__ = ("parent", "parent_idx", "action", "prior",
+                 "visit_count", "value_sum", "is_expanded", "n_children",
+                 "child_actions", "child_priors", "child_visits", "child_values",
+                 "child_nodes")
+
+    def __init__(self, parent: "MCTSNode | None" = None, parent_idx: int = -1,
+                 action: int = -1, prior: float = 0.0):
         self.parent = parent
-        self.action = action          # action that led to this node
-        self.prior = prior            # P(s, a) from the network
+        self.parent_idx = parent_idx  # index in parent's child_* arrays
+        self.action = action
+        self.prior = prior
         self.visit_count = 0
         self.value_sum = 0.0
-        self.children: list["MCTSNode"] = []
         self.is_expanded = False
-
-    def q_value(self) -> float:
-        if self.visit_count == 0:
-            return 0.0
-        return self.value_sum / self.visit_count
-
-    def ucb_score(self, parent_visits: int, c_puct: float) -> float:
-        """PUCT score: Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))"""
-        exploration = c_puct * self.prior * (parent_visits ** 0.5) / (1 + self.visit_count)
-        return self.q_value() + exploration
+        self.n_children = 0
+        self.child_actions: np.ndarray = np.empty(0, dtype=np.int32)
+        self.child_priors: np.ndarray = np.empty(0, dtype=np.float32)
+        self.child_visits: np.ndarray = np.empty(0, dtype=np.int32)
+        self.child_values: np.ndarray = np.empty(0, dtype=np.float32)
+        self.child_nodes: list["MCTSNode | None"] = []
 
     def select_child(self, c_puct: float) -> "MCTSNode":
-        """Select the child with highest PUCT score."""
-        best_score = -float("inf")
-        best_child = None
-        pv = self.visit_count
-        for child in self.children:
-            score = child.ucb_score(pv, c_puct)
-            if score > best_score:
-                best_score = score
-                best_child = child
-        return best_child
+        """Vectorized PUCT select — numpy over all children, no Python loop."""
+        v = self.child_visits.astype(np.float32)
+        q = np.divide(self.child_values, v,
+                       out=np.zeros(self.n_children, dtype=np.float32),
+                       where=v > 0)
+        exploration = c_puct * self.child_priors * (self.visit_count ** 0.5) / (1.0 + v)
+        best_idx = int(np.argmax(q + exploration))
+
+        if self.child_nodes[best_idx] is None:
+            self.child_nodes[best_idx] = MCTSNode(
+                parent=self, parent_idx=best_idx,
+                action=int(self.child_actions[best_idx]),
+                prior=float(self.child_priors[best_idx]),
+            )
+        return self.child_nodes[best_idx]
 
     def expand(self, priors: np.ndarray, legal_mask: np.ndarray):
-        """Expand this node, creating children for each legal action.
-
-        priors: [action_size] softmax output from the policy head
-        legal_mask: [action_size] float mask (1=legal, 0=illegal)
-        """
+        """Expand: store children as numpy arrays. No child MCTSNode created."""
         masked = priors * legal_mask
         total = masked.sum()
         if total > 0:
-            masked /= total
+            masked *= (1.0 / total)
         else:
-            # fallback: uniform over legal
             masked = legal_mask.copy()
             total = masked.sum()
             if total > 0:
-                masked /= total
+                masked *= (1.0 / total)
 
-        for action in range(len(masked)):
-            if legal_mask[action] > 0:
-                self.children.append(MCTSNode(parent=self, action=action,
-                                              prior=float(masked[action])))
+        legal_indices = np.flatnonzero(legal_mask)
+        n = len(legal_indices)
+        self.n_children = n
+        self.child_actions = legal_indices.astype(np.int32)
+        self.child_priors = masked[legal_indices].astype(np.float32)
+        self.child_visits = np.zeros(n, dtype=np.int32)
+        self.child_values = np.zeros(n, dtype=np.float32)
+        self.child_nodes = [None] * n
         self.is_expanded = True
 
+    def _sync_to_parent(self):
+        """O(1) sync own stats to parent's arrays."""
+        if self.parent is not None and self.parent_idx >= 0:
+            self.parent.child_visits[self.parent_idx] = self.visit_count
+            self.parent.child_values[self.parent_idx] = self.value_sum
+
     def backup(self, value: float):
-        """Propagate value up the tree, alternating sign for opponent."""
+        """Propagate value up, alternating sign. O(1) parent sync per level."""
         node = self
         v = value
         while node is not None:
             node.visit_count += 1
             node.value_sum += v
-            v = -v  # flip for opponent's perspective
+            node._sync_to_parent()
+            v = -v
             node = node.parent
 
     def apply_virtual_loss(self, vl: float):
-        """Apply virtual loss during batched select to discourage path overlap."""
         self.visit_count += 1
         self.value_sum -= vl
+        self._sync_to_parent()
 
     def revert_virtual_loss(self, vl: float):
-        """Revert virtual loss before real backup."""
         self.visit_count -= 1
         self.value_sum += vl
+        self._sync_to_parent()
 
+
+# ── Serial MCTS (backward compat) ────────────────────────────────────────
 
 def mcts_search(
     root_state: Any,
@@ -106,42 +122,16 @@ def mcts_search(
     dirichlet_alpha: float = 0.03,
     dirichlet_frac: float = 0.25,
 ) -> np.ndarray:
-    """Run MCTS from the given state. Domain-agnostic.
-
-    Args:
-        root_state: opaque game state object
-        evaluate_fn: (state) -> (priors[action_size], value_for_current_player)
-        copy_fn: (state) -> deep copy of state
-        legal_mask_fn: (state) -> float mask[action_size] (1=legal)
-        apply_fn: (state, action_int) -> None (mutates state in-place)
-        terminal_fn: (state) -> bool
-        terminal_value_fn: (state) -> float value from last-mover's perspective
-            (+1.0 for win, -1.0 for loss, 0.0 for draw)
-        action_size: total number of possible actions
-        num_simulations: MCTS rollout count
-        c_puct: exploration constant
-        dirichlet_alpha: root noise alpha
-        dirichlet_frac: root noise mixing fraction
-
-    Returns:
-        visits: np.ndarray[action_size] — visit count distribution
-
-    Value convention:
-        node.value_sum stores value from the PARENT's player perspective.
-        select_child picks the child with highest Q (best for the selecting player).
-    """
+    """Serial MCTS (single-state evaluate). Kept for backward compat."""
     root = MCTSNode()
-
-    # Evaluate root
     legal_mask = legal_mask_fn(root_state)
     priors, root_value = evaluate_fn(root_state)
     root.expand(priors, legal_mask)
 
-    # Add Dirichlet noise to root for exploration diversity
-    if dirichlet_frac > 0 and root.children:
-        noise = np.random.dirichlet([dirichlet_alpha] * len(root.children))
-        for i, child in enumerate(root.children):
-            child.prior = (1 - dirichlet_frac) * child.prior + dirichlet_frac * noise[i]
+    if dirichlet_frac > 0 and root.n_children > 0:
+        noise = np.random.dirichlet([dirichlet_alpha] * root.n_children)
+        root.child_priors = ((1 - dirichlet_frac) * root.child_priors
+                             + dirichlet_frac * noise).astype(np.float32)
 
     root.visit_count = 1
     root.value_sum = root_value
@@ -149,33 +139,25 @@ def mcts_search(
     for _ in range(num_simulations):
         node = root
         sim_state = copy_fn(root_state)
-
-        # 1. Select — walk down the tree using PUCT
         while node.is_expanded and not terminal_fn(sim_state):
             node = node.select_child(c_puct)
             apply_fn(sim_state, node.action)
-
-        # 2. Expand + Evaluate
         if terminal_fn(sim_state):
-            # Terminal: value from last-mover's perspective (= parent's player).
             leaf_value = terminal_value_fn(sim_state)
         else:
             lm = legal_mask_fn(sim_state)
             p, v = evaluate_fn(sim_state)
-            # NN value is from current player's perspective at the expanded node.
-            # Current player = opponent of the parent's player → negate.
             leaf_value = -v
             node.expand(p, lm)
-
-        # 3. Backup — propagate leaf value up the tree
         node.backup(leaf_value)
 
-    # Build visit count distribution
     visits = np.zeros(action_size, dtype=np.float32)
-    for child in root.children:
-        visits[child.action] = child.visit_count
+    for i in range(root.n_children):
+        visits[root.child_actions[i]] = root.child_visits[i]
     return visits
 
+
+# ── Batched MCTS (single root) ───────────────────────────────────────────
 
 def mcts_search_batched(
     root_state: Any,
@@ -193,106 +175,65 @@ def mcts_search_batched(
     dirichlet_alpha: float = 0.03,
     dirichlet_frac: float = 0.25,
 ) -> np.ndarray:
-    """Batched MCTS — collects multiple leaf nodes per GPU call.
-
-    Uses virtual loss to diversify concurrent search paths, then evaluates
-    all leaves in a single batch call to the neural network. This increases
-    GPU utilization from ~5% (serial) to ~60-80% (batched).
-
-    Args:
-        evaluate_batch_fn: (list[state]) -> list[(priors, value)]
-            Batch version of evaluate_fn. Single call handles N states.
-        batch_size: number of concurrent search paths per GPU call.
-        virtual_loss: penalty applied during select to discourage path overlap.
-        (all other args identical to mcts_search)
-
-    Returns:
-        visits: np.ndarray[action_size] — visit count distribution
-    """
+    """Batched MCTS — collects batch_size leaf nodes per GPU call."""
     root = MCTSNode()
-
-    # Evaluate root (single state, wrap in list)
     legal_mask = legal_mask_fn(root_state)
-    results = evaluate_batch_fn([root_state])
-    root_priors, root_value = results[0]
-    root.expand(root_priors, legal_mask)
-
-    # Dirichlet noise on root
-    if dirichlet_frac > 0 and root.children:
-        noise = np.random.dirichlet([dirichlet_alpha] * len(root.children))
-        for i, child in enumerate(root.children):
-            child.prior = (1 - dirichlet_frac) * child.prior + dirichlet_frac * noise[i]
-
+    rp, rv = evaluate_batch_fn([root_state])[0]
+    root.expand(rp, legal_mask)
+    if dirichlet_frac > 0 and root.n_children > 0:
+        noise = np.random.dirichlet([dirichlet_alpha] * root.n_children)
+        root.child_priors = ((1 - dirichlet_frac) * root.child_priors
+                             + dirichlet_frac * noise).astype(np.float32)
     root.visit_count = 1
-    root.value_sum = root_value
+    root.value_sum = rv
 
     remaining = num_simulations
     while remaining > 0:
         batch_n = min(batch_size, remaining)
+        paths: list[list[MCTSNode]] = []
+        leaf_states: list[Any] = []
+        leaf_path_idx: list[int] = []
+        term_pairs: list[tuple[int, float]] = []
 
-        # Collect search paths, applying virtual loss along each path
-        search_paths: list[list[MCTSNode]] = []   # nodes visited per path
-        leaf_states: list[Any] = []                # states to evaluate
-        leaf_indices: list[int] = []               # which path index needs eval
-        terminal_pairs: list[tuple[int, float]] = []  # (path_idx, value)
-
-        for path_idx in range(batch_n):
+        for pi in range(batch_n):
             node = root
-            sim_state = copy_fn(root_state)
+            ss = copy_fn(root_state)
             path = [node]
-
-            # Select with virtual loss
-            while node.is_expanded and not terminal_fn(sim_state):
+            while node.is_expanded and not terminal_fn(ss):
                 node.apply_virtual_loss(virtual_loss)
                 node = node.select_child(c_puct)
-                apply_fn(sim_state, node.action)
+                apply_fn(ss, node.action)
                 path.append(node)
             node.apply_virtual_loss(virtual_loss)
-
-            search_paths.append(path)
-
-            if terminal_fn(sim_state):
-                terminal_pairs.append((path_idx, terminal_value_fn(sim_state)))
+            paths.append(path)
+            if terminal_fn(ss):
+                term_pairs.append((pi, terminal_value_fn(ss)))
             else:
-                leaf_states.append(sim_state)
-                leaf_indices.append(path_idx)
+                leaf_states.append(ss)
+                leaf_path_idx.append(pi)
 
-        # Batch evaluate all non-terminal leaves in one GPU call
-        if leaf_states:
-            eval_results = evaluate_batch_fn(leaf_states)
-        else:
-            eval_results = []
-
-        # Expand + backup non-terminal paths
-        for i, (state, (priors, value)) in enumerate(zip(leaf_states, eval_results)):
-            path_idx = leaf_indices[i]
-            path = search_paths[path_idx]
-            leaf_node = path[-1]
-
-            lm = legal_mask_fn(state)
-            leaf_node.expand(priors, lm)
-            leaf_value = -value  # negate: NN value is current player, we want parent's
-
-            # Revert virtual loss then backup
+        evals = evaluate_batch_fn(leaf_states) if leaf_states else []
+        for i, (p, v) in enumerate(evals):
+            path = paths[leaf_path_idx[i]]
+            leaf = path[-1]
+            leaf.expand(p, legal_mask_fn(leaf_states[i]))
             for n in path:
                 n.revert_virtual_loss(virtual_loss)
-            leaf_node.backup(leaf_value)
-
-        # Backup terminal paths
-        for path_idx, tv in terminal_pairs:
-            path = search_paths[path_idx]
+            leaf.backup(-v)
+        for pi, tv in term_pairs:
+            path = paths[pi]
             for n in path:
                 n.revert_virtual_loss(virtual_loss)
             path[-1].backup(tv)
-
         remaining -= batch_n
 
-    # Build visit count distribution
     visits = np.zeros(action_size, dtype=np.float32)
-    for child in root.children:
-        visits[child.action] = child.visit_count
+    for i in range(root.n_children):
+        visits[root.child_actions[i]] = root.child_visits[i]
     return visits
 
+
+# ── Multi-root MCTS (N trees, shared GPU) ────────────────────────────────
 
 def mcts_search_multi_root(
     root_states: list[Any],
@@ -304,109 +245,93 @@ def mcts_search_multi_root(
     terminal_value_fn: Callable[[Any], float],
     action_size: int,
     num_simulations: int,
+    sims_per_round: int = 4,
     virtual_loss: float = 3.0,
     c_puct: float = 1.5,
     dirichlet_alpha: float = 0.03,
     dirichlet_frac: float = 0.25,
 ) -> list[np.ndarray]:
-    """Multi-root MCTS — run N independent search trees sharing one GPU batch.
+    """Multi-root MCTS — N trees, K sims/tree/round, shared GPU batch.
 
-    Instead of calling mcts_search N times (each with its own small GPU batch),
-    this function interleaves simulations across all N trees and merges their
-    leaf evaluations into a single large GPU batch call.
-
-    For N=8 boards × 50 sims: ~50 GPU calls of batch ~8 each.
-    The key gain: ONE gpu call per simulation round across ALL boards,
-    not one per board per batch.
+    Each round: K sims per tree × N trees → up to K*N leaves in one GPU batch.
+    This reduces GPU round-trips from num_sims to num_sims/K while
+    keeping the same total search quality.
 
     Args:
-        root_states: list of N game states to search from
-        (all other args identical to mcts_search_batched)
-
-    Returns:
-        list of N visit distributions (np.ndarray[action_size])
+        sims_per_round: K — number of sims per tree per GPU batch round.
+            Higher K = fewer GPU calls but more virtual loss distortion.
+            Default 4 gives good balance: 50 sims / 4 = ~13 GPU calls
+            with batch size ~4*8=32 (vs 50 calls of batch 8).
     """
-    n_roots = len(root_states)
-    if n_roots == 0:
+    n = len(root_states)
+    if n == 0:
         return []
 
-    # Initialize all roots — batch evaluate them together
+    lms = [legal_mask_fn(s) for s in root_states]
+    init_results = evaluate_batch_fn(root_states)
     roots: list[MCTSNode] = []
-    legal_masks = [legal_mask_fn(s) for s in root_states]
-    root_results = evaluate_batch_fn(root_states)
+    for i in range(n):
+        r = MCTSNode()
+        p, v = init_results[i]
+        r.expand(p, lms[i])
+        if dirichlet_frac > 0 and r.n_children > 0:
+            noise = np.random.dirichlet([dirichlet_alpha] * r.n_children)
+            r.child_priors = ((1 - dirichlet_frac) * r.child_priors
+                              + dirichlet_frac * noise).astype(np.float32)
+        r.visit_count = 1
+        r.value_sum = v
+        roots.append(r)
 
-    for i in range(n_roots):
-        root = MCTSNode()
-        priors, value = root_results[i]
-        root.expand(priors, legal_masks[i])
-        if dirichlet_frac > 0 and root.children:
-            noise = np.random.dirichlet([dirichlet_alpha] * len(root.children))
-            for j, child in enumerate(root.children):
-                child.prior = (1 - dirichlet_frac) * child.prior + dirichlet_frac * noise[j]
-        root.visit_count = 1
-        root.value_sum = value
-        roots.append(root)
-
-    # Run simulations: one sim per tree per round, merge leaves across trees
-    for _ in range(num_simulations):
-        leaf_eval_indices: list[int] = []
-        leaf_eval_states: list[Any] = []
-        terminal_results: list[tuple[int, float]] = []
+    remaining = num_simulations
+    while remaining > 0:
+        k = min(sims_per_round, remaining)
+        leaf_items: list[tuple[int, int, Any]] = []  # (tree_idx, path_list_idx, state)
+        term_items: list[tuple[int, float]] = []      # (path_list_idx, value)
         all_paths: list[list[MCTSNode]] = []
 
-        for tree_idx in range(n_roots):
-            node = roots[tree_idx]
-            sim_state = copy_fn(root_states[tree_idx])
-            path = [node]
-
-            while node.is_expanded and not terminal_fn(sim_state):
+        # K sims per tree × N trees — collect all leaves
+        for _sim in range(k):
+            for ti in range(n):
+                node = roots[ti]
+                ss = copy_fn(root_states[ti])
+                path = [node]
+                while node.is_expanded and not terminal_fn(ss):
+                    node.apply_virtual_loss(virtual_loss)
+                    node = node.select_child(c_puct)
+                    apply_fn(ss, node.action)
+                    path.append(node)
                 node.apply_virtual_loss(virtual_loss)
-                node = node.select_child(c_puct)
-                apply_fn(sim_state, node.action)
-                path.append(node)
-            node.apply_virtual_loss(virtual_loss)
+                pi = len(all_paths)
+                all_paths.append(path)
+                if terminal_fn(ss):
+                    term_items.append((pi, terminal_value_fn(ss)))
+                else:
+                    leaf_items.append((ti, pi, ss))
 
-            all_paths.append(path)
+        # ONE GPU batch for all K*N leaves
+        if leaf_items:
+            leaf_states = [item[2] for item in leaf_items]
+            evals = evaluate_batch_fn(leaf_states)
+            for (ti, pi, ss), (p, v) in zip(leaf_items, evals):
+                path = all_paths[pi]
+                leaf = path[-1]
+                leaf.expand(p, legal_mask_fn(ss))
+                for nd in path:
+                    nd.revert_virtual_loss(virtual_loss)
+                leaf.backup(-v)
 
-            if terminal_fn(sim_state):
-                terminal_results.append((tree_idx, terminal_value_fn(sim_state)))
-            else:
-                leaf_eval_indices.append(tree_idx)
-                leaf_eval_states.append(sim_state)
-
-        # ONE GPU batch call for ALL trees' leaves this round
-        if leaf_eval_states:
-            eval_results = evaluate_batch_fn(leaf_eval_states)
-        else:
-            eval_results = []
-
-        # Expand + backup non-terminal leaves
-        for i, (priors, value) in enumerate(eval_results):
-            tree_idx = leaf_eval_indices[i]
-            path = all_paths[tree_idx]
-            leaf_node = path[-1]
-            sim_state = leaf_eval_states[i]
-
-            lm = legal_mask_fn(sim_state)
-            leaf_node.expand(priors, lm)
-            leaf_value = -value
-
-            for n in path:
-                n.revert_virtual_loss(virtual_loss)
-            leaf_node.backup(leaf_value)
-
-        # Backup terminal paths
-        for tree_idx, tv in terminal_results:
-            path = all_paths[tree_idx]
-            for n in path:
-                n.revert_virtual_loss(virtual_loss)
+        for pi, tv in term_items:
+            path = all_paths[pi]
+            for nd in path:
+                nd.revert_virtual_loss(virtual_loss)
             path[-1].backup(tv)
 
-    # Build visit distributions for all trees
-    all_visits = []
-    for root in roots:
-        visits = np.zeros(action_size, dtype=np.float32)
-        for child in root.children:
-            visits[child.action] = child.visit_count
-        all_visits.append(visits)
-    return all_visits
+        remaining -= k
+
+    out = []
+    for r in roots:
+        v = np.zeros(action_size, dtype=np.float32)
+        for i in range(r.n_children):
+            v[r.child_actions[i]] = r.child_visits[i]
+        out.append(v)
+    return out

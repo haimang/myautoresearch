@@ -453,6 +453,7 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
             terminal_value_fn=_terminal_value,
             action_size=BOARD_SIZE * BOARD_SIZE,
             num_simulations=mcts_sims,
+            sims_per_round=min(4, mcts_sims),  # K=4: ~13 GPU calls vs 50
             virtual_loss=MCTS_VIRTUAL_LOSS,
             c_puct=C_PUCT,
             dirichlet_alpha=DIRICHLET_ALPHA,
@@ -503,8 +504,10 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
             if board.is_terminal():
                 finished[board_idx] = True
 
-        # Periodic Metal cache cleanup
-        mx.clear_cache()
+        # Periodic Metal cache cleanup (every 10 rounds, not every round)
+        round_count = sum(1 for f in finished if not f)
+        if round_count == 0 or total_moves % 80 == 0:
+            mx.clear_cache()
 
     # Collect training data
     all_training_data = []
