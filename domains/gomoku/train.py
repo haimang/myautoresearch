@@ -1434,18 +1434,11 @@ def train(args):
         print(f"\nRunning final evaluation vs {opp_label} ({full_eval_games} games)...")
         tag = f"final_c{cycle:04d}"
 
-        if opponent_model is not None:
-            # NN vs NN: in-process eval
-            model.eval()
-            result = _in_process_eval(model, eval_level, full_eval_games,
-                                      opponent_model=opponent_model)
-        else:
-            # Minimax: subprocess eval
-            result = _subprocess_eval(
-                model_path, eval_level, full_eval_games, tag, run_id,
-                recording_dir=recording_dir,
-                num_blocks=num_blocks, num_filters=num_filters,
-            )
+        # Always in-process eval (subprocess has architecture mismatch bug)
+        model.eval()
+        result = _in_process_eval(model, eval_level, full_eval_games,
+                                  opponent_model=opponent_model)
+        mx.clear_cache()
         if result:
             final_wr = result.get("win_rate", final_wr)
             print(f"Final win_rate: {final_wr:.1%}")
@@ -1701,13 +1694,16 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
     opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
     log_event_fn(f"✓ Checkpoint {tag}  wr={win_rate:.1%}")
 
-    # Full eval: use in-process NN eval if opponent_model is set, else subprocess minimax
+    # Full eval: always in-process (subprocess has circular import issues with
+    # monkey-patched load_model — the architecture mismatch bug).
+    # Metal buffer safety: model.eval() + mx.clear_cache() after eval.
     elapsed = _time.time() - start_time
-    if opponent_model is not None:
+    if True:  # always in-process
         model.eval()
         result = _in_process_eval(model, eval_level, full_eval_games,
                                   opponent_model=opponent_model)
-    else:
+        mx.clear_cache()
+    if False:  # subprocess disabled — kept for reference
         result = _subprocess_eval(
             ckpt_path, eval_level, full_eval_games, tag, run_id,
             recording_dir=recording_dir,
