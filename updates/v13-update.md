@@ -381,3 +381,111 @@ cp output/tracker.db <共享路径>/v13_test.db
 | `updates/v13-update.md` | 本文件 + 工作日志回填 |
 
 主要工作量在训练执行（Mac 上运行）和 README 文档编写。代码改动量极小。
+
+---
+
+## 11. 工作日志
+
+> 执行者：Claude Opus 4.6  
+> 执行日期：2026-04-12
+
+### 11.1 代码改动
+
+**domains/gomoku/train.py** (+10 行)：
+1. 新增 `--mcts-batch N` CLI flag — 控制 `sims_per_round`（每棵树每 GPU 轮的模拟数）
+2. MCTS 启用时自动设置 `MCTS_BATCH_SIZE = min(8, mcts_sims)`（之前硬编码 4）
+3. 用户可通过 `--mcts-batch 16` 手动覆盖，增大 GPU batch（32 盘 x 16 sims = batch 512）
+
+**README.md**（全面重写，268 行）：
+- 新增：MCTS 训练完整指南（命令、参数、示例）
+- 新增：对手注册流程（register → list → eval → train）
+- 新增：所有 analyze 命令（--stagnation, --pareto, --compare-by-steps）
+- 新增：模型容量参考表（6x64 → 8x128）
+- 新增：早停机制说明
+- 更新：目录结构（framework/core/ 层）
+- 更新：参数参考表（含所有 MCTS 参数）
+
+### 11.2 Mac 测试命令
+
+**命令 1：创建 8x64 MCTS 模型（900 秒，pg=32）**
+
+```bash
+uv run python domains/gomoku/train.py \
+  --mcts-sims 50 --parallel-games 32 --mcts-batch 8 \
+  --num-blocks 8 --num-filters 64 \
+  --time-budget 900 \
+  --no-eval-opponent --eval-interval 5 --probe-games 50 \
+  --seed 42
+```
+
+说明：
+- `--mcts-sims 50`：每步 50 次 MCTS 搜索
+- `--parallel-games 32`：32 盘并行（GPU batch = 8x32=256，最大化 GPU 利用率）
+- `--mcts-batch 8`：每棵树每轮 8 次模拟（比默认更激进，减少 GPU 调用次数）
+- `--num-blocks 8 --num-filters 64`：8x64 架构（713K 参数）
+- `--time-budget 900`：15 分钟训练
+- `--no-eval-opponent`：仅用 minimax L0 做 probe eval
+- `--seed 42`：可复现
+
+**命令 2：注册该模型为 S0 对手**
+
+训练完成后，查看 run ID 和最佳 checkpoint：
+```bash
+uv run python framework/analyze.py --runs
+# 找到刚完成的 run ID（最新的一条）
+
+# 查看该 run 的 checkpoints
+uv run python framework/analyze.py --best
+```
+
+注册：
+```bash
+uv run python domains/gomoku/train.py \
+  --register-opponent S0 \
+  --from-run <run_id> \
+  --from-tag <最佳checkpoint的tag> \
+  --description "8x64 MCTS-50, vs L0"
+```
+
+验证：
+```bash
+uv run python domains/gomoku/play.py --list-opponents
+```
+
+**命令 3：使用 S0 作为 eval 对手，进行新 MCTS 训练**
+
+```bash
+uv run python domains/gomoku/train.py \
+  --mcts-sims 50 --parallel-games 32 --mcts-batch 8 \
+  --num-blocks 8 --num-filters 64 \
+  --time-budget 1800 \
+  --eval-opponent S0 --eval-level 1 \
+  --eval-interval 5 --probe-games 50 \
+  --auto-stop-stagnation \
+  --seed 42
+```
+
+说明：
+- `--eval-opponent S0`：probe eval 使用 S0（注册的 NN 对手）
+- `--eval-level 1`：checkpoint full eval 使用 minimax L1（depth 2）
+- `--auto-stop-stagnation`：WR 停滞时自动停止
+- 其余参数同命令 1
+
+### 11.3 分析命令
+
+```bash
+# 训练后查看所有 run
+uv run python framework/analyze.py --runs
+
+# 对比两个 run（按步数归一化）
+uv run python framework/analyze.py --compare-by-steps <run1> <run2>
+
+# 停滞检测
+uv run python framework/analyze.py --stagnation <run_id>
+
+# Pareto 前沿
+uv run python framework/analyze.py --pareto
+
+# 带回 DB 到开发机分析
+cp output/tracker.db <共享路径>/v13_test.db
+```

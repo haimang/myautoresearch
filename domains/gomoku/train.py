@@ -453,7 +453,7 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
             terminal_value_fn=_terminal_value,
             action_size=BOARD_SIZE * BOARD_SIZE,
             num_simulations=mcts_sims,
-            sims_per_round=min(4, mcts_sims),  # K=4: ~13 GPU calls vs 50
+            sims_per_round=MCTS_BATCH_SIZE,
             virtual_loss=MCTS_VIRTUAL_LOSS,
             c_puct=C_PUCT,
             dirichlet_alpha=DIRICHLET_ALPHA,
@@ -831,13 +831,18 @@ def train(args):
     mcts_sims = args.mcts_sims
     c_puct_val = args.c_puct
     dirichlet_alpha_val = args.dirichlet_alpha
+    mcts_batch = args.mcts_batch  # sims_per_round override
     auto_stop_stagnation = args.auto_stop_stagnation
     stagnation_window = args.stagnation_window
 
     # Apply MCTS settings to module-level constants so run_self_play sees them
-    global MCTS_SIMULATIONS, C_PUCT, DIRICHLET_ALPHA
+    global MCTS_SIMULATIONS, C_PUCT, DIRICHLET_ALPHA, MCTS_BATCH_SIZE
     MCTS_SIMULATIONS = mcts_sims
     C_PUCT = c_puct_val
+    if mcts_batch is not None:
+        MCTS_BATCH_SIZE = mcts_batch
+    elif mcts_sims > 0:
+        MCTS_BATCH_SIZE = min(8, mcts_sims)
     DIRICHLET_ALPHA = dirichlet_alpha_val
 
     # Handle --no-eval-opponent: override to disable NN opponent
@@ -1776,6 +1781,8 @@ def parse_args() -> argparse.Namespace:
                    help=f"MCTS exploration constant (default: {C_PUCT})")
     p.add_argument("--dirichlet-alpha", type=float, default=DIRICHLET_ALPHA,
                    help=f"Dirichlet noise alpha for MCTS root (default: {DIRICHLET_ALPHA})")
+    p.add_argument("--mcts-batch", type=int, default=None,
+                   help="Sims per tree per GPU batch round (default: auto = min(8, mcts-sims))")
     # Reproducibility
     p.add_argument("--seed", type=int, default=None,
                    help="Random seed for reproducibility (default: None = non-deterministic)")
