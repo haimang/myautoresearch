@@ -40,6 +40,16 @@ class CreateSessionRequest(BaseModel):
     mctsSims: int = Field(default=0, ge=0, le=800)
 
 
+class CreateAutoSessionRequest(BaseModel):
+    """AI vs AI auto-play session."""
+    blackType: str = Field(..., pattern="^(nn|minimax)$")
+    blackId: str
+    blackMcts: int = Field(default=50, ge=0, le=800)
+    whiteType: str = Field(..., pattern="^(nn|minimax)$")
+    whiteId: str
+    whiteMcts: int = Field(default=50, ge=0, le=800)
+
+
 class MoveRequest(BaseModel):
     row: int
     col: int
@@ -49,11 +59,12 @@ class MoveRequest(BaseModel):
 class GameSession:
     session_id: str
     opponent: dict
-    human_color: int
+    human_color: int          # 0 = AI vs AI (no human)
     black_fn: Optional[callable]
     white_fn: Optional[callable]
     board: Board
     mcts_sims: int = 0
+    is_auto: bool = False     # True = AI vs AI mode
 
 
 app = FastAPI(title="MAG Gomoku Web")
@@ -88,7 +99,9 @@ def _winner_name(winner: int) -> Optional[str]:
 def _serialize_session(session: GameSession) -> dict:
     board = session.board
     human_can_move = (
-        board.winner == 0 and board.current_player == session.human_color
+        not session.is_auto
+        and board.winner == 0
+        and board.current_player == session.human_color
     )
     moves = [
         {
@@ -121,6 +134,7 @@ def _serialize_session(session: GameSession) -> dict:
         "opponent": session.opponent,
         "canHumanMove": human_can_move,
         "aiThinking": False,
+        "isAuto": session.is_auto,
     }
 
 
@@ -177,6 +191,55 @@ def create_session(req: CreateSessionRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     with _session_lock:
         _sessions[session.session_id] = session
+    return _serialize_session(session)
+
+
+@app.post("/api/session/auto")
+def create_auto_session(req: CreateAutoSessionRequest):
+    """Create an AI vs AI session. Use /api/session/{id}/step to advance."""
+    try:
+        black_fn, black_meta = create_player(req.blackType, req.blackId,
+                                              mcts_sims=req.blackMcts)
+        white_fn, white_meta = create_player(req.whiteType, req.whiteId,
+                                              mcts_sims=req.whiteMcts)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    session = GameSession(
+        session_id=str(uuid.uuid4()),
+        opponent={"black": black_meta, "white": white_meta},
+        human_color=0,  # no human
+        black_fn=black_fn,
+        white_fn=white_fn,
+        board=Board(),
+        mcts_sims=0,
+        is_auto=True,
+    )
+    with _session_lock:
+        _sessions[session.session_id] = session
+    return _serialize_session(session)
+
+
+@app.post("/api/session/{session_id}/step")
+def step_auto(session_id: str):
+    """Advance an AI vs AI game by one move. Call repeatedly to animate."""
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not session.is_auto:
+        raise HTTPException(status_code=400, detail="Not an auto-play session")
+    board = session.board
+    if board.winner != 0:
+        return _serialize_session(session)
+    player_fn = session.black_fn if board.current_player == BLACK else session.white_fn
+    if player_fn is None:
+        raise HTTPException(status_code=500, detail="Missing player function")
+    try:
+        row, col = player_fn(board)
+        if not board.place(row, col):
+            raise RuntimeError(f"AI illegal move ({row}, {col})")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return _serialize_session(session)
 
 

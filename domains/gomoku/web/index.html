@@ -14,32 +14,75 @@
       <p class="lede">直接在浏览器里与任意已注册 opponent 或 minimax 对弈。</p>
 
       <label class="field">
-        <span>Opponent</span>
-        <select id="opponent-select"></select>
-      </label>
-
-      <label class="field">
-        <span>Your Color</span>
-        <select id="color-select">
-          <option value="black">Black</option>
-          <option value="white">White</option>
+        <span>Mode</span>
+        <select id="mode-select">
+          <option value="human">Human vs AI</option>
+          <option value="auto">AI vs AI (watch)</option>
         </select>
       </label>
 
-      <label class="field">
-        <span>MCTS Sims</span>
-        <select id="mcts-select">
-          <option value="0">Off (pure network)</option>
-          <option value="25">25 (fast)</option>
-          <option value="50" selected>50 (balanced)</option>
-          <option value="100">100 (strong)</option>
-          <option value="200">200 (slow but strongest)</option>
-        </select>
-      </label>
+      <!-- Human vs AI controls -->
+      <div id="human-controls">
+        <label class="field">
+          <span>Opponent</span>
+          <select id="opponent-select"></select>
+        </label>
+        <label class="field">
+          <span>Your Color</span>
+          <select id="color-select">
+            <option value="black">Black</option>
+            <option value="white">White</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>MCTS Sims</span>
+          <select id="mcts-select">
+            <option value="0">Off (pure network)</option>
+            <option value="25">25 (fast)</option>
+            <option value="50" selected>50 (balanced)</option>
+            <option value="100">100 (strong)</option>
+            <option value="200">200 (slow)</option>
+          </select>
+        </label>
+      </div>
+
+      <!-- AI vs AI controls -->
+      <div id="auto-controls" style="display:none">
+        <label class="field">
+          <span>Black AI</span>
+          <select id="black-select"></select>
+        </label>
+        <label class="field">
+          <span>Black MCTS</span>
+          <select id="black-mcts">
+            <option value="0">Off</option>
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>White AI</span>
+          <select id="white-select"></select>
+        </label>
+        <label class="field">
+          <span>White MCTS</span>
+          <select id="white-mcts">
+            <option value="0">Off</option>
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+        </label>
+      </div>
 
       <div class="actions">
         <button id="start-button" class="primary">Start New Game</button>
         <button id="reset-button">Reset Current Game</button>
+        <button id="step-button" style="display:none">Step (1 move)</button>
+        <button id="autoplay-button" style="display:none">Auto Play ▶</button>
       </div>
 
       <div class="status-block">
