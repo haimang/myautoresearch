@@ -54,6 +54,8 @@ INPUT_CHANNELS = 3       # <<<DOMAIN>>> 编码通道数
 
 # <<<DOMAIN>>> — 替换为你的领域评估导入:
 #   from prepare import evaluate_win_rate, TIME_BUDGET
+# NOTE: framework 评估模板已重命名为 prepare_template.py（v15.4），
+# 避免与 domains/<name>/prepare.py 同名冲突。
 TIME_BUDGET = 300  # 5 分钟默认
 
 

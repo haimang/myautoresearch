@@ -392,7 +392,8 @@ MCTS_VIRTUAL_LOSS = 3.0   # virtual loss for batched search path diversification
 def mcts_search(board, model, num_simulations: int,
                 c_puct: float = C_PUCT,
                 dirichlet_alpha: float = DIRICHLET_ALPHA,
-                dirichlet_frac: float = DIRICHLET_FRAC) -> np.ndarray:
+                dirichlet_frac: float = DIRICHLET_FRAC,
+                _compiled_forward=None) -> np.ndarray:
     """Run batched MCTS from the given Gomoku board state.
 
     Uses framework/core/mcts.mcts_search_batched() with virtual loss for
@@ -400,13 +401,20 @@ def mcts_search(board, model, num_simulations: int,
 
     Returns a [225] visit count distribution (unnormalized).
     """
+    fwd = _compiled_forward or model
+
     def _evaluate_batch(states):
         """Batch evaluate multiple board states in one MLX forward pass."""
         encodings = np.stack([s.encode() for s in states])  # [B, 3, 15, 15]
         enc_mx = mx.array(encodings)
-        logits, values = model(enc_mx)
-        mx.eval(logits, values)
-        priors_all = np.array(mx.softmax(logits, axis=-1))  # [B, 225]
+        if _compiled_forward is not None:
+            priors, values = fwd(enc_mx)
+            mx.eval(priors, values)
+            priors_all = np.array(priors)
+        else:
+            logits, values = fwd(enc_mx)
+            mx.eval(logits, values)
+            priors_all = np.array(mx.softmax(logits, axis=-1))  # [B, 225]
         values_np = np.array(values).flatten()               # [B]
         return [(priors_all[i], float(values_np[i])) for i in range(len(states))]
 
@@ -453,6 +461,13 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
 
     model.eval()
 
+    # v15.4: compile forward pass for ~15-20% inference speedup.
+    # Safe because model is in eval mode (no BatchNorm state mutation).
+    def _raw_forward(x):
+        logits, values = model(x)
+        return mx.softmax(logits, axis=-1), values
+    _compiled_forward = mx.compile(_raw_forward)
+
     # Intra-search MLX cache release counter. mx.clear_cache() is cheap
     # (~10μs) but calling it on every single forward is still wasteful for
     # small MCTS batches. Every 8 forwards is the sweet spot: keeps the
@@ -466,9 +481,9 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
             return []
         encodings = np.stack([s.encode() for s in states])
         enc_mx = mx.array(encodings)
-        logits, values = model(enc_mx)
-        mx.eval(logits, values)
-        priors_all = np.array(mx.softmax(logits, axis=-1))
+        priors, values = _compiled_forward(enc_mx)
+        mx.eval(priors, values)
+        priors_all = np.array(priors)
         values_np = np.array(values).flatten()
         _ebc[0] += 1
         if _ebc[0] % 8 == 0:
@@ -1551,13 +1566,17 @@ def train(args):
     # v15.2: also log the minimax backend so users can confirm the C minimax
     # is actually loaded on Mac (not silently falling back to Python).
     try:
-        from prepare import MINIMAX_BACKEND as _mm_backend
+        import prepare as _prepare_mod
+        _mm_backend = getattr(_prepare_mod, "MINIMAX_BACKEND", "?")
+        _prepare_file = _prepare_mod.__file__
     except Exception:
         _mm_backend = "?"
+        _prepare_file = "?"
     _log_event(f"Started run {run_id_short} | {num_params/1000:.1f}K params"
                + (f" | budget {time_budget}s" if time_budget else "")
                + (f" | MCTS {mcts_sims}sims [{mcts_backend}]" if mcts_sims > 0 else "")
                + f" | minimax [{_mm_backend}]")
+    _log_event(f"prepare.py → {_prepare_file}")
 
     # Show TUI immediately so user sees something before first cycle
     _update_tui()
@@ -2111,6 +2130,11 @@ def _in_process_eval(model, level: int, n_games: int,
     start = _time.time()
     nn_call_count = 0
 
+    # v15.4: compiled forward for eval NN (model is in eval mode)
+    def _fwd(x):
+        return model(x)
+    _compiled_fwd = mx.compile(_fwd)
+
     while True:
         # Mark newly-terminal games
         for i in range(n_games):
@@ -2136,7 +2160,7 @@ def _in_process_eval(model, level: int, n_games: int,
         if nn_turn_idx:
             encodings = np.stack([boards[i].encode() for i in nn_turn_idx])
             x = mx.array(encodings)
-            policy_logits, _ = model(x)
+            policy_logits, _ = _compiled_fwd(x)
             mx.eval(policy_logits)
             policy_np = np.array(policy_logits)  # [B, 225]
             for k, i in enumerate(nn_turn_idx):

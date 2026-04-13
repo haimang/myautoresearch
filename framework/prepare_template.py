@@ -1,6 +1,9 @@
 """
 autoresearch 评估模板 — 对手体系与基准测试。
 
+v15.4 重命名: prepare.py → prepare_template.py
+避免与 domains/<name>/prepare.py 同名导致 sys.path 优先级 bug。
+
 这是评估模块的框架根副本，定义了 autoresearch 评估系统的标准结构：
 
     对手（分级难度） → 评估框架 → 指标与归档

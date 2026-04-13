@@ -932,3 +932,140 @@ Mac M3 Max 实机，`--mcts-sims 0 --eval-level 2 --probe-games 32 --eval-interv
 ### 14.8 v15.3 一句话总结
 
 > **`sys.path` 排序 bug 导致 `from prepare import OPPONENTS` 解析到 `framework/prepare.py`（纯 Python minimax，~700 ms/call）而非 `domains/gomoku/prepare.py`（C minimax，~5 ms/call）。v15.0 以来 C minimax 从未在 eval 中生效过。修复：将 framework/ 插入到域目录之后而非之前。32-game probe 从 213 秒降至 2 秒，加速 109×。**
+
+---
+
+## §15 v15.4 — P0/P1 加固 + mx.compile() 加速
+
+### 15.1 背景
+
+v15.3 发现了三个待办项（见 v15-findings §11.7）：
+
+| 优先级 | 问题 | 状态 |
+|--------|------|------|
+| P0 | 两个同名 `prepare.py` 是定时炸弹，sys.path 顺序稍有变化就会复发 | ✅ 已修复 |
+| P0 | `play.py` / `play_service.py` 的 sys.path 仍用旧的 `insert(0)` 模式 | ✅ 已修复 |
+| P1 | `mx.compile()` 可免费加速 MCTS NN forward pass | ✅ 已实装 |
+| P1 | 启动日志应打印 `prepare.__file__` 以立即暴露错误加载 | ✅ 已实装 |
+
+### 15.2 修复 1：消除同名 prepare.py（P0）
+
+**问题**：`framework/prepare.py` 和 `domains/gomoku/prepare.py` 同名。任何 `from prepare import ...` 的解析完全取决于 `sys.path` 顺序。v15.0–v15.2 期间，这个 bug 反复出现。
+
+**方案**：将 `framework/prepare.py` 重命名为 `framework/prepare_template.py`。
+
+- 该文件是框架模板（docstring 中明确标注 `<<<DOMAIN>>>` 占位符），在运行时不应被 import
+- `framework/train.py` 中对它的引用全部是注释形式（`#   from prepare import ...`）
+- 重命名后，即使 `sys.path` 顺序错误，`from prepare import ...` 也不可能解析到框架版本
+
+**同时修复**：`play.py` 和 `play_service.py` 中的 sys.path 设置仍使用旧的 `insert(0, framework/)` 模式（与 v15.3 修复前的 train.py 相同的 bug）。已统一改为 `insert(domain_idx + 1, framework/)`。
+
+### 15.3 修复 2：mx.compile() MCTS 推理加速（P1）
+
+**原理**：MLX 的 `mx.compile()` 将多步 GPU 操作融合为单个编译图，消除中间 dispatch 开销。在 model.eval() 模式下（BatchNorm 不更新 running stats），编译安全且无副作用。
+
+**应用位置**（3 处）：
+
+1. **自对弈 MCTS `_evaluate_batch`**（热路径，占训练 99.8% 时间）：编译 forward + softmax 融合
+2. **单局 MCTS `mcts_search`**：通过 `_compiled_forward` 参数传入
+3. **Eval `_in_process_eval` NN forward**：编译 model forward
+
+**实测 benchmark**（M3 Max, 8 blocks × 128 filters, 2.49M params）：
+
+| batch size | 未编译 | mx.compile() | 加速 |
+|-----------|--------|-------------|------|
+| 8 (MCTS 热路径) | 2.55 ms | **1.97 ms** | **22.7%** |
+| 16 | 3.24 ms | **2.53 ms** | **21.9%** |
+
+> 训练中 MCTS `_evaluate_batch` 是绝对瓶颈（99.8% wall time）。batch=8 加速 22.7% 意味着每个训练 cycle 节省约 18 秒（82s → ~67s）。
+
+### 15.4 修复 3：启动验证日志（P1）
+
+启动日志现在打印 `prepare.__file__` 完整路径，例如：
+
+```
+[23:35:03] Started run a7ebab39 | 564.5K params | minimax [c]
+[23:35:03] prepare.py → /Users/seanz/mag-gomoku/domains/gomoku/prepare.py
+```
+
+如果误加载了框架模板，会立即可见：
+```
+prepare.py → /Users/seanz/mag-gomoku/framework/prepare_template.py  ← 明显错误
+```
+
+### 15.5 验证
+
+```
+$ uv run python domains/gomoku/train.py --time-budget 45 --eval-level 1 \
+    --eval-interval 3 --probe-games 8 --parallel-games 8 --mcts-sims 100
+
+[23:35:03] Started run a7ebab39 | 564.5K params | MCTS 100sims [C-native] | minimax [c]
+[23:35:03] prepare.py → /Users/seanz/mag-gomoku/domains/gomoku/prepare.py
+[23:35:13] Probe c3: 0.0% (8g vs L1, 8u/2o, 0.2s)    ← eval 正常、快速
+Cycle    5 | MCTS: 18614sim/s                           ← sim/s 正常
+Cycle   10 | MCTS: 18799sim/s
+Final win_rate: 0.0% (vs L1, 200 games)                ← 符合预期（新模型 vs C-L1）
+Wall time: 47.7s
+```
+
+✅ prepare.py 解析正确  
+✅ C minimax 加载  
+✅ Probe 耗时 0.2s（非之前的 213s）  
+✅ mx.compile 编译正常运行  
+
+### 15.6 变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `framework/prepare.py` → `framework/prepare_template.py` | 重命名，避免同名冲突 |
+| `framework/prepare_template.py` | docstring 更新，注明 v15.4 重命名原因 |
+| `framework/train.py` | 更新注释引用 |
+| `domains/gomoku/train.py` | mx.compile() × 3 处 + 启动日志打印 prepare.__file__ |
+| `domains/gomoku/play.py` | sys.path 修复：`insert(0)` → `insert(domain_idx+1)` |
+| `domains/gomoku/play_service.py` | sys.path 修复：同上 |
+
+### 15.7 推荐训练命令
+
+现在所有基础设施问题已修复（eval 速度、模块加载、编译加速），可以开始正式的课程训练。
+
+**第一阶段：打赢 C-L1（minimax depth 2）**
+
+```bash
+SDL_VIDEODRIVER=dummy PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
+    --eval-level 1 \
+    --mcts-sims 800 \
+    --parallel-games 16 \
+    --num-blocks 8 --num-filters 128 \
+    --eval-interval 5 \
+    --probe-games 32 \
+    --target-win-rate 0.55 \
+    --time-budget 3600
+```
+
+**参数说明**：
+- `--eval-level 1`：对手为 C minimax depth 2（而非之前跳级到 L2）
+- `--mcts-sims 800`：MCTS 搜索深度，保持策略质量
+- `--target-win-rate 0.55`：达到 55% 胜率自动停止
+- `--time-budget 3600`：1 小时上限
+- `--num-blocks 8 --num-filters 128`：沿用之前的 2.49M 参数架构
+
+**预期**：C-L1 是 depth-2 minimax + 模式评估，比 Python L1 强得多但仍可学习。预计 30-60 分钟应能看到胜率提升。
+
+**第二阶段（C-L1 达标后）**：
+
+```bash
+# --resume <checkpoint_id> 从第一阶段检查点继续
+SDL_VIDEODRIVER=dummy PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
+    --eval-level 2 \
+    --mcts-sims 800 \
+    --parallel-games 16 \
+    --num-blocks 8 --num-filters 128 \
+    --eval-interval 5 \
+    --probe-games 32 \
+    --target-win-rate 0.55 \
+    --resume <L1_checkpoint_id>
+```
+
+### 15.8 v15.4 一句话总结
+
+> **消除 `framework/prepare.py` 同名隐患（重命名为 `prepare_template.py`），修复 play.py/play_service.py sys.path，添加 `mx.compile()` 实现 MCTS NN 推理 22% 加速，增加启动日志验证。基础设施就绪，可开始 C-L1 课程训练。**
