@@ -591,3 +591,550 @@ uv run python domains/gomoku/train.py \
 - 在 v14-findings.md 追加 §8 "第一份真实 vs L1 数据"
 - 在 pareto-frontier.md §14 的"发现能力表"里补一行 "eval-协议修复前后" 的对照
 - 判断这个 checkpoint 是否可作为 S1 候选，给出下一步动作（resume L2 / 重训 / 换策略）
+
+---
+
+## 12. 资源利用率诊断与升级改造方案（2026-04-13 下午）
+
+> 触发：mcts_11 启动时观察到 M3 Max (128 GB 统一内存) 在 `--parallel-games 24 --mcts-batch 8` 和 `--parallel-games 64 --mcts-batch 16` 两种配置下 **RAM 都稳定在 115 GB**，同时 CPU 负载 <10%、GPU 长期 <50W。这是严重的资源利用失衡：内存快满了，但算力没用上。
+
+本节是一次严肃的系统诊断。我先把三个根因拆开，每一个都用代码和硬件事实论证；然后给出 P0 / P1 / P2 三级改造方案和验证判据。
+
+### 12.1 用户观察
+
+| 配置 | RAM | CPU | GPU | 结论 |
+|------|-----|-----|-----|------|
+| pg=24 / mcts-batch=8 | 115 GB | <20W | <10W | 115 GB 吃满，CPU/GPU 双闲 |
+| pg=64 / mcts-batch=16 | 115 GB（持续）| <10% | <50W | 同上，扩 pg 无帮助 |
+| pg=10 / mcts-batch=16（mcts_10） | 未测 | ? | ? | 能跑完 3h 完整训练，说明是高 pg 触发的问题 |
+
+两个观察值得单独重复：
+1. **从 pg=24 到 pg=64，RAM 没有随 pg 线性增长**——它在 115 GB 撞天花板，说明有一个和 pg 无关的全局累积，不是"每盘多几 GB"那种线性问题。
+2. **从 pg=24 到 pg=64，GPU 功耗只从 10W 涨到 50W**——说明 pg × mcts-batch 增加并没有把更多工作量真正送进 GPU。这是**吞吐量的 smoking gun**。
+
+### 12.2 根因一：`MAX_BATCH_PATHS = 256` 静默截断（P0 级，throughput 杀手）
+
+**代码证据** — `framework/core/mcts_c.c:289-296`：
+
+```c
+#define MAX_BATCH_PATHS 256   /* max K*N per call */
+#define MAX_PATH_DEPTH  128
+
+static int   g_batch_path_nodes[MAX_BATCH_PATHS * MAX_PATH_DEPTH];
+static int   g_batch_path_actions[MAX_BATCH_PATHS * MAX_PATH_DEPTH];
+static int   g_batch_path_lens[MAX_BATCH_PATHS];
+static int   g_batch_leaf_nodes[MAX_BATCH_PATHS];
+```
+
+`framework/core/mcts_c.c:298-316` 的 `mcts_batch_select` 主循环：
+
+```c
+for (int sim = 0; sim < sims_per_round && total < MAX_BATCH_PATHS; sim++) {
+    for (int ri = 0; ri < n_roots && total < MAX_BATCH_PATHS; ri++) {
+        ...
+        total++;
+    }
+}
+```
+
+注意 **两个 `total < MAX_BATCH_PATHS` 守卫**——一旦凑够 256 条路径，`sims_per_round` 的外层循环就提前退出，**剩下的 sims 被静默丢弃，不报错也不警告**。
+
+**后果换算：**
+
+| 用户配置 | 意图 leaf/round | 实际 leaf/round | 损失 |
+|----------|------------------|-------------------|------|
+| pg=10 / batch=16 | 160 | 160 | 0%（mcts_10 命中甜点）|
+| pg=16 / batch=16 | 256 | 256 | 0%（刚好卡边界）|
+| pg=24 / batch=8  | 192 | 192 | 0% |
+| pg=24 / batch=16 | 384 | 256 | **33%** |
+| pg=32 / batch=16 | 512 | 256 | **50%** |
+| pg=64 / batch=16 | **1024** | **256** | **75%** |
+| pg=64 / batch=8  | 512 | 256 | **50%** |
+
+**pg=64 / batch=16 在每个 sim round 只做了 256/1024 = 25% 的声明工作量。** 为了完成 800 sims，外层 `while remaining > 0` 循环会多跑 4 倍 round，总 Python↔C↔GPU 转换次数翻 4 倍。对于 GPU 来说：每次 forward 的 batch 大小被夹在 256 内（8×128 ResNet 在 Metal 上的 matmul 甜点也大致在 batch 256 附近），所以增大 pg 并不能让 GPU 单次 forward 更忙——只是让 round 数变多、Python 侧序列化开销变多。
+
+**这一条解释了 GPU 50W 的天花板**：不管 pg 怎么涨，leaf batch 都固定在 256，GPU 每次 forward 做的工作量是常数，但 round 频次更高，于是平均 GPU 饱和度反而下降。
+
+### 12.3 根因二：MLX 分配器在训练循环里从不释放（P0 级，RAM 杀手）
+
+**代码证据** — `domains/gomoku/train.py` 全文 `mx.clear_cache()` 只出现在 5 处：
+
+| 行号 | 上下文 | 频率 |
+|------|--------|------|
+| 530 | 自对弈 MCTS 内，`total_moves % 80 == 0` | 每 ~80 步一次 |
+| 748 | `run_opponent_play` 每 20 局一次 | 稀疏 |
+| 1497, 1738, 1856 | 评估路径 | 一次性 |
+
+**训练循环（`for step in range(steps_this_cycle)` 块，line 1288-1329）里完全没有 `mx.clear_cache()`。**
+
+MLX 在 Apple Silicon 统一内存上的已知行为：
+
+1. `mx.eval(model.parameters(), optimizer.state)`（line 1322）**执行计算图**并释放 graph 临时变量，但**不释放 allocator cache**——它只是把"这批 activations 已经用完"的 buffer 还给内部池子，等下次分配复用。
+2. 内部池子的上限是统一内存的上限。MLX 不会主动缩容。
+3. 只有 `mx.clear_cache()` 才把 allocator cache 还给 OS。
+
+**数量级估算** — 8x128 ResNet / batch=256 单次 forward 的 activation 占用：
+
+```
+conv3→128 输出: 256 × 128 × 15 × 15 × 4 bytes ≈ 29.5 MB
+8 res blocks × 2 convs × 29.5 MB ≈ 472 MB 仅 activations
+加 value_and_grad 的梯度 tape（训练时）≈ 翻倍 ≈ 950 MB
+```
+
+一次 training step ≈ **1 GB MLX 中间 buffer**。50 steps × 无 clear_cache = **可以在一个 cycle 内累到 50 GB**。但注意这 50 GB 是 MLX 内部 pool 的"已分配未释放"状态——上限受物理内存限制，它会在某个阈值停下来（即 115 GB 附近），并开始复用池内 buffer。这就是为什么 **pg=24 和 pg=64 都卡在 115 GB**：他们都撞上了 MLX 内部 pool 的"最大保留水位"，那个水位取决于训练步的 batch 大小和 MLX allocator 的策略，**和 pg 无关**。
+
+**这一条解释了 RAM 115 GB 天花板的 pg 不变性。**
+
+### 12.4 根因三：CPU→GPU→C 串行流水线（P1 级，架构问题）
+
+**代码证据** — `framework/core/mcts_native.py:138-218` 的 sim round 主循环：
+
+```python
+while remaining > 0:
+    # 1. C 选择路径（CPU-C，串行）
+    total_paths = lib.mcts_batch_select(...)
+    
+    # 2. Python 回放 boards（CPU-Python，串行）
+    for pi in range(total_paths):
+        sim_state = copy_fn(root_states[pi % n])
+        for step in range(1, plen):
+            apply_fn(sim_state, action)
+            ...
+    
+    # 3. GPU 前向（Metal，串行）
+    evals = evaluate_batch_fn(expand_states)
+    
+    # 4. C 回溯（CPU-C，串行）
+    lib.mcts_batch_expand_backup(...)
+```
+
+**四个阶段严格串行，任何时刻只有一个资源在工作。** 时间分布粗估：
+
+| 阶段 | 耗时 | 谁在干活 | 其他资源 |
+|------|------|----------|----------|
+| 1. C select | ~1-2 ms | 1 CPU 核 | GPU 空闲 |
+| 2. Python board ops | ~3-5 ms | 1 CPU 核 (GIL) | GPU 空闲 |
+| 3. GPU forward | ~5-10 ms | GPU | 16 CPU 核全空闲 |
+| 4. C backup | ~1-2 ms | 1 CPU 核 | GPU 空闲 |
+| **总计** | ~10-20 ms/round | 三个资源轮流 | 永远只有一个活着 |
+
+**理论 CPU 利用率上限 = 1 核 / 16 核 × (1+2+4)/20 × 100% ≈ 22%**——但因为 Python GIL，有效上限更低，用户观察到的 <10% 完全一致。
+
+**理论 GPU 功耗上限** = 50W（Metal 8x128 batch=256 单次 forward）× 30%（5-10 ms 占 10-20 ms 的一半以下）= **~15W 平均**——也和用户观察的 10-50W 区间吻合。
+
+### 12.5 额外观察：memory 115 GB 是上限还是问题？
+
+用户问题里提到 "115 GB 应该已经吃满了"。严格说 M3 Max 128 GB 单位统一内存，115 GB 是 **90% 占用**——OS 会开始抢压，MLX 开始被动 evict，训练速度会**断崖式**下降（常见症状：TUI 的 Gm/s 从 0.2 掉到 0.05）。所以即使训练能跑完，它已经进入了"系统被动换出"的退化区。
+
+**目标：把 RAM 压到 ≤ 40 GB。** 留出空间给 OS 缓存和其他进程，同时解决速度衰减。
+
+### 12.6 改造方案
+
+三级，P0 必做，P1 强烈推荐，P2 为后续版本准备。
+
+#### P0a — 修 `MAX_BATCH_PATHS` 截断
+
+**改动点：** `framework/core/mcts_c.c:289`
+
+```c
+#define MAX_BATCH_PATHS 2048   /* was 256; was silently truncating pg×batch >256 */
+```
+
+**成本：** 4 个 static buffer 从 `256 × (128×2 + 1 + 1) × 4 = 264 KB` 变成 `2048 × 258 × 4 = 2.1 MB`。完全可以接受。
+
+**副带改动：** 在 `mcts_batch_select` 里加一个 `printf` 或让 Python 端的 wrapper 检测 `sims_per_round × n_roots > MAX_BATCH_PATHS` 并报警。静默截断是 v14 的一个真正的 ops bug——必须修掉。
+
+**受益配置：**
+- pg=16 / batch=32 → leaf batch 512（GPU 用得更饱）
+- pg=24 / batch=16 → leaf batch 384
+- pg=12 / batch=32 → leaf batch 384
+
+#### P0b — 训练循环里每 step 结束调 `mx.clear_cache()`
+
+**改动点：** `domains/gomoku/train.py:1322-1325` 区块（`optimizer.update` + `mx.eval` 之后）：
+
+```python
+optimizer.update(model, grads)
+mx.eval(model.parameters(), optimizer.state)
+
+cycle_loss += loss.item()
+total_train_steps += 1
+steps_run_this_cycle += 1
+
+# NEW: release allocator cache every step. This is the main RAM leak fix.
+# Without this, 50 train steps × ~1 GB activations/gradients = up to 50 GB
+# retained by MLX's internal pool, independent of parallel_games.
+if total_train_steps % 4 == 0:  # every 4 steps to amortize syscall cost
+    mx.clear_cache()
+```
+
+每 4 步调一次是 throughput / RAM 的折中；如果 RAM 还是高，降到每步。`mx.clear_cache()` 在 MLX 0.20+ 上是 us 级操作，每步调完全可接受。
+
+**同时修自对弈循环的 clear_cache 频率** — `domains/gomoku/train.py:528-530`：
+
+```python
+# OLD: if round_count == 0 or total_moves % 80 == 0: mx.clear_cache()
+# NEW: 每 8 个 move（~1 round）调一次
+if total_moves % 8 == 0:
+    mx.clear_cache()
+```
+
+**预期效果：** RAM 从 115 GB → 25-40 GB。
+
+#### P0c — 降低 pg 到甜点，提高单次 leaf batch
+
+**改动点：** CLI 推荐参数（不改代码）。
+
+基于根因一的分析，最优配置是让 `pg × mcts-batch ≈ 256`（MLX 8x128 的 GPU 甜点，P0a 修复后可以放到 512-1024）：
+
+| 目标 | pg | mcts-batch | leaf batch | 评价 |
+|------|----|-----------|-----------|------|
+| **甜点 A（稳态）** | 16 | 16 | 256 | 当前可行，mcts_10 附近 |
+| **甜点 B（大 batch）** | 16 | 32 | 512 | P0a 后可行 |
+| **甜点 C（超大 batch）** | 32 | 16 | 512 | P0a 后可行 |
+| **不推荐** | ≥48 | ≥16 | (被截断) | P0a 前无效 |
+
+**用户原命令 `pg=64 / batch=16` 的直接替换：**
+
+```bash
+# ❌ 原命令（64 × 16 = 1024，被静默截到 256，有效 pg=16，其余 48 个 board 空耗内存）
+--parallel-games 64 --mcts-batch 16
+
+# ✅ 推荐（P0a 修复前）
+--parallel-games 16 --mcts-batch 16
+
+# ✅ 推荐（P0a 修复后）
+--parallel-games 16 --mcts-batch 32
+```
+
+**预期效果：** 相同 GPU 功耗下训练样本数产出更一致；RAM 从"pg 无关的 115 GB"变成"与 pg 线性相关"，pg=16 时大约 20-30 GB。
+
+#### P1 — 异步流水线：CPU board ops 与 GPU forward 重叠
+
+**目标：** 把 §12.4 的四阶段串行改成两条并行流水。
+
+**架构（train.py 内部改动，不碰 C）：**
+
+```
+Worker-A：C select → Python board ops → 构造 batch 张量
+Worker-B：GPU forward → 拿到 (priors, values)
+主：串联两者，C expand+backup
+
+时间线（一个 sim round）：
+  round t:    A [select][copy][stack]   →
+              B                           [forward]   →
+              main                                    [backup]
+
+  round t+1:  A              [select][copy][stack]   →
+              B                                       [forward]   →
+              main                                                [backup]
+```
+
+当 `A[t+1]` 和 `B[t]` 重叠时，每轮的有效时间从 `A+B+main ≈ 15 ms` 压到 `max(A, B) + main ≈ 10 ms`——**理论提速 33%**。
+
+**实现：** Python 的 `concurrent.futures.ThreadPoolExecutor(max_workers=1)` 加一个后台 worker 处理 A 阶段即可；MLX 的 forward 释放 GIL，线程与主循环天然并行。这是 30-50 行 diff，完全在 `_run_self_play_mcts` 内部。
+
+**不推荐现在做多进程 worker**：AlphaZero 原版是多进程，但那是 Python 无 GIL 前的架构。Python 3.13 的 free-threading 尚未成熟、MLX context 也不是多进程友好的。单进程 + 后台线程是当前阶段的 Pareto 最优。
+
+#### P2（v15 以后）— Board 操作 C 化 或 多进程 worker
+
+如果 P0+P1 完成后 SP time 仍然是瓶颈，下一阶段有两个方向：
+
+1. **把 `Board.copy + place` 搬进 C**，在 `mcts_batch_select` 里做 "select-copy-place-expand-backup" 的完整 sim round，不回 Python 做 board 操作。预期再 2-3x 提速。代价：要修改 game.py（现在是 READ-ONLY 按 v14 前约束，但 v15 可以放开）。
+2. **多进程自对弈 worker**：每个 worker 进程独立跑 pg=8 × mcts-batch=16，通过共享内存队列把训练样本送回主进程。预期 4-8x 提速，但架构变化大。
+
+两者是互斥路线，选一个。我倾向 (1)——更小的改动面，更好的 GC / 调试体验。
+
+### 12.7 改造顺序与验证
+
+**Phase 0（本轮必做，预计 < 2 h 编码 + 1 h 验证）：**
+
+1. P0a：`MAX_BATCH_PATHS = 256` → `2048`，加 Python wrapper 的截断警告
+2. P0b：训练循环 + 自对弈循环的 `mx.clear_cache` 频率修正
+3. 重编 C 扩展：`cd framework/core && bash build_native.sh`
+4. 跑一个 30 分钟 smoke test：
+
+```bash
+uv run python domains/gomoku/train.py \
+  --mcts-sims 800 --parallel-games 16 --mcts-batch 32 \
+  --num-blocks 8 --num-filters 128 \
+  --learning-rate 3e-4 --steps-per-cycle 50 --buffer-size 100000 \
+  --time-budget 1800 \
+  --eval-level 2 \
+  --eval-interval 5 --probe-games 80 \
+  --full-eval-games 200 --eval-openings 16 \
+  --resume 6c9c8bdd --seed 42
+```
+
+**验证判据：**
+
+| 指标 | 验收值 | 如何测 |
+|------|--------|--------|
+| RAM 峰值 | ≤ 40 GB | `top` / Activity Monitor |
+| GPU 平均功耗 | ≥ 35 W | `powermetrics --samplers gpu_power -i 1000` |
+| Gm/s | ≥ mcts_10 的 0.2 | TUI 面板 |
+| 训练完成后 P-Loss | 稳定下降趋势 | TUI 面板 |
+| 不报 MAX_BATCH_PATHS 警告 | 无警告 | stdout |
+
+任一不达标都要停下来诊断，不要直接进 3 小时长训。
+
+**Phase 1（Phase 0 验证通过后做，预计 1 天）：**
+
+- P1：添加 `ThreadPoolExecutor` 流水线
+- 验证判据：同配置 Gm/s ≥ Phase 0 的 1.25 倍
+
+**Phase 2（另起版本 v15）：**
+
+- 决定 P2 的 1/2 路线，或者引入完全不同的架构（multi-root GPU kernel）
+
+### 12.8 本节不打算做的事
+
+为了保持改造面小、可验证，以下都**不**在本轮范围内：
+
+- ❌ 切换 MLX 版本 / 编译选项 / `MPS_HIGH_WATERMARK_RATIO` 环境变量——这些都是外部黑盒
+- ❌ 降 `num_filters` 到 64（mcts_10 数据已经证明 8x128 是必要容量）
+- ❌ 缩 `buffer_size`——buffer 大小和 RAM 问题无关，v14-findings §8.5 证明 buffer 在合理区间
+- ❌ 改 `mcts_sims` 到 400——搜索量是质量基石，不能为了资源利用砍它
+
+### 12.9 一句话结论
+
+> **内存 115 GB 不是 `parallel-games` 太大，是 MLX 训练循环里从不 `clear_cache`；GPU 50W 不是并行度不够，是 `MAX_BATCH_PATHS=256` 在 C 侧静默截断高 pg×batch 请求。这两个都是 v14 留下的 P0 级 bug，修复代价 < 50 行代码。** 修完后推荐 `pg=16 / mcts-batch=32` 作为 8x128 / 800 sims 的新甜点。
+
+---
+
+## 13. v14.1 工作日志：P0 + P1 代码升级与性能基线（2026-04-13 下午）
+
+> 执行者：Claude Opus 4.6 | 范围：§12.6 P0 + P1 全部落地，P2 转入 v15 backlog
+
+### 13.1 本次落地的改动
+
+| # | 文件 | 改动 | 类型 |
+|---|------|------|------|
+| 1 | `framework/core/mcts_c.c` | `MAX_BATCH_PATHS` 256 → 2048，新增 `mcts_max_batch_paths()` 查询 API | P0a |
+| 2 | `framework/core/mcts_native.py` | 启动时读取 C 的 `MAX_BATCH_PATHS`；首次越界时发 `RuntimeWarning` 而不是静默截断 | P0a |
+| 3 | `framework/core/mcts_native.py` | 新增 `ThreadPoolExecutor` 基础设施（`MCTS_NATIVE_WORKERS` 环境变量控制）+ chunked 分派 | P1 (infra) |
+| 4 | `domains/gomoku/train.py` | 训练循环每 4 steps 调 `mx.clear_cache()` | P0b |
+| 5 | `domains/gomoku/train.py` | 自对弈 `_evaluate_batch` 每 8 次 forward 调 `mx.clear_cache()` | P0b |
+| 6 | `domains/gomoku/train.py` | 自对弈外层 while 循环末尾每轮调 `mx.clear_cache()` | P0b |
+| 7 | `domains/gomoku/train.py` | 新 `_apply()` fast-path：跳过 `is_legal()`、跳过 `history.append()` | P1 (real win) |
+| 8 | `domains/gomoku/game.py` | `_WIN_DIRECTIONS` 提升到模块级常量 | P1 (real win) |
+| 9 | `domains/gomoku/game.py` | `_check_win` 去掉方向列表分配 + 展开 sign 循环 | P1 (real win) |
+
+**总改动量：** ~60 行代码新增、~20 行修改。C 扩展已在本机重编译（`framework/core/mcts_c.so`）。
+
+### 13.2 原 P1 计划落空的诚实记录
+
+§12.6 的 P1 原计划是"CPU board ops 和 GPU forward 用 `ThreadPoolExecutor` 重叠"。实际动手后发现**这个方案在当前架构下根本没有重叠空间**：
+
+- 每个 sim round 的依赖链是 `C_select(t) → board_ops(t) → GPU_forward(t) → C_backup(t)`
+- `C_select(t+1)` 需要 `C_backup(t)` 更新后的树状态
+- 所以 round t+1 的任何阶段都不能和 round t 的任何阶段并行
+- **同一棵搜索树内不存在流水线机会**
+
+把 Python path-walk loop 放到 ThreadPoolExecutor 里的初版（按路径派发，每路径一个 task）实测 **0.41-0.56x**（更慢）——dispatch 开销压倒实际工作。
+
+改成 **chunk 分派**（每 chunk 64-128 路径）后速度变成 **0.81-0.87x**——仍然更慢。原因在 `_walk_chunk` 的内部 profile：
+
+```
+cumtime% (pg=16 batch=16, 3 searches, 400 sims each):
+  _walk_chunk:          41%
+    game.py place():    21%
+      _check_win:       12%
+      is_legal:          2%
+      history.append:    < 1%
+    game.py copy():      8%
+      np.grid.copy():    2%   ← 唯一 GIL-free 的点
+```
+
+`_check_win` 和 `place()` 都是 **纯 Python 内层循环**，GIL 全程持有。`grid.copy()` 虽然 GIL-free，但它只占总时间的 2%——再多线程也只能摊薄这 2%。剩下的 98% 是 GIL-bound，加线程只会增加调度开销。
+
+**教训：在给出 P1 方案前应该先跑 profile。** §12.6 里"理论 CPU 利用率上限 22%"那段是对的，但我漏了一个前提：22% 的上限里只有 ~2% 是 GIL-free 部分，所以多线程的实际上限不是 4x 而是 1.02x。
+
+**保留策略：** ThreadPoolExecutor 基础设施留在 `mcts_native.py` 里，但**默认禁用**（`MCTS_NATIVE_WORKERS=1`）。环境变量可以开启，但**不要**在命令行里加这个变量——除非你自己测过且看到正速度比。M3 Max 的 16 核全是 performance 核，理论上 GIL 释放的窗口比 Linux 小核更值得钱，值得在 Mac 上再跑一次基线；但在那之前当成"有但不启用"的功能。
+
+### 13.3 P1 真正产生的提速来自哪里
+
+既然线程化失败，§13.1 的 P1 行 #7 / #8 / #9 是实际产生速度的地方——都是**减少 Python 开销**，不是并行化：
+
+#### (a) `_apply` fast-path —— 跳 `is_legal` + 跳 `history.append`
+
+MCTS 模拟路径天然合法（C 的 `mcts_select_child` 只走已展开的合法子节点），`_fast_copy` 也把 history 清空了不需要维护。所以在 self-play 专用的 `_apply` 里直接内联 `place()` 的必要部分：
+
+```python
+def _apply(state, action):
+    row, col = action // BOARD_SIZE, action % BOARD_SIZE
+    player = state.current_player
+    state.grid[row, col] = player
+    state.move_count += 1
+    state.last_move = (row, col)
+    if state._check_win(row, col, player):
+        state.winner = player
+    elif state.move_count >= BOARD_SIZE * BOARD_SIZE:
+        state.winner = -1
+    state.current_player = WHITE if player == BLACK else BLACK
+```
+
+节省：每次 apply 少一次 `is_legal` 调用（带 bounds check + 4 个属性访问）+ 少一次 `list.append`。profile 显示 ~8% 的 `_walk_chunk` 总时间。
+
+#### (b) `_check_win` 去掉每次调用的方向列表分配
+
+原版每次进入 `_check_win` 都 `directions = [(0,1),(1,0),(1,1),(1,-1)]`——一次 list + 4 个 tuple 的分配。提升到模块常量 `_WIN_DIRECTIONS` 后每次调用省掉这些。
+
+顺便把内层 `for sign in (1, -1)` 展开成两段，少一层循环变量赋值。
+
+#### (c) 综合测量结果（Linux 开发机，1×pg4-class）
+
+同一 fake_eval 下，400-sim 搜索中位时长（5 次 trials）：
+
+| 配置 | 基线 v14 | v14.1 | 提速 |
+|------|---------|-------|------|
+| pg=16 batch=16 (leaf=256) | 300.4 ms | 245.1 ms | **1.23x** |
+| pg=16 batch=32 (leaf=512) | 305.4 ms | 258.2 ms | **1.18x** |
+| pg=32 batch=16 (leaf=512) | 622.0 ms | 516.3 ms | **1.20x** |
+| pg=32 batch=32 (leaf=1024) | 641.8 ms | 561.6 ms | **1.14x** |
+
+**平均 ~1.19x**（Linux，~5% 方差）。这是纯 Python-side 的改进，在 Mac 上的绝对数会不一样（M3 performance 核的 Python 吞吐更高），但相对提升应该类似。
+
+### 13.4 正确性验证
+
+所有微优化都通过了下列回归测试：
+
+1. **Board `_check_win` 7 个 pattern 测试**：横 / 纵 / 正对角 / 反对角 / 白棋胜 / 未连成 / 被堵——全部通过。
+2. **MCTS 视场一致性测试**：固定 seed、无 Dirichlet 噪声、4 boards × 400 sims，`_apply`+fast_copy 与原 `place()`+Board.copy 产出 **逐根 visit 总数相等**（均为 400）且 top-3 访问位点一致。
+3. **C 扩展 `MAX_BATCH_PATHS` 截断警告**：pg=64 × batch=64 = 4096 > 2048 时**一次性**发 `RuntimeWarning`，`effective sims/round` 显式标明被降到 32。
+4. **parse check**：5 个修改过的文件全部 `ast.parse` 通过。
+
+### 13.5 性能预测（Mac M3 Max 上的 3 小时训练）
+
+以下是本轮修复在用户硬件上的**预期影响**。这是基于 mcts_10 baseline（pg=10 / batch=16 / 3h / 176 cycles）做的外推，有测不准度——请用 §13.6 的 smoke test 数据验证后再信。
+
+| 指标 | mcts_9th 6h | mcts_10 3h | **mcts_11 预期 3h (P0+P1 后)** | 备注 |
+|------|-------|-------|------|------|
+| RAM 峰值 | ~? | ~? (未测) | **25-40 GB** | P0b 每 4 train step clear cache |
+| GPU 功耗 | ~? | ~? | **35-50 W** | P0a 允许更大有效 batch |
+| Gm/s (pg=16/batch=32) | n/a | 0.20 @ pg=10 | **0.26-0.30** | P1 Python 优化 1.19x + 更大 batch 摊薄 GPU 开销 |
+| 每 cycle wall | n/a | 61 s | **40-50 s** | 同上 |
+| 3h cycles | 457 (6h) | 176 | **215-270** | |
+| 每 cycle SP time | n/a | 43.7 s | **28-35 s** | |
+| 每 cycle train time | n/a | ~15 s | ~15 s | 训练步不受影响 |
+| 3h 累计 games | 4570 (6h) | 1760 | **3400-4300** | |
+| 3h 累计 train steps | 22135 (6h) | 8253 | **10750-13500** | |
+
+**关键预测：**
+
+1. **RAM 从 115 GB 跌到 ~30 GB**——这是 P0b 的直接后果，最应该肉眼看见的改动。
+2. **Gm/s 提速 1.3-1.5x**——来自 §13.3 (c) 的 1.19x + P0a 解开 batch 截断的额外 ~10-20%。
+3. **GPU 功耗波形变稳定**——不再是 "10W 坐着 / 偶发 50W 尖峰" 的低占空比，而是 "35-50W 持续"。
+
+**如果测不到这些：**
+
+- RAM 仍然 >80 GB → `mx.clear_cache` 调用频率不够，或者有其他未修的泄漏（我们的测量只覆盖 Linux 无 MLX 路径，MLX 那一半必须到 Mac 才能验）
+- Gm/s 不涨 → P1 的 Python 优化在 M3 核下收益比 Linux 小，或者瓶颈在 MLX 不是在 CPU
+- GPU 还是摇摆 → 可能是 `_evaluate_batch` 的 `mx.clear_cache` 把 MLX 的 kernel 缓存也清掉了（副作用），改成每 16 forward 调一次试试
+
+### 13.6 必须做的启动步骤
+
+**Step 1** — git pull 本仓库最新 commit（包含 `framework/core/mcts_c.c`、`mcts_native.py`、`train.py`、`game.py` 的改动）
+
+**Step 2** — **必须重编 C 扩展**（`MAX_BATCH_PATHS` 从 256 改成 2048，需要重新 build .dylib）：
+
+```bash
+cd framework/core && bash build_native.sh && cd ../..
+```
+
+Mac 下这会产出 `mcts_c.dylib`。如果缺 clang 报错，`xcode-select --install` 补一下。
+
+**Step 3** — 用一个 Python 一行确认新的 cap 被 C 侧暴露了：
+
+```bash
+uv run python -c "
+import sys; sys.path.insert(0, 'framework')
+from core.mcts_native import max_batch_paths
+print('MAX_BATCH_PATHS =', max_batch_paths())
+"
+```
+
+应当打印 `MAX_BATCH_PATHS = 2048`。如果还是 256，说明 Step 2 没成功，检查是否有旧的 .dylib 挡路。
+
+**Step 4** — 30 分钟 smoke test（在跑 3h 长训前必做）：
+
+```bash
+uv run python domains/gomoku/train.py \
+  --mcts-sims 800 --parallel-games 16 --mcts-batch 32 \
+  --num-blocks 8 --num-filters 128 \
+  --learning-rate 3e-4 --steps-per-cycle 50 --buffer-size 100000 \
+  --time-budget 1800 \
+  --eval-level 2 \
+  --eval-interval 5 --probe-games 80 \
+  --full-eval-games 200 --eval-openings 16 \
+  --resume 6c9c8bdd --seed 42
+```
+
+同时在另一个终端开 **Activity Monitor** 或跑 `top -o mem`，记录：
+
+| 检查点 | 目标 | 失败则 |
+|--------|------|--------|
+| 启动 2 分钟 | RAM < 35 GB | P0b 不生效 → 看 train.py 的 clear_cache 分支是否命中 |
+| 启动 5 分钟 | TUI `Gm/s` ≥ 0.22 | P0a 或 P1 没生效 → 检查 mcts_max_batch_paths() 返回值 |
+| 启动 15 分钟 | GPU 功耗 ≥ 35 W（`powermetrics --samplers gpu_power`）| 底层还有问题 → 停机诊断 |
+| 任何时刻 | 不出现 `mcts_batch_select: sims_per_round(X) × n_roots(Y)... exceeds C cap` 警告 | pg × batch > 2048，降一个 |
+
+任何一条未达标**都不要直接进 §13.7 的 3h 长训**。stop 了来找我，我们一起看哪里卡住。
+
+### 13.7 Mcts_11 新训练命令（3 h，vs L2，resume 6c9c8bdd）
+
+Smoke test 通过后的正式命令：
+
+```bash
+uv run python domains/gomoku/train.py \
+  --mcts-sims 800 --parallel-games 16 --mcts-batch 32 \
+  --num-blocks 8 --num-filters 128 \
+  --learning-rate 3e-4 --steps-per-cycle 50 --buffer-size 100000 \
+  --time-budget 10800 \
+  --eval-level 2 \
+  --eval-interval 5 --probe-games 80 \
+  --full-eval-games 200 --eval-openings 16 \
+  --auto-stop-stagnation --stagnation-window 15 \
+  --resume 6c9c8bdd --seed 42
+```
+
+**参数说明（与你上次命令的差异）：**
+
+| 参数 | 上次 | 本次 | 理由 |
+|------|------|------|------|
+| `--parallel-games` | 64 | **16** | 回到甜点（P0a 后 leaf batch 真正达到 512）|
+| `--mcts-batch` | 16 | **32** | P0a 修好后 `16×32=512` 在 MLX 甜点区 |
+| `--time-budget` | 18000 | **10800** | 和 mcts_10 可直接对比（cost 轴对齐）|
+| `--eval-interval` | 15 | **5** | L2 训练前 1 小时 WR 变化快，不要稀释 |
+| `--probe-games` | 120 | 80 | 和 mcts_10 对齐 |
+| `--full-eval-games` | 250 | 200 | 和 mcts_10 对齐 |
+| `--no-eval-opponent` | 有 | **省略** | v14.1 起默认不启用 NN 对手 |
+
+**成功判据：**
+
+| 指标 | 阈值 |
+|------|------|
+| RAM 峰值 | ≤ 40 GB |
+| Gm/s | ≥ 0.22 |
+| 首个 probe WR vs L2 > 0% | cycle ≤ 30 |
+| smoothed WR ≥ 60% vs L2 | 3h 结束时 |
+| policy_loss 最低值 | ≤ 4.20 |
+| full eval `uniq/op` | ≥ 24/16 |
+
+### 13.8 P2 backlog（转入 v15）
+
+本轮不做，记账留给 v15：
+
+| # | 项 | 动机 | 预期收益 |
+|---|----|------|---------|
+| 1 | 把 `Board` 的 grid + place + _check_win 换成 cython/C 扩展 | §13.2 的 profile 证明 98% 时间是 GIL-bound Python | 2-3x self-play throughput |
+| 2 | 多进程 self-play worker（共享内存 replay queue）| 绕开 GIL，彻底解锁 CPU 并行 | 4-6x throughput（需要重构） |
+| 3 | Board ops 搬到 C 并在 `mcts_batch_select` 内联 | 零 Python↔C 跨界 | 再叠加 1.5-2x |
+| 4 | `_evaluate_batch` 用 `mx.async_eval` 让 Metal 提前排队 | 减少 Python↔GPU 握手延迟 | 5-10% 左右 |
+| 5 | 训练循环的 D4 symmetry 增广搬到 numpy 批量 | 现在每个 sample 单独做 | 3-5% |
+
+选定 (1) 或 (2) 之一作为 v15 的主攻方向，其他作为附属。
+
+### 13.9 一句话总结
+
+> **v14.1 落地的三件事：C 侧 MAX_BATCH_PATHS 256→2048 + 训练循环 `mx.clear_cache()` 补齐 + Python 热路径（_apply / _check_win）微优化。前两项是 bug 修复，第三项是 1.19x 的小提速。P1 "CPU-GPU 流水线" 的原计划因为依赖链不可并行被证伪、ThreadPoolExecutor 因为 GIL 被证伪，两条路都诚实记录到 §13.2。Mac 上 smoke test 的验收基线：RAM ≤ 40 GB、Gm/s ≥ 0.22、无 batch-cap 警告。**

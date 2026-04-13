@@ -286,7 +286,26 @@ void mcts_revert_path_virtual_loss(const int *path_nodes, int path_len,
  *
  * Returns total number of paths written.
  */
-#define MAX_BATCH_PATHS 256   /* max K*N per call */
+/*
+ * Path batch buffers.
+ *
+ * IMPORTANT: MAX_BATCH_PATHS is the hard cap on (sims_per_round * n_roots)
+ * per call. Before v14.1 this was 256, which SILENTLY TRUNCATED any larger
+ * request — the outer loop guard `total < MAX_BATCH_PATHS` just stopped
+ * iterating without reporting. At pg=64 / batch=16 that was 1024 requested
+ * but only 256 served (75% work loss), which completely hid GPU saturation.
+ *
+ * New value 2048 covers realistic configurations:
+ *   pg=32  / batch=64 = 2048 ✓
+ *   pg=64  / batch=32 = 2048 ✓
+ *   pg=128 / batch=16 = 2048 ✓
+ *
+ * Memory cost: 2048 * (128*2 + 1 + 1) * 4 bytes ≈ 2.1 MB static — negligible.
+ *
+ * A caller requesting more than MAX_BATCH_PATHS is still truncated, but the
+ * Python wrapper in mcts_native.py now detects and warns on that case.
+ */
+#define MAX_BATCH_PATHS 2048  /* was 256 — see comment above */
 #define MAX_PATH_DEPTH  128
 
 /* Flat output buffers (caller reads after call) */
@@ -294,6 +313,9 @@ static int   g_batch_path_nodes[MAX_BATCH_PATHS * MAX_PATH_DEPTH];
 static int   g_batch_path_actions[MAX_BATCH_PATHS * MAX_PATH_DEPTH];
 static int   g_batch_path_lens[MAX_BATCH_PATHS];
 static int   g_batch_leaf_nodes[MAX_BATCH_PATHS];   /* leaf node index */
+
+/* Exported so Python can query the compile-time cap at runtime. */
+int mcts_max_batch_paths(void) { return MAX_BATCH_PATHS; }
 
 int mcts_batch_select(const int *root_indices, int n_roots,
                       int k_sims, float c_puct, float virtual_loss)

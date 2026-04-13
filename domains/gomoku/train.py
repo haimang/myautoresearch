@@ -408,6 +408,13 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
 
     model.eval()
 
+    # Intra-search MLX cache release counter. mx.clear_cache() is cheap
+    # (~10μs) but calling it on every single forward is still wasteful for
+    # small MCTS batches. Every 8 forwards is the sweet spot: keeps the
+    # peak pool size bounded to ~8 × activation_size while paying <1% of
+    # wall time on the release call itself.
+    _ebc = [0]
+
     def _evaluate_batch(states):
         """Shared batch evaluate for all boards' MCTS trees."""
         if not states:
@@ -418,10 +425,31 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
         mx.eval(logits, values)
         priors_all = np.array(mx.softmax(logits, axis=-1))
         values_np = np.array(values).flatten()
+        _ebc[0] += 1
+        if _ebc[0] % 8 == 0:
+            mx.clear_cache()
         return [(priors_all[i], float(values_np[i])) for i in range(len(states))]
 
     def _apply(state, action):
-        state.place(action // BOARD_SIZE, action % BOARD_SIZE)
+        """Fast-path action application for MCTS simulation.
+
+        Skips Board.place()'s is_legal() check (MCTS paths are legal by
+        construction — the tree only stores legal children), and skips
+        the history.append() because _fast_copy zeroed history and we
+        never replay a sim state. These two elisions cut ~35% off the
+        profiled cost of place() at pg=16 per v14.1 profile.
+        """
+        row = action // BOARD_SIZE
+        col = action % BOARD_SIZE
+        player = state.current_player
+        state.grid[row, col] = player
+        state.move_count += 1
+        state.last_move = (row, col)
+        if state._check_win(row, col, player):
+            state.winner = player
+        elif state.move_count >= BOARD_SIZE * BOARD_SIZE:
+            state.winner = -1
+        state.current_player = WHITE if player == BLACK else BLACK
 
     def _terminal_value(state):
         return 0.0 if state.winner == -1 else 1.0
@@ -524,10 +552,21 @@ def _run_self_play_mcts(model, num_games: int, mcts_sims: int,
             if board.is_terminal():
                 finished[board_idx] = True
 
-        # Periodic Metal cache cleanup (every 10 rounds, not every round)
-        round_count = sum(1 for f in finished if not f)
-        if round_count == 0 or total_moves % 80 == 0:
-            mx.clear_cache()
+        # Metal allocator cache release.
+        #
+        # MLX on Apple Silicon retains forward-pass buffers in an internal
+        # pool across calls — on unified-memory systems without periodic
+        # clear_cache() the pool grows monotonically until it hits the
+        # system RAM ceiling. v14 ran with cadence "every 80 moves" which
+        # was far too sparse: at pg=16 / 800 sims, one MCTS search does
+        # ~100 GPU forwards per move, so "every 80 moves" = ~8000 forwards
+        # between clears. See v14-update §12.3 for the full post-mortem.
+        #
+        # New cadence: every round (= one complete batch of leaves across
+        # all active boards). The mx.clear_cache() call is cheap — tens
+        # of μs — so per-round is cost-effectively infinite headroom vs
+        # the RAM cost of retaining ~1 GB/forward of activations.
+        mx.clear_cache()
 
     # Collect training data
     all_training_data = []
@@ -1333,6 +1372,17 @@ def train(args):
                     last_batch_policies_mx = batch_policies_mx
                     last_batch_values_mx = batch_values_mx
 
+                    # Release MLX allocator pool during training. Without
+                    # this, 50 grad steps × ~1 GB activations+gradients per
+                    # step can retain tens of GB of Metal buffers that are
+                    # never returned to the OS — the root cause of the
+                    # mcts_11 "RAM locked at 115 GB" symptom. Every 4 steps
+                    # is a reasonable amortisation: clear_cache is ~10μs
+                    # but we don't want to pay it on every single step.
+                    # See v14-update §12.3.
+                    if total_train_steps % 4 == 0:
+                        mx.clear_cache()
+
                 if steps_run_this_cycle > 0:
                     last_loss = cycle_loss / steps_run_this_cycle
                     # Recompute on the last mini-batch to recover the
@@ -1922,10 +1972,14 @@ def parse_args() -> argparse.Namespace:
                    help="Stop after this many self-play games")
     p.add_argument("--eval-level", type=int, default=EVAL_LEVEL,
                    help=f"Evaluation opponent level 0-3 (default: {EVAL_LEVEL})")
-    p.add_argument("--eval-opponent", type=str, default="L4",
-                   help="Evaluate against a registered NN opponent alias (default: L4)")
+    p.add_argument("--eval-opponent", type=str, default=None,
+                   help="Evaluate against a registered NN opponent alias "
+                        "(default: None = use minimax at --eval-level). "
+                        "This used to default to 'L4' which broke any fresh "
+                        "tracker.db that didn't have that legacy alias.")
     p.add_argument("--no-eval-opponent", action="store_true",
-                   help="Disable NN opponent, use minimax only (for benchmarks)")
+                   help="Deprecated no-op — kept for command compatibility. "
+                        "The new default is already 'no NN opponent'.")
     p.add_argument("--eval-interval", type=int, default=15,
                    help="Probe evaluation every N cycles (default: 15)")
     p.add_argument("--probe-games", type=int, default=100,

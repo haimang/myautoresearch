@@ -415,3 +415,227 @@ uv run python domains/gomoku/web/web_app.py
 4. 只有当某个 checkpoint 在"随机化 L1 对手 + 多样化开局"下稳定 ≥80% vs L1，才注册成 S1 并进入 L2 阶段。
 
 **v14 到此为止的教训可以一句话总结：** 在评估协议有确定性坍缩的前提下，任何 100% 胜率都不可信，任何由它推出来的训练决策都不可信。先把尺子校准，再谈长度。
+
+---
+
+## 8. mcts_10 复盘 — 修好尺子后的第一份真实数据
+
+> 2026-04-13 | 基于 updates/mcts_10th_exp.db + updates/mcts_10th.png（3 小时训练，run 6c9c8bdd）
+
+这是在 §7.8 所列全部框架修复（随机化 minimax / 开局多样化 / 轨迹指纹 / policy-value loss 拆分 / cycle_metrics 空 cycle 过滤）落地后的第一次长训。目的是回答一个问题：**在修好的评估协议下，mcts_9th "100% 胜率" 是真的还是假的？**
+
+### 8.1 run 概要
+
+| 项目 | 值 |
+|------|-----|
+| Run ID | 6c9c8bdd-67bd-4405-97b9-0533970ec12a |
+| 架构 | 8×128（2.49M params）|
+| MCTS | 800 sims（C 原生）|
+| Resume | 无（从零训练）|
+| LR / steps / buffer | 2e-4 / 50 / 100,000 |
+| Parallel / batch | 10 / 256 |
+| time_budget | 10800s（3 h，实际 10800.2s 吃满）|
+| Cycles / games / steps | 176 / 1,760 / 8,253 |
+| **final_loss / P / V** | **4.7528 / 4.4150 / 0.2541** |
+| Final WR vs L1（200 局 full eval）| **100%（200W/0L/0D, 27 unique / 16 openings）**|
+| Checkpoints | 6（wr055_c0110 … final_c0176）|
+| Seed | 42, is_benchmark=1 |
+
+### 8.2 结论先行（对比 mcts_9th）
+
+| 指标 | mcts_9th (6h) | mcts_10 (3h) | 判断 |
+|------|---------------|--------------|------|
+| 训练时长 | 21600s | 10800s | 一半 |
+| 训练步数 | 22,135 | 8,253 | 约 37% |
+| 自对弈局数 | 4,570 | 1,760 | 约 39% |
+| Final policy loss | ~4.25（单一 loss 合算推算）| **4.41**（可直接读）| 可观测 |
+| Final value loss | 不可见 | **0.254** | 可观测 |
+| Final WR vs L1 (full eval) | 100%（伪）| **100%（真）**| 关键转折 |
+| Full eval unique games | ≈2 | **27 / 200** | 修复生效 |
+| Probe WR 取值集 | {0.0, 0.5, 1.0} | 连续（0.087→0.967→…）| 修复生效 |
+| avg_game_length 最终 | 10.5（坍缩）| **15.0**（合理）| 修复生效 |
+
+**核心判断：mcts_10 的 100% 是真的。** 它是在 27 条（接近 16 opening × 2 side 的理论上限 32）不同开局变体下、对 top-3 sampled minimax 对手全胜的结果——不再是 "两条确定性必杀线复制 200 次" 的统计伪影。
+
+### 8.3 证据 1：统计坍缩已消失
+
+所有 6 个 checkpoint 的 `eval_unique_openings` 字段：
+
+| tag | cycle | WR | wins/losses | avg_len | unique |
+|-----|-------|----|--------------|---------|--------|
+| wr055_c0110 | 110 | 83.5% | 167/33 | 23.0 | **32** |
+| wr065_c0120 | 120 | 87.5% | 175/25 | 18.1 | **32** |
+| wr070_c0130 | 130 | 90.5% | 181/19 | 20.4 | **32** |
+| wr084_c0150 | 150 | 97.0% | 194/6  | 16.5 | **28** |
+| wr088_c0160 | 160 | 100.0% | 200/0 | 15.4 | **28** |
+| final_c0176 | 176 | 100.0% | 200/0 | 15.0 | **27** |
+
+16 条开局 × NN 黑白两侧 = 32 个 (opening, side) 桶是理论上限。训练初期全部 32 个桶都产生不同轨迹；到后期模型定型，同一桶内不同 L1 采样分支更多趋于同一条必胜线，unique 数从 32 轻微下降到 27——这本身就是"有一条强势线被强化"的正常表现，但 27 仍然是 mcts_9th 那个 ≈2 的 13 倍。
+
+**avg_game_length 从 110 cycle 的 23.0 下降到 176 cycle 的 15.0**——不是崩溃，而是攻势更锐利。mcts_9th 的 10.5 是"6 步速胜"式的机械必杀复读；15 步配合多个不同开局则是"不同开局下都能找到 7-8 步内终结对手"的真正局面理解。
+
+### 8.4 证据 2：probe WR 轨迹有真实学习曲线
+
+17 次 probe eval（每 10 cycle 一次，150 局）的 WR 取值：
+
+```
+cycle  10   20   30   40   50   60   70   80   90  100  110  120  130  140  150  160  170
+WR    0%   0%   0%   0%  9%  23%  37%  75%  61%  40%  83%  87%  91%  66%  97% 100%  91%
+```
+
+- **不再是 {0, 0.5, 1} 的离散坍缩**：出现了 9%, 23%, 37%, 61%, 40%, 66%, 87%, 91% 等连续值。修复前这些值在数学上不可达。
+- **真实学习曲线形态**：前 40 cycle 全 0%（模型先学会不犯低级错误），50-80 cycle 陡升（25% → 75%），80-120 震荡上行（反映 replay buffer 刚开始装满时样本分布变化），130 cycle 后稳定在 >90%。
+- **140 cycle 的 66% 和 170 cycle 的 91% 是"回退"**，不是 bug。这是真实训练中 replay buffer 采样方差 + 对手 top-3 采样方差共同造成的自然震荡。smoothed（avg）始终单调上行：73.6 → 94.9 → 88.3 → 88.9。
+
+这条曲线在 mcts_9th 里是看不见的。
+
+### 8.5 证据 3：policy / value loss 拆分揭示真正的瓶颈
+
+从 cycle_metrics 直接读（新 schema 字段）：
+
+| cycle | total loss | policy loss | value loss | 备注 |
+|-------|-----------|-------------|------------|------|
+| 1 | 6.363 | 5.365 | 0.469 | 起点接近 uniform (log 225 ≈ 5.42) |
+| 50 | 5.179 | 4.889 | 0.255 | value 先收敛 |
+| 100 | 4.894 | 4.630 | 0.340 | policy 缓慢下行 |
+| 150 | 4.759 | 4.424 | 0.272 | |
+| 168 | 4.764 | **4.307** | 0.354 | policy 最低 |
+| 176 | 4.753 | 4.415 | 0.254 | 末段轻微回升 |
+
+**关键观察：**
+
+1. **Value head 很快收敛并稳定在 0.25-0.35 MSE 区间**。值目标在 [-1, 1]，RMS 误差 ≈ 0.5——价值头能给出有意义的局面评估。这是 mcts_9th 里看不见的、但始终存在的"好消息"。
+2. **Policy head 的下降只有 ~1.06 nat**（5.365 → 4.307），相对 uniform 的 5.42 nat 来说，这是"比完全随机好一点点"。TUI 里写 `policy entropy gap: 4.42 nats`——策略熵距离 one-hot 还有 4.42 nat 的距离。
+3. **这才是真正的瓶颈**。mcts_9th 的表面 loss 是 "总 loss 4.25"，让人以为模型在学；拆开来看才知道 value 早已饱和，policy 一直在"几乎 uniform 分布上做微调"。mcts_10 同样情况——但现在这条信息**是可观测的**，不再被加权合并遮蔽。
+4. **100% WR 并不依赖 strong policy prior**。模型能打赢 L1 主要靠 800 sims 的 MCTS 把粗糙先验"搜索放大"成强走法——AlphaZero 机制在工作，但工作的是"搜索放大器"而不是"先验本身"。
+
+**这个观察改变下一阶段决策。** 见 §8.8。
+
+### 8.6 证据 4：空 cycle 伪影不再出现
+
+- 176 cycles × `loss IS NOT NULL` → 176 行。
+- `SELECT COUNT(*) FROM cycle_metrics WHERE loss IS NULL` → 0。
+- `runs.final_loss = 4.7528`（不再是 0.0）。
+- 这是 §7.8 第 6 项修复在库层的直接证据。analyze.py 的任何 Pareto / 前沿分析现在读到的 final_loss 都是真实最后训练步的 loss，不是记账伪影。
+
+### 8.7 final_c0176 checkpoint 是否可用？
+
+| 用途 | 结论 | 依据 |
+|------|------|------|
+| 注册为 S1（>80% vs L1 稳定）| **可用** | 最后 4 次 probe smoothed 88.9%；full eval 200/200 vs stochastic L1；27 unique 轨迹 |
+| resume 到 L2 训练起点 | **可用** | 训练已稳定，value head 收敛，search-driven 先验可被 L2 继续改造 |
+| web 人机对弈 | **可用，但要管理预期** | 它对 L1 风格稳定必胜；对人类风格未经测试，可能在非常规开局走偏。MCTS 推理时应开 ≥200 sims 以补偿稀薄先验 |
+| Pareto 前沿候选（cost=3h, quality=100% vs L1）| **前沿点** | 比 mcts_9th 的 6h 相同"100%"花费一半时间、且指标可信 |
+
+**但要 honest 地记下这个 checkpoint 的限制：**
+
+- Policy 先验仍然很弱（entropy 3.27，policy_loss 4.41）。它不是"下棋高手的神经网络"，它是"MCTS 搜索的放大器"。离开 MCTS，单用 argmax policy 去对战 L1 也赢，但对战更强对手会快速暴露先验不够集中的问题。
+- `wr088_c0160`（cycle 160，WR 100%，unique 28，avg_len 15.4）和 `final_c0176`（WR 100%，unique 27，avg_len 15.0）在数值上几乎一样。**最佳候选是 wr088_c0160**——更少额外 16 cycle 的 potential overfit，更多 unique。但两者差异很小，可以任选。
+
+**推荐：注册 wr088_c0160 为 S1。**
+
+### 8.8 注册命令
+
+```bash
+# 在 Mac 的项目根目录执行
+uv run python domains/gomoku/train.py \
+  --register-opponent S1 \
+  --from-run 6c9c8bdd-67bd-4405-97b9-0533970ec12a \
+  --from-tag wr088_c0160 \
+  --description "8x128 MCTS-800, 100% vs stochastic L1 (mcts_10, 3h, 28 uniq/16 op)"
+```
+
+如果 `opponents` 表里已存在旧的 S1（来自 c70162b9 run，老协议下 82% vs L1），先删除再注册，或者注册成 `S1v2`：
+
+```bash
+# 方案 A：覆盖旧 S1（如果 framework/core/db.register_opponent 支持 REPLACE）
+# 方案 B：起个新 alias
+uv run python domains/gomoku/train.py \
+  --register-opponent S1v2 \
+  --from-run 6c9c8bdd-67bd-4405-97b9-0533970ec12a \
+  --from-tag wr088_c0160 \
+  --description "8x128 MCTS-800, mcts_10 3h, 100% vs L1 (post eval-protocol fix)"
+```
+
+> **⚠ 旧 S1 的数字是"老协议下的虚 82%"**，不要再用它做 resume。**mcts_10 的 wr088_c0160 是目前为止唯一一个在修好的评估协议下达到晋升门槛的 checkpoint。**
+
+### 8.9 下一步训练目标：Stage 2 vs L2
+
+有两条可选路径。推荐 A。
+
+#### 路径 A：L2 训练（推荐）
+
+**动机：** L1 已解决，继续在 L1 上刷分会触发 §14.5 "特性三：停滞检测"——wall time 浪费。L2（minimax depth 4）对战术的要求显著提高：能看到 4 步远，能构建双活三、活四等组合威胁。L1 下够用的稀薄先验在 L2 下不一定够。
+
+**参数选择：**
+
+| 参数 | 值 | 理由 |
+|------|-----|------|
+| `--resume` | 6c9c8bdd（或 S1v2 alias 转 run_id）| 继承 value head + 部分 policy 形状 |
+| `--mcts-sims` | 800 | 不变。L2 更难，更不能降搜索量 |
+| `--num-blocks / --num-filters` | 8 / 128 | 不变。mcts_10 数据说明容量够用 |
+| `--learning-rate` | **2e-4 → 3e-4** | 适度上调：mcts_10 的 policy loss 下降太慢，LR 可以更激进一点。同时 replay buffer 已经装满稳定，不会像初训那样需要很低 LR |
+| `--steps-per-cycle` | 50 | 不变 |
+| `--buffer-size` | 100000 | 不变。resume 时 buffer 从零开始装，前 ~30 cycle loss 会偏高，这是设计取舍 |
+| `--time-budget` | **10800（3h）** | 和 mcts_10 同尺度，便于直接对比；若 L2 明显更慢，再扩到 6h |
+| `--eval-level` | **2** | 关键切换 |
+| `--probe-games` | 80 | 保持 |
+| `--full-eval-games` | 200 | 保持 |
+| `--eval-openings` | 16 | 保持 |
+| `--auto-stop-stagnation` | on | 开启 |
+| `--stagnation-window` | 15 | L2 下 WR 上升会更慢，窗口放大到 20 也可接受 |
+
+**命令：**
+
+```bash
+uv run python domains/gomoku/train.py \
+  --mcts-sims 800 --parallel-games 10 --mcts-batch 16 \
+  --num-blocks 8 --num-filters 128 \
+  --learning-rate 3e-4 --steps-per-cycle 50 --buffer-size 100000 \
+  --time-budget 10800 \
+  --eval-level 2 --no-eval-opponent \
+  --eval-interval 5 --probe-games 80 \
+  --full-eval-games 200 --eval-openings 16 \
+  --auto-stop-stagnation --stagnation-window 15 \
+  --resume 6c9c8bdd --seed 42
+```
+
+**成功判据（vs L2 depth 4, stochastic top-3 采样）：**
+
+| 指标 | 阈值 | 含义 |
+|------|------|------|
+| 首个 probe WR > 0% | cycle ≤ 30 | 先验有效迁移 |
+| probe WR 达到 50% | cycle ≤ 100 | 学习在进行 |
+| smoothed WR ≥ 60% | 训练结束时 | 可晋升到 S2 |
+| policy_loss 最低值 | ≤ 4.20 | 策略先验有实质提升 |
+| avg_game_length | 稳定在 18-30 | 没有退化成速胜复读 |
+| unique_trajectories | ≥ 24 | 评估仍有统计力 |
+
+任一核心判据未满足（WR < 50% 或 policy_loss 不降），都要回到 §8.10 列出的诊断清单。
+
+#### 路径 B：继续在 L1 刷 policy_loss（不推荐）
+
+动机可能是"先把 policy 学好再打 L2"，但这是假的。policy_loss 不降是因为 self-play target 的分布广度已经饱和——L1 对手给出的"需要学的新棋型"有限。继续刷只会把 replay buffer 填满相同模式的样本。**应该让对手变强来推动 policy 进一步聚焦。**
+
+### 8.10 如果路径 A 失败的诊断清单
+
+如果 L2 训练 1 小时后 probe WR 仍 < 20%：
+
+1. **检查 value loss 是否爆炸**。value head 是 mcts_10 里唯一学得好的部分，L2 对手给出的"终局胜负信号"分布可能不同，先看 value loss 曲线是否保持在 < 0.5 区间。若爆炸，LR 可能过大，降回 2e-4 或加 warmup。
+2. **检查 avg_game_length 是否在 ≥ 50 步**。如果每局 100 步还不决出胜负，说明 MCTS 搜不到必杀，先验也给不了有效集中——这是"模型对 L2 无办法"的具体症状。
+3. **检查 full eval 的 unique trajectories**。如果显著 < 16（说明开局桶内严重收敛），可能是路径 A 又走回 L1 风格的必胜线但 L2 不吃这套。
+4. **考虑增加 mcts-sims 到 1200**。800 对 L1 够，对 L2 可能不够——focus 27% 在 L2 的复杂局面下会稀释。
+
+### 8.11 本次训练作为框架能力实证
+
+从 autoresearch 框架视角，mcts_10 回答了 `pareto-frontier.md §14.2` 的问题 "框架是否有能力发现 Pareto 前沿"。
+
+- **成本轴（3h wall time, 1760 games, 8253 steps, 2.49M params）** 与 **真理轴（full eval 200 局 vs stochastic L1 的真实 WR）** 首次同时记录且都有统计意义。
+- 这是 Gomoku domain 里第一个可放入 `(cost, true_quality)` Pareto 图的"可信"数据点。mcts_9th 的 "6h 100%" 在修好的尺度上测量显示**不构成前沿点**——因为它那个 100% 没有 domain truth 支撑。
+- 修复后的 `cycle_metrics.policy_loss / value_loss` 列让 analyze.py 后续可以做"训练真的在学吗"这类诊断式 Pareto 分析，而不是只盯总 loss 数字。
+
+**用 §14.6 的语言总结：** 框架没有越界——它没有替我们决定要不要上 MCTS、要不要换架构。它只是把"尺子"修好了，让后续任何训练的数据都能进入一个可比较、可解释的前沿面。下一次注册 S2 / S3 时，这份 mcts_10 数据会作为"真实基准曲线的起点"一直被引用。
+
+### 8.12 一句话结论
+
+> **mcts_10 证明 v14 的框架修复有效：policy 先验仍然弱，但在修好的协议下 100% vs 随机化 L1 是真的；checkpoint wr088_c0160 可以注册为 S1v2，下一步应直接进入 3 小时 L2 训练（resume + LR 3e-4），目标 smoothed WR ≥ 60% vs stochastic L2。**
