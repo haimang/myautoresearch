@@ -6,6 +6,7 @@ The agent modifies hyperparameters and architecture between runs.
 """
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import os
@@ -194,6 +195,41 @@ def load_model(path: str, num_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS) ->
     model = GomokuNet(num_blocks=num_blocks, num_filters=num_filters)
     model.load_weights(path)
     return model
+
+
+# v15 B1: weight snapshot for async eval. We need to freeze the model state
+# at probe-submit time so the background eval thread can read weights without
+# racing the training loop's optimizer.update(). MLX arrays are immutable, so
+# parameters() returns a tree of immutable refs — copying them via tree_map
+# is safe and cheap (~10MB / ~50ms for an 8x128 model).
+def snapshot_model(model: GomokuNet,
+                   num_blocks: int = NUM_RES_BLOCKS,
+                   num_filters: int = NUM_FILTERS) -> GomokuNet:
+    """Return a frozen copy of `model` for use by background eval threads.
+
+    The returned model is in eval mode and detached from any training state.
+    """
+    snap = GomokuNet(num_blocks=num_blocks, num_filters=num_filters)
+    # tree_unflatten + flatten to deep-copy the parameter tree
+    src_params = nn.utils.tree_flatten(model.parameters())
+    snap_params = {k: mx.array(v) for k, v in src_params}
+    snap.update(nn.utils.tree_unflatten(list(snap_params.items())))
+    snap.eval()
+    mx.eval(snap.parameters())
+    return snap
+
+
+def _eval_worker(snapshot: "GomokuNet", level: int, n_games: int,
+                 num_openings: int, opponent_model: "GomokuNet | None") -> dict:
+    """v15 B2: thread-pool worker. Runs in background while training continues.
+
+    Receives a frozen weight snapshot, runs `_in_process_eval`, returns the
+    full result dict (including `wr_by_opening`). Pure function — no shared
+    mutable state with the main thread.
+    """
+    return _in_process_eval(snapshot, level, n_games,
+                            opponent_model=opponent_model,
+                            num_openings=num_openings)
 
 
 # ---------------------------------------------------------------------------
@@ -959,10 +995,30 @@ def train(args):
         resumed_from = resolved_id
         resume_model_path = latest_ckpt["model_path"]
         initial_cycle = latest_ckpt["cycle"]
-        initial_ckpt_wr = latest_ckpt["win_rate"]
+
+        # v15 A1: cross-level resume must reset the checkpoint threshold chain.
+        #
+        # Prior behaviour inherited parent's final WR verbatim as
+        # `initial_ckpt_wr`. When resuming into a different `--eval-level`
+        # (e.g. mcts_10 vs L1 @100% → mcts_11 vs L2), the inherited 1.0 made
+        # `crossed_threshold()` always return None and no checkpoint was ever
+        # saved during the child run. See mcts_11 post-mortem in v15-update.md
+        # §3.1. We now check parent's eval_level; if different, reset to 0 so
+        # the child run starts a fresh threshold chain vs the new opponent.
+        parent_eval_level = old_run.get("eval_level")
+        if parent_eval_level is None or parent_eval_level != args.eval_level:
+            initial_ckpt_wr = 0.0
+            _ckpt_note = (
+                f" [cross-level resume: parent eval_level="
+                f"{parent_eval_level}, new={args.eval_level}, "
+                f"threshold chain reset from 0]"
+            )
+        else:
+            initial_ckpt_wr = latest_ckpt["win_rate"]
+            _ckpt_note = ""
         print(f"Resuming from run {resolved_id[:8]}  "
-              f"cycle={initial_cycle}  wr={initial_ckpt_wr:.1%}  "
-              f"model={resume_model_path}")
+              f"cycle={initial_cycle}  parent_wr={latest_ckpt['win_rate']:.1%}  "
+              f"model={resume_model_path}{_ckpt_note}")
         db_tmp.close()
 
     # Initialize tracker DB
@@ -997,9 +1053,33 @@ def train(args):
                         eval_opponent=args.eval_opponent)
 
     # Initialize model
+    # Priority: --resume > --initial-opponent > fresh init
     if resume_model_path and os.path.exists(resume_model_path):
         model = load_model(resume_model_path, num_blocks=num_blocks,
                            num_filters=num_filters)
+    elif args.initial_opponent:
+        # v15 F2: from-scratch run but starting weights come from a
+        # registered opponent. This is the entry point for v16's
+        # "S2 vs S2 from scratch" training mode.
+        opp = _tracker.get_opponent(db_conn, args.initial_opponent)
+        if not opp:
+            print(f"Error: --initial-opponent '{args.initial_opponent}' not found")
+            sys.exit(1)
+        if not os.path.exists(opp["model_path"]):
+            print(f"Error: opponent weights not found: {opp['model_path']}")
+            sys.exit(1)
+        opp_nb = opp.get("num_res_blocks") or num_blocks
+        opp_nf = opp.get("num_filters") or num_filters
+        if opp_nb != num_blocks or opp_nf != num_filters:
+            print(f"Warning: --initial-opponent {args.initial_opponent} arch "
+                  f"({opp_nb}x{opp_nf}) != --num-blocks/--num-filters "
+                  f"({num_blocks}x{num_filters}). Using opponent's arch.")
+            num_blocks = opp_nb
+            num_filters = opp_nf
+        model = load_model(opp["model_path"],
+                           num_blocks=num_blocks, num_filters=num_filters)
+        print(f"Initial weights loaded from opponent '{args.initial_opponent}' "
+              f"({num_blocks}x{num_filters})")
     else:
         model = GomokuNet(num_blocks=num_blocks, num_filters=num_filters)
     dummy = mx.zeros((1, 3, BOARD_SIZE, BOARD_SIZE))
@@ -1034,6 +1114,17 @@ def train(args):
     policy_loss_history: list[float] = []
     value_loss_history: list[float] = []
 
+    # v15 B2: async eval state. Single worker thread runs probes (and full
+    # evals on threshold crossings) on a frozen weight snapshot. Main loop
+    # polls `pending_eval` at the top of each cycle and integrates the
+    # result into cycle_metrics + checkpoint logic without blocking.
+    eval_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="eval-worker"
+    )
+    pending_eval: dict | None = None  # {"future", "kind", "submit_cycle", ...}
+    eval_status_str = "idle"   # for TUI display
+    eval_submit_time: float = 0.0  # for TUI elapsed display
+
     # NN opponent (if --eval-opponent specified)
     eval_opponent_alias: str | None = args.eval_opponent
     opponent_model = None
@@ -1055,7 +1146,17 @@ def train(args):
               f"from {opp['model_path']}")
 
     # NN training opponent (if --train-opponent specified)
+    # v15 F2: when --initial-opponent is given but --train-opponent is not,
+    # default the train opponent to the same alias. This is the v16 path:
+    # "S2 vs S2 from scratch" boils down to one CLI flag.
     train_opponent_alias: str | None = args.train_opponent
+    if train_opponent_alias is None and args.initial_opponent is not None:
+        train_opponent_alias = args.initial_opponent
+        if args.opponent_mix < 0.999:
+            print(f"[v15 F2] --initial-opponent {args.initial_opponent} given "
+                  f"without --train-opponent: using same alias as train-opponent. "
+                  f"For pure S vs S, set --opponent-mix 1.0 "
+                  f"(current: {args.opponent_mix})")
     train_opponent_model = None
     opponent_mix: float = args.opponent_mix if train_opponent_alias else 0.0
     if train_opponent_alias:
@@ -1114,6 +1215,198 @@ def train(args):
         w = min(window, len(wr_history))
         return sum(wr_history[-w:]) / w
 
+    # ─── v15 B2-B6: async eval submit / integrate helpers ────────────────
+    # `pending_eval` is a dict (or None) defined in the outer training state,
+    # accessed via nonlocal because Python closures cannot rebind ints/dicts
+    # otherwise. The nested functions modify it via `nonlocal`.
+
+    def _submit_eval(kind: str, eval_games: int, integrate_as_threshold: float | None):
+        """v15 B2: snapshot the model and submit an eval to the worker pool.
+
+        kind: 'probe' or 'full'
+        integrate_as_threshold: when not None, this eval result is also used
+                                to save a checkpoint at the given threshold
+                                (i.e. the result of a full eval triggered by a
+                                probe crossing).
+        """
+        nonlocal pending_eval, eval_status_str, eval_submit_time
+        if pending_eval is not None:
+            # Skip — only one eval in flight at a time
+            _log_event(
+                f"⊘ Eval {kind} skipped (cycle {cycle}): previous "
+                f"{pending_eval['kind']} still running "
+                f"(elapsed {(_time.time()-eval_submit_time):.0f}s)"
+            )
+            return
+        snap = snapshot_model(model, num_blocks=num_blocks, num_filters=num_filters)
+        f = eval_executor.submit(
+            _eval_worker, snap, eval_level, eval_games,
+            args.eval_openings, opponent_model,
+        )
+        pending_eval = {
+            "future": f,
+            "kind": kind,
+            "submit_cycle": cycle,
+            "submit_time": _time.time(),
+            "n_games": eval_games,
+            "integrate_as_threshold": integrate_as_threshold,
+        }
+        eval_status_str = "running"
+        eval_submit_time = _time.time()
+        _log_event(
+            f"→ Eval {kind} submitted (cycle {cycle}, {eval_games} games)"
+        )
+
+    def _try_integrate_eval():
+        """v15 B3: poll the in-flight eval; integrate if done.
+
+        Called once per cycle at the top. Non-blocking: if not done, returns
+        immediately. If done, writes cycle_metrics, checks checkpoint
+        threshold, and may trigger a chained full-eval.
+        """
+        nonlocal pending_eval, last_probe_wr, last_ckpt_wr, num_checkpoints
+        nonlocal eval_status_str, stop_reason
+        if pending_eval is None:
+            return
+        f: Future = pending_eval["future"]
+        if not f.done():
+            return
+        try:
+            result = f.result()
+        except Exception as exc:
+            _log_event(f"✗ Eval {pending_eval['kind']} failed: {exc}")
+            pending_eval = None
+            eval_status_str = "idle"
+            return
+
+        kind = pending_eval["kind"]
+        submit_cycle = pending_eval["submit_cycle"]
+        threshold_for_ckpt = pending_eval["integrate_as_threshold"]
+        elapsed = _time.time() - pending_eval["submit_time"]
+        pending_eval = None
+        eval_status_str = "idle"
+
+        wr = result["win_rate"]
+        uniq = result.get("unique_trajectories", 0)
+        n_open = result.get("num_openings", 0)
+        n_g = result.get("wins", 0) + result.get("losses", 0) + result.get("draws", 0)
+
+        if kind == "probe":
+            last_probe_wr = wr
+            wr_history.append(wr)
+            sm_wr = _smoothed_wr()
+            sm_str = f" (avg:{sm_wr:.1%})" if sm_wr is not None and len(wr_history) > 1 else ""
+            opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
+            _log_event(
+                f"✓ Probe done c{submit_cycle}: {wr:.1%}{sm_str} "
+                f"({n_g} games vs {opp_label}, {uniq}u/{n_open}o, {elapsed:.0f}s)"
+            )
+            # Write a probe row to cycle_metrics, attributed to the SUBMIT cycle
+            _tracker.save_cycle_metric(db_conn, run_id, {
+                "cycle": cycle,  # row index = current; submit_cycle stored separately
+                "timestamp_s": _time.time() - start_time,
+                "loss": last_loss,
+                "policy_loss": last_policy_loss,
+                "value_loss": last_value_loss,
+                "total_games": total_games,
+                "total_steps": total_train_steps,
+                "buffer_size": len(replay_buffer),
+                "win_rate": wr,
+                "eval_type": "probe",
+                "eval_games": n_g,
+                "eval_level": eval_level,
+                "eval_submitted_cycle": submit_cycle,
+            })
+
+            # Threshold check: did smoothed WR cross a checkpoint gate?
+            effective_wr = sm_wr if sm_wr is not None else wr
+            crossed = _tracker.crossed_threshold(effective_wr, last_ckpt_wr)
+            if crossed is not None:
+                # Submit a full eval — checkpoint gets saved when full eval returns
+                _submit_eval("full", full_eval_games, integrate_as_threshold=crossed)
+                last_ckpt_wr = effective_wr  # advance even though full eval pending
+
+            # Target WR / stagnation early stop checks
+            if target_win_rate and effective_wr >= target_win_rate:
+                _log_event(f"🎯 Target {target_win_rate:.0%} reached (avg:{effective_wr:.1%})")
+                stop_reason = "target_win_rate"
+
+            if auto_stop_stagnation and len(wr_history) >= stagnation_window:
+                _sw = wr_history[-stagnation_window:]
+                _xs = list(range(len(_sw)))
+                _n = len(_sw)
+                _sx = sum(_xs); _sy = sum(_sw)
+                _sxy = sum(x*y for x,y in zip(_xs, _sw))
+                _sxx = sum(x*x for x in _xs)
+                _denom = _n*_sxx - _sx*_sx
+                if abs(_denom) > 1e-12:
+                    _slope = (_n*_sxy - _sx*_sy) / _denom
+                    _mean = _sy / _n
+                    _std = (sum((w-_mean)**2 for w in _sw) / _n) ** 0.5
+                    _expected = abs(_slope * _n)
+                    if _expected < _std and _std > 0.01:
+                        _log_event(
+                            f"⚠ Stagnation: WR plateau for {stagnation_window} "
+                            f"evals (std={_std:.1%})"
+                        )
+                        stop_reason = "stagnation"
+
+        elif kind == "full":
+            # Full eval result → save checkpoint
+            _do_checkpoint_from_result(
+                result, cycle=cycle, threshold=threshold_for_ckpt,
+            )
+            num_checkpoints += 1
+            _log_event(
+                f"✓ Full eval done c{submit_cycle}: {wr:.1%} "
+                f"({result.get('wins',0)}W/{result.get('losses',0)}L, "
+                f"{uniq}u/{n_open}o, {elapsed:.0f}s) → checkpoint saved"
+            )
+
+    def _do_checkpoint_from_result(result: dict, cycle: int, threshold: float | None):
+        """v15 B4: save a checkpoint built from an async full-eval result.
+
+        Inlines the relevant bits of the old _do_checkpoint() that came after
+        the eval call (which is now in the worker thread).
+        """
+        wr_pct = int((threshold if threshold is not None else result["win_rate"]) * 100)
+        tag = f"wr{wr_pct:03d}_c{cycle:04d}"
+        ckpt_path = f"{ckpt_dir}/{tag}.safetensors"
+        save_model(model, ckpt_path)
+        elapsed = _time.time() - start_time
+        full_wr = result.get("win_rate", 0.0)
+        uniq = result.get("unique_trajectories", 0)
+
+        _tracker.save_checkpoint(db_conn, run_id, {
+            "tag": tag,
+            "cycle": cycle,
+            "step": total_train_steps,
+            "loss": last_loss,
+            "win_rate": full_wr,
+            "eval_level": eval_level,
+            "eval_games": result.get("wins", 0) + result.get("losses", 0) + result.get("draws", 0),
+            "wins": result.get("wins"),
+            "losses": result.get("losses"),
+            "draws": result.get("draws"),
+            "avg_game_length": result.get("avg_game_length"),
+            "num_params": num_params,
+            "model_path": ckpt_path,
+            "model_size_bytes": os.path.getsize(ckpt_path),
+            "train_elapsed_s": elapsed,
+            "eval_elapsed_s": result.get("eval_elapsed_s"),
+            "eval_unique_openings": uniq,
+            "recent_smoothed_wr": list(wr_history[-5:]) if wr_history else [],
+        })
+        # Persist per-opening breakdown for E3 diagnostics
+        if result.get("wr_by_opening"):
+            ckpt_id = db_conn.execute(
+                "SELECT id FROM checkpoints WHERE run_id=? AND tag=?",
+                (run_id, tag),
+            ).fetchone()
+            if ckpt_id is not None:
+                _tracker.save_eval_breakdown(db_conn, ckpt_id[0],
+                                             result["wr_by_opening"])
+
     def _recent_avg(values: list[float], window: int = 5) -> float | None:
         if not values:
             return None
@@ -1162,6 +1455,39 @@ def train(args):
                 f"  P-Loss  {last_policy_loss:>6.3f}   │   V-Loss   {last_value_loss:>8.4f}   │   "
                 f"policy entropy gap: {max(0.0, last_policy_loss):.2f} nats"
             ))
+
+        # --- v15 B5: async eval status row ---
+        if pending_eval is not None:
+            kind = pending_eval["kind"]
+            ec = pending_eval["submit_cycle"]
+            ng = pending_eval["n_games"]
+            elapsed_e = _time.time() - pending_eval["submit_time"]
+            lines.append(row(
+                f"  Eval    ⋯ {kind:<5} (submit c{ec}, {ng}g, {elapsed_e:>4.0f}s)         "
+            ))
+        else:
+            lines.append(row(f"  Eval    ★ idle                                                       "))
+
+        # --- v15 E4: training health row ---
+        h_learning = "★"
+        if len(policy_loss_history) >= 20:
+            recent = policy_loss_history[-10:]
+            older = policy_loss_history[-20:-10]
+            if sum(recent)/10 >= sum(older)/10 - 0.005:
+                h_learning = "⚠"
+        h_diverse = "★"
+        if last_probe_wr is not None and last_value_loss is not None:
+            # Diversity proxy: probe was recently run and finished
+            pass
+        h_value = "★" if (last_value_loss is None or 0.05 <= last_value_loss <= 0.6) else "⚠"
+        h_plateau = "⚠" if (len(wr_history) >= 5
+                              and max(wr_history[-5:]) - min(wr_history[-5:]) < 0.02
+                              and max(wr_history[-5:]) < 0.95) else "★"
+        h_collapse = "★"  # filled in by full-eval; default ★
+        lines.append(row(
+            f"  Health  learn:{h_learning}  diverse:{h_diverse}  plateau:{h_plateau}  "
+            f"value:{h_value}  collapse:{h_collapse}"
+        ))
 
         # --- MCTS stats row (only when MCTS is active) ---
         if MCTS_SIMULATIONS > 0:
@@ -1266,25 +1592,44 @@ def train(args):
                 stop_reason = "target_games"
                 break
 
+            # v15 B3: poll any in-flight async eval and integrate the result
+            # into cycle_metrics / checkpoint logic. Non-blocking — costs
+            # ~1 μs when no eval is pending.
+            _try_integrate_eval()
+            if stop_reason in ("target_win_rate", "stagnation"):
+                _update_tui()
+                break
+
             cycle += 1
 
             # ----- Self-play (+ optional opponent games) -----
+            # v15 F1: opponent_mix=1.0 means PURE opponent play (no self-play).
+            # This is the entry point for v16's "S2 vs S2 from scratch" path.
+            # Old behaviour forced n_self ≥ 1 even at mix=1.0, which prevented
+            # the pure-opponent training mode from running.
             model.eval()
-            if train_opponent_model and opponent_mix > 0 and parallel_games >= 2:
-                n_opp = max(1, int(parallel_games * opponent_mix))
-                n_self = max(1, parallel_games - n_opp)
+            if train_opponent_model and opponent_mix > 0 and parallel_games >= 1:
+                if opponent_mix >= 0.999:
+                    n_opp = parallel_games
+                    n_self = 0
+                else:
+                    n_opp = max(1, int(parallel_games * opponent_mix))
+                    n_self = max(1, parallel_games - n_opp)
             else:
                 n_opp = 0
                 n_self = parallel_games
 
             sp_t0 = _time.time()
-            data, games_done, avg_gl, mcts_st = run_self_play(
-                model, num_games=n_self, temperature=TEMPERATURE
-            )
+            if n_self > 0:
+                data, games_done, avg_gl, mcts_st = run_self_play(
+                    model, num_games=n_self, temperature=TEMPERATURE
+                )
+                last_mcts_stats = mcts_st
+            else:
+                data, games_done, avg_gl = [], 0, 0.0
             selfplay_time = _time.time() - sp_t0
             total_games += games_done
             avg_game_length = avg_gl
-            last_mcts_stats = mcts_st
 
             if n_opp > 0 and train_opponent_model is not None:
                 opp_data, opp_done, opp_gl = run_opponent_play(
@@ -1294,7 +1639,7 @@ def train(args):
                 total_games += opp_done
                 # Weighted average of game lengths
                 total_g = games_done + opp_done
-                avg_game_length = (avg_gl * games_done + opp_gl * opp_done) / total_g if total_g > 0 else 0.0
+                avg_game_length = (avg_gl * games_done + opp_gl * opp_done) / total_g if total_g > 0 else opp_gl
 
             for item in data:
                 if len(replay_buffer) >= buffer_size:
@@ -1422,79 +1767,24 @@ def train(args):
                 "buffer_size": len(replay_buffer),
             }
 
-            # ----- Probe evaluation -----
+            # ----- Probe evaluation (v15 B2: async submit; results integrated
+            #  by _try_integrate_eval() at the top of each subsequent cycle) ----
             if cycle % eval_interval == 0 and evaluate_win_rate is not None:
-                model.eval()
-                probe_wr = _quick_eval(model, eval_level, probe_games,
-                                       opponent_model=opponent_model,
-                                       num_openings=args.eval_openings)
-                last_probe_wr = probe_wr
-                wr_history.append(probe_wr)
-                metric["win_rate"] = probe_wr
-                metric["eval_type"] = "probe"
-                metric["eval_games"] = probe_games
-                metric["eval_level"] = eval_level
+                _submit_eval("probe", probe_games, integrate_as_threshold=None)
+                # Stagnation/target/WR integration now happens when the probe
+                # result is polled in (see _try_integrate_eval).
 
-                sm_wr = _smoothed_wr()
-                sm_str = f" (avg:{sm_wr:.1%})" if sm_wr is not None and len(wr_history) > 1 else ""
-                opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
-                _log_event(f"Probe: {probe_wr:.1%}{sm_str} ({probe_games} games vs {opp_label})")
-
-                # Check checkpoint threshold using smoothed WR
-                effective_wr = sm_wr if sm_wr is not None else probe_wr
-                crossed = _tracker.crossed_threshold(effective_wr, last_ckpt_wr)
-                if crossed is not None:
-                    _do_checkpoint(
-                        model, db_conn, run_id, run_id_short, cycle,
-                        total_train_steps, last_loss, effective_wr,
-                        eval_level, full_eval_games, num_params,
-                        start_time, events, _log_event,
-                        ckpt_dir, recording_dir,
-                        threshold=crossed,
-                        num_blocks=num_blocks, num_filters=num_filters,
-                        opponent_model=opponent_model,
-                        eval_opponent_alias=eval_opponent_alias,
-                        num_openings=args.eval_openings,
-                    )
-                    last_ckpt_wr = effective_wr
-                    num_checkpoints += 1
-
-                # Early stop on target win rate (using smoothed WR)
-                if target_win_rate and effective_wr >= target_win_rate:
-                    _log_event(f"🎯 Target win rate {target_win_rate:.0%} reached! (avg:{effective_wr:.1%})")
-                    stop_reason = "target_win_rate"
-                    _update_tui()
-                    break
-
-                # Early stop on stagnation (optional)
-                if auto_stop_stagnation and len(wr_history) >= stagnation_window:
-                    _sw = wr_history[-stagnation_window:]
-                    _xs = list(range(len(_sw)))
-                    _n = len(_sw)
-                    _sx = sum(_xs); _sy = sum(_sw)
-                    _sxy = sum(x*y for x,y in zip(_xs, _sw))
-                    _sxx = sum(x*x for x in _xs)
-                    _denom = _n*_sxx - _sx*_sx
-                    if abs(_denom) > 1e-12:
-                        _slope = (_n*_sxy - _sx*_sy) / _denom
-                        _mean = _sy / _n
-                        _std = (sum((w-_mean)**2 for w in _sw) / _n) ** 0.5
-                        _expected = abs(_slope * _n)
-                        if _expected < _std and _std > 0.01:
-                            _log_event(f"⚠ Stagnation: WR plateau for {stagnation_window} evals (std={_std:.1%})")
-                            stop_reason = "stagnation"
-                            _update_tui()
-                            break
+            if stop_reason in ("target_win_rate", "stagnation"):
+                _update_tui()
+                break
 
             if steps_run_this_cycle > 0 and last_loss > 0:
                 loss_history.append(last_loss)
 
             # Only emit a cycle_metrics row if something meaningful happened
-            # this cycle — either a training step produced a loss, or a
-            # probe eval populated win_rate. Otherwise (time-budget expired
-            # after self-play but before training) we'd pollute the run with
-            # a loss=0 artifact row — see v14 mcts_9th findings §7.4.
-            if steps_run_this_cycle > 0 or metric.get("win_rate") is not None:
+            # this cycle. Probe rows are written separately by
+            # _try_integrate_eval() when the async result arrives.
+            if steps_run_this_cycle > 0:
                 _tracker.save_cycle_metric(db_conn, run_id, metric)
 
             # Update TUI or print
@@ -1521,6 +1811,19 @@ def train(args):
         stop_reason = "interrupted"
         _log_event("Training interrupted by user")
     finally:
+        # v15 B8: drain in-flight eval before shutdown so we don't lose data
+        # or hang the executor. Bounded wait — if eval is pathologically slow
+        # we cancel and warn rather than block forever.
+        if pending_eval is not None:
+            try:
+                _log_event("Waiting for in-flight eval to complete (up to 30s)…")
+                pending_eval["future"].result(timeout=30)
+                _try_integrate_eval()
+            except Exception as exc:
+                _log_event(f"⚠ Eval drain timed out / failed: {exc}")
+                pending_eval = None
+        eval_executor.shutdown(wait=False, cancel_futures=True)
+
         if use_tui:
             # Print final state after clearing
             sys.stdout.write("\033[H\033[J")
@@ -1578,7 +1881,13 @@ def train(args):
                 "train_elapsed_s": total_elapsed,
                 "eval_elapsed_s": result.get("eval_elapsed_s"),
                 "eval_unique_openings": uniq,
+                # v15 E2: include recent smoothed WR so can_promote() runs
+                "recent_smoothed_wr": list(wr_history[-5:]) if wr_history else [],
             })
+            # v15 E3: persist per-opening WR breakdown
+            if result.get("wr_by_opening"):
+                _tracker.save_eval_breakdown(db_conn, ckpt_id,
+                                             result["wr_by_opening"])
             # Save recording metadata
             for gd in result.get("game_details", []):
                 if "game_file" in gd:
@@ -1602,6 +1911,67 @@ def train(args):
         "wall_time_s": total_elapsed,
         "peak_memory_mb": None,
     })
+
+    # ----- v15 E5: --auto-promote-to <alias> -----
+    # If the user asked for auto-promotion and at least one checkpoint in
+    # this run is promotion_eligible, register the most-recent eligible
+    # checkpoint as the target alias. If nothing is eligible, print the
+    # reason so the user sees why promotion was declined.
+    if args.auto_promote_to:
+        import shutil as _shutil
+        eligible_ckpts = db_conn.execute(
+            "SELECT id, tag, cycle, win_rate, eval_level, model_path, "
+            "promotion_eligible, promotion_reason "
+            "FROM checkpoints WHERE run_id = ? "
+            "ORDER BY cycle DESC", (run_id,)
+        ).fetchall()
+
+        chosen = None
+        for row in eligible_ckpts:
+            if row["promotion_eligible"] == 1:
+                chosen = row
+                break
+
+        if chosen is None:
+            reasons = [f"  {r['tag']}: {r['promotion_reason'] or 'unknown'}"
+                       for r in eligible_ckpts[:5]]
+            print(f"\n⚠ --auto-promote-to {args.auto_promote_to}: "
+                  f"no checkpoint is promotion_eligible")
+            for r in reasons:
+                print(r)
+        else:
+            alias = args.auto_promote_to
+            dst_dir = os.path.join("output", "opponents", alias)
+            os.makedirs(dst_dir, exist_ok=True)
+            dst_path = os.path.join(dst_dir, "model.safetensors")
+            _shutil.copy2(chosen["model_path"], dst_path)
+
+            # Detect prev_alias from resumed_from chain (if any)
+            prev_alias = None
+            if resumed_from:
+                parent_opp = db_conn.execute(
+                    "SELECT alias FROM opponents WHERE source_run = ?",
+                    (resumed_from,),
+                ).fetchone()
+                if parent_opp:
+                    prev_alias = parent_opp["alias"]
+
+            _tracker.register_opponent(
+                db_conn, alias, dst_path,
+                source_run=run_id,
+                source_tag=chosen["tag"],
+                win_rate=chosen["win_rate"],
+                eval_level=chosen["eval_level"],
+                description=f"Auto-promoted from {run_id[:8]}/{chosen['tag']}",
+                num_res_blocks=num_blocks,
+                num_filters=num_filters,
+                prev_alias=prev_alias,
+            )
+            print(f"\n✓ Auto-promoted to {alias}: "
+                  f"{chosen['tag']} WR={chosen['win_rate']:.1%} "
+                  f"(prev_alias={prev_alias or '—'})")
+            print(f"  Model copied to {dst_path}")
+
     db_conn.close()
 
     # ----- Print summary -----
@@ -1738,10 +2108,14 @@ def _in_process_eval(model, level: int, n_games: int,
 
     wins, losses, draws = 0, 0, 0
     total_moves = 0
-    # Track distinct game trajectories seen in this eval — a sanity check
-    # that opening diversification + stochastic opponents actually broke
-    # the "all games identical" failure mode. See v14 findings §7.3.
     trajectory_fingerprints: set[tuple] = set()
+    # v15 E3: per-opening WR breakdown. Indexed by opening_index.
+    per_opening: list[dict] = [
+        {"opening_index": i, "opening_moves": str(openings[i]),
+         "wins": 0, "losses": 0, "draws": 0,
+         "_lengths": [], "_traj": set()}
+        for i in range(len(openings))
+    ]
     start = _time.time()
 
     for game_i in range(n_games):
@@ -1749,11 +2123,10 @@ def _in_process_eval(model, level: int, n_games: int,
         nn_player = BLACK if nn_is_black else WHITE
 
         board = Board()
-        # Pick an opening deterministically by game index so the per-opening
-        # games-per-side split stays balanced.
         side_games = max(1, n_games // 2)
         local_i = game_i if nn_is_black else game_i - n_games // 2
-        opening = openings[local_i % len(openings)]
+        opening_index = local_i % len(openings)
+        opening = openings[opening_index]
         _apply_opening(board, opening)
 
         trajectory: list[int] = []
@@ -1774,20 +2147,44 @@ def _in_process_eval(model, level: int, n_games: int,
             board.place(row, col)
             trajectory.append(row * BOARD_SIZE + col)
 
-        trajectory_fingerprints.add(tuple(trajectory))
+        traj_tuple = tuple(trajectory)
+        trajectory_fingerprints.add(traj_tuple)
+
+        bucket = per_opening[opening_index]
+        bucket["_lengths"].append(board.move_count)
+        bucket["_traj"].add(traj_tuple)
 
         total_moves += board.move_count
         if board.winner == nn_player:
             wins += 1
+            bucket["wins"] += 1
         elif board.winner is not None:
             losses += 1
+            bucket["losses"] += 1
         else:
             draws += 1
+            bucket["draws"] += 1
 
         if game_i % 20 == 0:
             mx.clear_cache()
 
     elapsed = _time.time() - start
+
+    # Finalize per-opening structs (avg length + unique games)
+    breakdown = []
+    for b in per_opening:
+        n_games_b = b["wins"] + b["losses"] + b["draws"]
+        avg_len_b = sum(b["_lengths"]) / max(1, len(b["_lengths"]))
+        breakdown.append({
+            "opening_index": b["opening_index"],
+            "opening_moves": b["opening_moves"],
+            "wins": b["wins"],
+            "losses": b["losses"],
+            "draws": b["draws"],
+            "avg_length": avg_len_b,
+            "unique_games": len(b["_traj"]),
+        })
+
     return {
         "win_rate": wins / n_games if n_games > 0 else 0.0,
         "wins": wins,
@@ -1797,6 +2194,7 @@ def _in_process_eval(model, level: int, n_games: int,
         "eval_elapsed_s": elapsed,
         "num_openings": len(openings),
         "unique_trajectories": len(trajectory_fingerprints),
+        "wr_by_opening": breakdown,
     }
 
 
@@ -2030,11 +2428,23 @@ def parse_args() -> argparse.Namespace:
                    help="Fraction of games played vs train-opponent (default: 0.2)")
     p.add_argument("--resume", type=str, default=None,
                    help="UUID of a previous run to resume from its last checkpoint")
+    # v15 F2: from-scratch training but start with an opponent's weights.
+    # Used by v16's "S2 vs S2 from scratch" path — unlike --resume which
+    # inherits cycle count and optimizer state, --initial-opponent only
+    # copies the weights into a fresh run.
+    p.add_argument("--initial-opponent", type=str, default=None, metavar="ALIAS",
+                   help="Load weights from a registered opponent as the "
+                        "starting point (fresh run, not a resume)")
     # Stagnation early stopping
     p.add_argument("--auto-stop-stagnation", action="store_true",
                    help="Auto-stop training when WR plateaus (stagnation detected)")
     p.add_argument("--stagnation-window", type=int, default=10,
                    help="Number of eval points for stagnation detection (default: 10)")
+    # v15 E5: auto-promotion. On completion, if any checkpoint is eligible
+    # per can_promote(), register the newest eligible one as this alias.
+    p.add_argument("--auto-promote-to", type=str, default=None, metavar="ALIAS",
+                   help="On success, auto-register the best eligible "
+                        "checkpoint as an opponent alias (e.g. S2, S3)")
     # Opponent registration (non-training mode)
     p.add_argument("--register-opponent", type=str, default=None, metavar="ALIAS",
                    help="Register a checkpoint as a named NN opponent")

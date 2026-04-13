@@ -36,6 +36,33 @@ EVAL_GAMES = 200  # games per evaluation
 RECORDING_DIR = "output/recordings"
 
 # ---------------------------------------------------------------------------
+# Minimax backend (v15 C4): choose between native C and pure Python.
+#
+# The C backend is 50-100x faster than Python for L2/L3 and is the only way
+# L3 (depth 6) becomes usable. Forced via env var:
+#     GOMOKU_MINIMAX_BACKEND=c       → try C, fail if unavailable
+#     GOMOKU_MINIMAX_BACKEND=python  → force pure Python (baseline)
+#     GOMOKU_MINIMAX_BACKEND=auto    → try C, silently fall back to Python (default)
+# ---------------------------------------------------------------------------
+
+MINIMAX_BACKEND = "python"  # updated below
+_minimax_native = None
+
+_backend_pref = os.environ.get("GOMOKU_MINIMAX_BACKEND", "auto").lower()
+if _backend_pref in ("c", "auto"):
+    try:
+        import minimax_native as _minimax_native  # noqa: E402
+        if _minimax_native.is_available():
+            MINIMAX_BACKEND = "c"
+    except ImportError:
+        if _backend_pref == "c":
+            raise
+        _minimax_native = None
+if _backend_pref == "python":
+    MINIMAX_BACKEND = "python"
+    _minimax_native = None
+
+# ---------------------------------------------------------------------------
 # Minimax evaluation heuristic
 # ---------------------------------------------------------------------------
 
@@ -335,7 +362,21 @@ def _root_move_scores(board: Board, depth: int, player: int,
     first layer of ``minimax_move``'s alpha-beta loop, but it returns ALL
     (move, score) pairs instead of just the best one — enabling stochastic
     sampling from top-k moves.
+
+    v15 C4: delegates to the native C implementation when available. Python
+    code path below is kept as a verified fallback.
     """
+    if MINIMAX_BACKEND == "c" and _minimax_native is not None:
+        # Select the C-side move_order ID by examining the fn identity.
+        if move_order_fn is _move_order_basic:
+            mo = _minimax_native.MOVE_ORDER_BASIC
+        elif move_order_fn is _move_order_heuristic:
+            mo = _minimax_native.MOVE_ORDER_HEURISTIC
+        else:
+            mo = _minimax_native.MOVE_ORDER_KILLER
+        return _minimax_native.root_scores(board.grid, player, depth, mo)
+
+    # --- Python fallback (unchanged) ---
     grid = board.grid.copy()
     opponent = WHITE if player == BLACK else BLACK
     candidate_fn = _make_candidate_fn(radius=2)

@@ -17,14 +17,63 @@ from typing import Optional
 
 DB_PATH = "output/tracker.db"
 
-# 检查点导出的胜率阈值
-# <80%: 每 5%, 80-90%: 每 2%, >90%: 每 1%
-CHECKPOINT_THRESHOLDS = [
-    0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
-    0.80, 0.82, 0.84, 0.86, 0.88,
-    0.90, 0.91, 0.92, 0.93, 0.94, 0.95,
-    0.96, 0.97, 0.98, 0.99, 1.00,
-]
+# v15 A2: 精简到 4 档 + Ctrl+C final 快照。
+#
+# 过去 22 个阈值对于 mcts_10/11 这种 3h 规模的 run 会产生 6-8 个
+# 中间 checkpoint，绝大部分都只是"刚越过阈值就存"的冗余记录。v15 起只在
+# 真正有晋升价值的四个点保存 checkpoint —— 其余的进度由 cycle_metrics
+# 的 probe 点体现，不需要复制一份 weights 文件。Ctrl+C 时的 final 快照
+# 仍然由 train.py 的 try/except KeyboardInterrupt 路径保证。
+CHECKPOINT_THRESHOLDS = [0.85, 0.90, 0.95, 1.00]
+
+# v15 E1: per-level WR thresholds for promotion eligibility.
+# Tighter for weaker opponents, looser for stronger ones.
+PROMOTION_WR_THRESHOLD_BY_LEVEL = {
+    0: 0.95,   # vs random — should be near-perfect to count as S0
+    1: 0.80,   # vs minimax depth 2
+    2: 0.60,   # vs minimax depth 4
+    3: 0.50,   # vs minimax depth 6 — "持续优化" stage
+}
+
+
+def can_promote(ckpt: dict, recent_smoothed_wr: list[float]) -> tuple[bool, str]:
+    """v15 E1: stage-promotion gate built from mcts_9th/10/11 hard lessons.
+
+    Returns (eligible, reason). Eligible only if ALL four checks pass:
+
+      1. WR ≥ level-specific threshold (PROMOTION_WR_THRESHOLD_BY_LEVEL)
+      2. unique_openings ≥ 16 (statistical-power gate; mcts_9th had ≈2)
+      3. avg_game_length ∈ [12, 60] (no speed-replay collapse)
+      4. recent smoothed WR range ≤ 0.15 over last 5 probes (stability)
+
+    If any check fails, returns (False, descriptive_reason).
+    """
+    level = ckpt.get("eval_level")
+    if level is None:
+        return False, "missing eval_level"
+
+    threshold = PROMOTION_WR_THRESHOLD_BY_LEVEL.get(level, 0.80)
+    wr = ckpt.get("win_rate")
+    if wr is None or wr < threshold:
+        return False, f"WR {wr:.2%} < {threshold:.0%} threshold for L{level}"
+
+    uniq = ckpt.get("eval_unique_openings")
+    if uniq is None or uniq < 16:
+        return False, f"unique_openings {uniq} < 16 (stats collapse risk)"
+
+    avg_len = ckpt.get("avg_game_length")
+    if avg_len is None:
+        return False, "missing avg_game_length"
+    if avg_len < 12.0 or avg_len > 60.0:
+        return False, f"avg_len {avg_len:.1f} outside sane range [12, 60]"
+
+    if recent_smoothed_wr and len(recent_smoothed_wr) >= 3:
+        recent = recent_smoothed_wr[-5:]
+        spread = max(recent) - min(recent)
+        if spread > 0.15:
+            return False, f"recent smoothed WR unstable (range {spread:.0%} > 15%)"
+
+    return True, "OK"
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -192,6 +241,41 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     for col, typ in [("eval_unique_openings", "INTEGER")]:
         try:
             conn.execute(f"ALTER TABLE checkpoints ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+    # v15 E2: promotion gate result — written by save_checkpoint via can_promote()
+    for col, typ in [("promotion_eligible", "INTEGER"),
+                     ("promotion_reason", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE checkpoints ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+    # v15 E3: eval_breakdown table — per-opening WR for diagnosing model blind spots
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS eval_breakdown (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            checkpoint_id   INTEGER NOT NULL REFERENCES checkpoints(id),
+            opening_index   INTEGER NOT NULL,
+            opening_moves   TEXT,
+            wins            INTEGER NOT NULL,
+            losses          INTEGER NOT NULL,
+            draws           INTEGER NOT NULL,
+            avg_length      REAL,
+            unique_games    INTEGER
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_eval_breakdown_ckpt "
+                 "ON eval_breakdown(checkpoint_id)")
+    # v15 E5: opponent promotion chain (S0 → S1 → S2 → ...)
+    for col, typ in [("prev_alias", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE opponents ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+    # v15 B7: async eval — record submit-time cycle so analyze.py can show latency
+    for col, typ in [("eval_submitted_cycle", "INTEGER")]:
+        try:
+            conn.execute(f"ALTER TABLE cycle_metrics ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
     conn.commit()
@@ -391,7 +475,18 @@ def save_cycle_metric(conn: sqlite3.Connection, run_id: str,
 
 def save_checkpoint(conn: sqlite3.Connection, run_id: str,
                     data: dict) -> int:
-    """插入检查点记录，返回 checkpoint id。"""
+    """插入检查点记录，返回 checkpoint id。
+
+    v15 E2: also computes promotion_eligible via can_promote() if the caller
+    provides `recent_smoothed_wr` in `data`. Otherwise leaves it NULL.
+    """
+    eligible_int = None
+    eligible_reason = None
+    if "recent_smoothed_wr" in data:
+        ok, reason = can_promote(data, data.get("recent_smoothed_wr") or [])
+        eligible_int = 1 if ok else 0
+        eligible_reason = reason
+
     cur = conn.execute(
         """INSERT INTO checkpoints (
             run_id, tag, cycle, step, loss,
@@ -399,8 +494,8 @@ def save_checkpoint(conn: sqlite3.Connection, run_id: str,
             wins, losses, draws, avg_game_length,
             num_params, model_path, model_size_bytes,
             created_at, train_elapsed_s, eval_elapsed_s,
-            eval_unique_openings
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            eval_unique_openings, promotion_eligible, promotion_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             data["tag"],
@@ -421,10 +516,43 @@ def save_checkpoint(conn: sqlite3.Connection, run_id: str,
             data.get("train_elapsed_s"),
             data.get("eval_elapsed_s"),
             data.get("eval_unique_openings"),
+            eligible_int,
+            eligible_reason,
         ),
     )
     conn.commit()
     return cur.lastrowid
+
+
+def save_eval_breakdown(conn: sqlite3.Connection, checkpoint_id: int,
+                        breakdown: list[dict]) -> None:
+    """v15 E3: persist per-opening WR breakdown for a checkpoint."""
+    for b in breakdown:
+        conn.execute(
+            """INSERT INTO eval_breakdown (
+                checkpoint_id, opening_index, opening_moves,
+                wins, losses, draws, avg_length, unique_games
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                checkpoint_id,
+                b["opening_index"],
+                b.get("opening_moves"),
+                b["wins"],
+                b["losses"],
+                b["draws"],
+                b.get("avg_length"),
+                b.get("unique_games"),
+            ),
+        )
+    conn.commit()
+
+
+def get_eval_breakdown(conn: sqlite3.Connection, checkpoint_id: int) -> list[dict]:
+    cur = conn.execute(
+        "SELECT * FROM eval_breakdown WHERE checkpoint_id = ? ORDER BY opening_index",
+        (checkpoint_id,),
+    )
+    return [dict(row) for row in cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -593,18 +721,22 @@ def register_opponent(conn: sqlite3.Connection, alias: str,
                       eval_level: Optional[int] = None,
                       description: Optional[str] = None,
                       num_res_blocks: Optional[int] = None,
-                      num_filters: Optional[int] = None) -> None:
-    """注册一个模型检查点作为命名对手。"""
+                      num_filters: Optional[int] = None,
+                      prev_alias: Optional[str] = None) -> None:
+    """注册一个模型检查点作为命名对手。
+
+    v15 E5: `prev_alias` records the promotion chain (S0 → S1 → S2 → …).
+    """
     conn.execute(
         """INSERT OR REPLACE INTO opponents (
             alias, source_run, source_tag, model_path,
             win_rate, eval_level, description, created_at,
-            num_res_blocks, num_filters
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            num_res_blocks, num_filters, prev_alias
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (alias, source_run, source_tag, model_path,
          win_rate, eval_level, description,
          datetime.now(timezone.utc).isoformat(),
-         num_res_blocks, num_filters),
+         num_res_blocks, num_filters, prev_alias),
     )
     conn.commit()
 

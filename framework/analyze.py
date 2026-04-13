@@ -23,12 +23,12 @@ from datetime import datetime, timezone
 from core.db import DB_PATH, init_db
 
 
-def _connect() -> sqlite3.Connection:
+def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
     """Open tracker.db via core.db (shared connection + migration logic)."""
-    if not os.path.exists(DB_PATH):
-        print(f"Error: database not found at {DB_PATH}")
+    if not os.path.exists(db_path):
+        print(f"Error: database not found at {db_path}")
         sys.exit(1)
-    return init_db(DB_PATH)
+    return init_db(db_path)
 
 
 def _col(text: str, width: int) -> str:
@@ -654,6 +654,105 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md") -> None:
 
 
 # ---------------------------------------------------------------------------
+# v15 E7: 对手晋升链
+# ---------------------------------------------------------------------------
+
+def cmd_promotion_chain(conn: sqlite3.Connection) -> None:
+    """Print the opponent promotion chain (S0 → S1 → S2 → ...).
+
+    Reads the `prev_alias` column added in v15 E5. Each opponent is shown
+    with its source run, source checkpoint, eval level, and registered
+    win rate. The chain is reconstructed by walking `prev_alias` pointers.
+    """
+    rows = conn.execute(
+        "SELECT alias, source_run, source_tag, win_rate, eval_level, "
+        "       num_res_blocks, num_filters, description, created_at, prev_alias "
+        "FROM opponents ORDER BY created_at"
+    ).fetchall()
+
+    if not rows:
+        print("No registered opponents.")
+        return
+
+    by_alias = {r["alias"]: dict(r) for r in rows}
+
+    # Build chains from leaf nodes (those nobody references as prev_alias)
+    referenced = {r["prev_alias"] for r in rows if r["prev_alias"]}
+    leaves = [r["alias"] for r in rows if r["alias"] not in referenced]
+
+    print(f"Promotion chains ({len(rows)} opponents)")
+    print("─" * 78)
+    for leaf in leaves:
+        chain = []
+        cur = leaf
+        seen = set()
+        while cur and cur in by_alias and cur not in seen:
+            seen.add(cur)
+            chain.append(by_alias[cur])
+            cur = by_alias[cur].get("prev_alias")
+        chain.reverse()  # root → ... → leaf
+
+        for i, opp in enumerate(chain):
+            arrow = "  " if i == 0 else "→ "
+            arch = ""
+            if opp.get("num_res_blocks") and opp.get("num_filters"):
+                arch = f" {opp['num_res_blocks']}x{opp['num_filters']}"
+            wr = f"{opp['win_rate']:.0%}" if opp.get("win_rate") is not None else "?"
+            lvl = f"L{opp['eval_level']}" if opp.get("eval_level") is not None else "L?"
+            print(f"  {arrow}{opp['alias']:<8}  WR {wr:>5} vs {lvl}{arch}  "
+                  f"src={opp['source_run'][:8] if opp['source_run'] else '?'}/"
+                  f"{opp['source_tag'] or '?'}")
+            if opp.get("description"):
+                print(f"        {opp['description']}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# v15 E3: per-opening WR breakdown
+# ---------------------------------------------------------------------------
+
+def cmd_opening_breakdown(conn: sqlite3.Connection, run_id: str) -> None:
+    """Show per-opening WR breakdown for all checkpoints of a run.
+
+    Reads from the eval_breakdown table (v15 E3).
+    """
+    ckpts = conn.execute(
+        "SELECT id, tag, cycle, win_rate, eval_unique_openings "
+        "FROM checkpoints WHERE run_id LIKE ? ORDER BY cycle",
+        (run_id + "%",),
+    ).fetchall()
+
+    if not ckpts:
+        print(f"No checkpoints for run '{run_id}'")
+        return
+
+    print(f"Per-opening WR breakdown for run {run_id[:8]}*")
+    print("─" * 78)
+    for ck in ckpts:
+        breakdown = conn.execute(
+            "SELECT * FROM eval_breakdown WHERE checkpoint_id = ? "
+            "ORDER BY opening_index",
+            (ck["id"],),
+        ).fetchall()
+        if not breakdown:
+            print(f"\n  {ck['tag']} (cycle {ck['cycle']}, WR {ck['win_rate']:.1%}): "
+                  f"no breakdown stored")
+            continue
+
+        print(f"\n  {ck['tag']} (cycle {ck['cycle']}, total WR {ck['win_rate']:.1%}, "
+              f"{ck['eval_unique_openings'] or '?'} unique games)")
+        print(f"    {'idx':>3}  {'WR':>7}  {'W':>4} {'L':>4} {'D':>4}  "
+              f"{'avgL':>5}  {'uniq':>4}  opening")
+        for b in breakdown:
+            n = b["wins"] + b["losses"] + b["draws"]
+            wr = b["wins"] / n if n > 0 else 0.0
+            print(f"    {b['opening_index']:>3}  {wr:>6.0%}  "
+                  f"{b['wins']:>4} {b['losses']:>4} {b['draws']:>4}  "
+                  f"{b['avg_length'] or 0:>5.1f}  {b['unique_games'] or 0:>4}  "
+                  f"{b['opening_moves']}")
+
+
+# ---------------------------------------------------------------------------
 # 步数归一化对比
 # ---------------------------------------------------------------------------
 
@@ -1270,6 +1369,10 @@ def main():
                        help="Pareto non-dominated sort across completed runs")
     group.add_argument("--compare-by-steps", nargs=2, metavar=("RUN_A", "RUN_B"),
                        help="Compare two runs by training steps (not wall time)")
+    group.add_argument("--promotion-chain", action="store_true",
+                       help="Print the S0 → S1 → S2 → ... opponent promotion chain")
+    group.add_argument("--opening-breakdown", metavar="RUN_ID",
+                       help="Per-opening WR breakdown for a run's checkpoints")
     group.add_argument("--report", action="store_true",
                        help="Generate structured experiment report for agent/human")
 
@@ -1279,7 +1382,7 @@ def main():
                         help="Number of recent runs in report (default: 5)")
 
     args = parser.parse_args()
-    conn = _connect()
+    conn = _connect(args.db)
 
     if args.runs:
         cmd_runs(conn)
@@ -1303,6 +1406,10 @@ def main():
         cmd_pareto(conn, fmt=args.format)
     elif args.compare_by_steps:
         cmd_compare_by_steps(conn, args.compare_by_steps[0], args.compare_by_steps[1])
+    elif args.promotion_chain:
+        cmd_promotion_chain(conn)
+    elif args.opening_breakdown:
+        cmd_opening_breakdown(conn, args.opening_breakdown)
     elif args.report:
         cmd_report(conn, n_recent=args.recent, fmt=args.format)
 
