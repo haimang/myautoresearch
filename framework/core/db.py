@@ -443,13 +443,15 @@ def finish_run(conn: sqlite3.Connection, run_id: str, summary: dict) -> None:
 
 def save_cycle_metric(conn: sqlite3.Connection, run_id: str,
                       metric: dict) -> None:
+    """v15.2: now also persists eval_submitted_cycle (the bug v15 introduced
+    by adding the column to the schema migration without updating INSERT)."""
     conn.execute(
         """INSERT INTO cycle_metrics (
             run_id, cycle, timestamp_s, loss,
             total_games, total_steps, buffer_size,
             win_rate, eval_type, eval_games, eval_level,
-            policy_loss, value_loss
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            policy_loss, value_loss, eval_submitted_cycle
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             metric["cycle"],
@@ -464,6 +466,7 @@ def save_cycle_metric(conn: sqlite3.Connection, run_id: str,
             metric.get("eval_level"),
             metric.get("policy_loss"),
             metric.get("value_loss"),
+            metric.get("eval_submitted_cycle"),
         ),
     )
     conn.commit()

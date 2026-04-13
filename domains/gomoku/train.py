@@ -1539,9 +1539,16 @@ def train(args):
             print(f"[{ts}] {msg}")
 
     mcts_backend = "C-native" if (_USE_NATIVE_MCTS and mcts_sims > 0) else ("Python" if mcts_sims > 0 else "off")
+    # v15.2: also log the minimax backend so users can confirm the C minimax
+    # is actually loaded on Mac (not silently falling back to Python).
+    try:
+        from prepare import MINIMAX_BACKEND as _mm_backend
+    except Exception:
+        _mm_backend = "?"
     _log_event(f"Started run {run_id_short} | {num_params/1000:.1f}K params"
                + (f" | budget {time_budget}s" if time_budget else "")
-               + (f" | MCTS {mcts_sims}sims [{mcts_backend}]" if mcts_sims > 0 else ""))
+               + (f" | MCTS {mcts_sims}sims [{mcts_backend}]" if mcts_sims > 0 else "")
+               + f" | minimax [{_mm_backend}]")
 
     # Show TUI immediately so user sees something before first cycle
     _update_tui()
@@ -1792,18 +1799,28 @@ def train(args):
     _log_event(f"Model saved to {model_path}")
 
     # ----- Final evaluation -----
+    # v15.2: wrap in try/except so a SECOND Ctrl+C during the final eval
+    # doesn't skip finish_run() and --auto-promote-to. mcts_12 hit this:
+    # user pressed Ctrl+C, then again during the slow final eval, and the
+    # run ended up with status='running' and no auto-promote at all.
     final_wr = last_probe_wr
     opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
+    result = None
     if evaluate_win_rate is not None:
         print(f"\nRunning final evaluation vs {opp_label} ({full_eval_games} games)...")
         tag = f"final_c{cycle:04d}"
 
-        # Always in-process eval (subprocess has architecture mismatch bug)
-        model.eval()
-        result = _in_process_eval(model, eval_level, full_eval_games,
-                                  opponent_model=opponent_model,
-                                  num_openings=args.eval_openings)
-        mx.clear_cache()
+        try:
+            model.eval()
+            result = _in_process_eval(model, eval_level, full_eval_games,
+                                      opponent_model=opponent_model,
+                                      num_openings=args.eval_openings)
+            mx.clear_cache()
+        except KeyboardInterrupt:
+            print("\n⚠ Final eval interrupted by second Ctrl+C — "
+                  "skipping checkpoint save, proceeding to finalize.")
+            stop_reason = "interrupted"
+            result = None
         if result:
             final_wr = result.get("win_rate", final_wr)
             uniq = result.get("unique_trajectories", 0)
@@ -2034,20 +2051,25 @@ def _apply_opening(board, seed: list[tuple[int, int]]) -> None:
 def _in_process_eval(model, level: int, n_games: int,
                      opponent_model=None,
                      num_openings: int = 0) -> dict:
-    """In-process evaluation returning full result dict.
+    """In-process evaluation with BATCHED NN calls across concurrent games.
 
-    Forces opening diversity: each game is seeded with a distinct opening
-    drawn from ``_EVAL_OPENING_SEEDS``, and the NN plays BLACK for the first
-    half / WHITE for the second half. With stochastic minimax opponents
-    (prepare.opponent_l1/l2/l3 use top-k sampling), this gives real
-    statistical power to the returned win_rate.
+    v15.2 hotfix — replaces the v14/v15 sequential implementation that did
+    one batch=1 MLX forward per move per game. mcts_12 on Mac M3 Max showed
+    that the sequential design takes ~10-20 minutes per probe (vs the ~13
+    seconds my Linux fake-NN benchmark predicted). Root cause: at batch=1,
+    MLX has 50-300 ms of GPU dispatch latency per call, and a 150-game
+    probe makes ~1800 such calls — almost all the wall time was MLX
+    dispatch overhead, not actual compute.
 
-    Parameters
-    ----------
-    num_openings
-        Number of distinct opening seeds to use. 0 means "auto" =
-        min(len(_EVAL_OPENING_SEEDS), max(1, n_games // 4)). Capped at the
-        number of seeds defined in _EVAL_OPENING_SEEDS.
+    The new design plays all `n_games` games concurrently, wave by wave.
+    On each wave we batch ALL boards whose current player is the NN into
+    a single forward pass, then sequentially apply the minimax opponent's
+    moves. This pushes batch sizes up from 1 to ~75 (half of n_games),
+    where MLX overhead is amortised properly.
+
+    Expected speedup: 8-15× on Mac M3 Max for 80-200 game probes against
+    L2/L3 minimax. The C minimax opponent calls remain sequential — they
+    are already fast enough that batching them would not help.
     """
     from game import Board
 
@@ -2062,74 +2084,132 @@ def _in_process_eval(model, level: int, n_games: int,
     num_openings = min(num_openings, len(_EVAL_OPENING_SEEDS))
     openings = _EVAL_OPENING_SEEDS[:num_openings]
 
+    # Per-game state arrays
+    boards = [Board() for _ in range(n_games)]
+    nn_player_of = [BLACK if i < n_games // 2 else WHITE for i in range(n_games)]
+    trajectories: list[list[int]] = [[] for _ in range(n_games)]
+    opening_index_of: list[int] = [0] * n_games
+    finished = [False] * n_games
+
+    # Apply opening seeds + record opening_index for per-opening breakdown
+    for i in range(n_games):
+        nn_is_black = nn_player_of[i] == BLACK
+        local_i = i if nn_is_black else i - n_games // 2
+        oi = local_i % len(openings)
+        opening_index_of[i] = oi
+        _apply_opening(boards[i], openings[oi])
+
+    start = _time.time()
+    nn_call_count = 0
+
+    while True:
+        # Mark newly-terminal games
+        for i in range(n_games):
+            if not finished[i] and boards[i].is_terminal():
+                finished[i] = True
+        if all(finished):
+            break
+
+        # Collect all boards where it's the NN's turn
+        nn_turn_idx: list[int] = []
+        opp_turn_idx: list[int] = []
+        for i in range(n_games):
+            if finished[i]:
+                continue
+            if boards[i].current_player == nn_player_of[i]:
+                nn_turn_idx.append(i)
+            else:
+                opp_turn_idx.append(i)
+
+        # ── Batched NN move ─────────────────────────────────────────────
+        # ONE GPU forward pass for all NN-turn boards (batch ~ n_games/2).
+        # This amortises MLX dispatch latency from ~250 ms × N → ~30 ms × 1.
+        if nn_turn_idx:
+            encodings = np.stack([boards[i].encode() for i in nn_turn_idx])
+            x = mx.array(encodings)
+            policy_logits, _ = model(x)
+            mx.eval(policy_logits)
+            policy_np = np.array(policy_logits)  # [B, 225]
+            for k, i in enumerate(nn_turn_idx):
+                legal = boards[i].get_legal_mask()
+                masked = policy_np[k].copy()
+                masked[legal == 0] = -np.inf
+                action = int(np.argmax(masked))
+                row, col = divmod(action, BOARD_SIZE)
+                boards[i].place(row, col)
+                trajectories[i].append(row * BOARD_SIZE + col)
+            nn_call_count += 1
+
+        # ── Sequential opponent moves ──────────────────────────────────
+        # Minimax opponent. Each call is ~10-65ms on C path; sequential
+        # is fine because opp_turn_idx is short and the bottleneck is no
+        # longer here.
+        if opp_turn_idx:
+            for i in opp_turn_idx:
+                if use_nn_opponent:
+                    # NN opponent: batch this group too for symmetry.
+                    pass  # handled below via batched path
+                else:
+                    row, col = opponent_fn(boards[i])
+                    boards[i].place(row, col)
+                    trajectories[i].append(row * BOARD_SIZE + col)
+
+            # Optionally batch NN opponent moves
+            if use_nn_opponent:
+                opp_encodings = np.stack([boards[i].encode() for i in opp_turn_idx])
+                opp_x = mx.array(opp_encodings)
+                opp_logits, _ = opponent_model(opp_x)
+                mx.eval(opp_logits)
+                opp_np = np.array(opp_logits)
+                for k, i in enumerate(opp_turn_idx):
+                    legal = boards[i].get_legal_mask()
+                    masked = opp_np[k].copy()
+                    masked[legal == 0] = -np.inf
+                    action = int(np.argmax(masked))
+                    row, col = divmod(action, BOARD_SIZE)
+                    boards[i].place(row, col)
+                    trajectories[i].append(row * BOARD_SIZE + col)
+
+        # Periodic MLX cache release. Coarser than the sequential version
+        # because each iteration here does ~75 forwards-worth of work.
+        if nn_call_count % 8 == 0:
+            mx.clear_cache()
+
+    elapsed = _time.time() - start
+    mx.clear_cache()
+
+    # ── Tally results + per-opening breakdown ──────────────────────────
     wins, losses, draws = 0, 0, 0
     total_moves = 0
     trajectory_fingerprints: set[tuple] = set()
-    # v15 E3: per-opening WR breakdown. Indexed by opening_index.
     per_opening: list[dict] = [
         {"opening_index": i, "opening_moves": str(openings[i]),
          "wins": 0, "losses": 0, "draws": 0,
          "_lengths": [], "_traj": set()}
         for i in range(len(openings))
     ]
-    start = _time.time()
 
-    for game_i in range(n_games):
-        nn_is_black = game_i < n_games // 2
-        nn_player = BLACK if nn_is_black else WHITE
-
-        board = Board()
-        side_games = max(1, n_games // 2)
-        local_i = game_i if nn_is_black else game_i - n_games // 2
-        opening_index = local_i % len(openings)
-        opening = openings[opening_index]
-        _apply_opening(board, opening)
-
-        trajectory: list[int] = []
-        while not board.is_terminal():
-            if board.current_player == nn_player:
-                encoded = board.encode()
-                x = mx.array(encoded[np.newaxis, ...])
-                policy_logits, _ = model(x)
-                policy = policy_logits[0]
-                legal_mask = mx.array(board.get_legal_mask())
-                masked = mx.where(legal_mask > 0, policy, mx.array(float("-inf")))
-                action = int(mx.argmax(masked).item())
-                row, col = divmod(action, BOARD_SIZE)
-            elif use_nn_opponent:
-                row, col = _nn_opponent_move(opponent_model, board)
-            else:
-                row, col = opponent_fn(board)
-            board.place(row, col)
-            trajectory.append(row * BOARD_SIZE + col)
-
-        traj_tuple = tuple(trajectory)
+    for i in range(n_games):
+        b = boards[i]
+        nn_p = nn_player_of[i]
+        traj_tuple = tuple(trajectories[i])
         trajectory_fingerprints.add(traj_tuple)
-
-        bucket = per_opening[opening_index]
-        bucket["_lengths"].append(board.move_count)
+        bucket = per_opening[opening_index_of[i]]
+        bucket["_lengths"].append(b.move_count)
         bucket["_traj"].add(traj_tuple)
-
-        total_moves += board.move_count
-        if board.winner == nn_player:
+        total_moves += b.move_count
+        if b.winner == nn_p:
             wins += 1
             bucket["wins"] += 1
-        elif board.winner is not None:
+        elif b.winner is not None and b.winner != 0:
             losses += 1
             bucket["losses"] += 1
         else:
             draws += 1
             bucket["draws"] += 1
 
-        if game_i % 20 == 0:
-            mx.clear_cache()
-
-    elapsed = _time.time() - start
-
-    # Finalize per-opening structs (avg length + unique games)
     breakdown = []
     for b in per_opening:
-        n_games_b = b["wins"] + b["losses"] + b["draws"]
         avg_len_b = sum(b["_lengths"]) / max(1, len(b["_lengths"]))
         breakdown.append({
             "opening_index": b["opening_index"],
@@ -2151,6 +2231,7 @@ def _in_process_eval(model, level: int, n_games: int,
         "num_openings": len(openings),
         "unique_trajectories": len(trajectory_fingerprints),
         "wr_by_opening": breakdown,
+        "nn_batch_calls": nn_call_count,  # diagnostic
     }
 
 
