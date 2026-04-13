@@ -18,12 +18,21 @@ import time as _time
 import uuid
 
 # ── path setup for decoupled project structure ──
+# Domain dir (_THIS_DIR) MUST come before framework/ in sys.path so that
+# `from prepare import OPPONENTS` resolves to domains/gomoku/prepare.py
+# (with C minimax backend), NOT framework/prepare.py (pure-Python fallback).
+# Python auto-adds the script dir to sys.path[0], but a subsequent insert(0)
+# for framework/ would push it to [1].  We add framework/ at index 1 to keep
+# the domain dir at [0].
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
-if os.path.join(_PROJECT_ROOT, "framework") not in sys.path:
-    sys.path.insert(0, os.path.join(_PROJECT_ROOT, "framework"))
+_fw_path = os.path.join(_PROJECT_ROOT, "framework")
+if _fw_path not in sys.path:
+    # Insert AFTER _THIS_DIR so domain prepare.py takes priority
+    _idx = sys.path.index(_THIS_DIR) + 1 if _THIS_DIR in sys.path else 0
+    sys.path.insert(_idx, _fw_path)
 os.chdir(_PROJECT_ROOT)  # ensure output/ paths resolve correctly
 
 import mlx.core as mx
