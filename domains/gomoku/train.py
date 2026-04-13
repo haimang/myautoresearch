@@ -797,7 +797,8 @@ def _collect_game_with_policies(batch, game_idx, policies, source: str = "self",
 
 def compute_loss(model, batch_boards, batch_policies, batch_values):
     """
-    Compute combined policy + value loss.
+    Combined policy + value loss — returns only the weighted total so this
+    function can be differentiated via ``mlx.nn.value_and_grad``.
 
     batch_boards:   [B, 3, 15, 15]
     batch_policies: [B, 225] probability targets
@@ -805,14 +806,24 @@ def compute_loss(model, batch_boards, batch_policies, batch_values):
     """
     pred_policies, pred_values = model(batch_boards)
 
-    # Policy loss: cross-entropy with soft targets
     log_probs = mx.log(mx.softmax(pred_policies, axis=-1) + 1e-8)
     policy_loss = -mx.mean(mx.sum(batch_policies * log_probs, axis=-1))
-
-    # Value loss: MSE
     value_loss = mx.mean((pred_values.squeeze() - batch_values) ** 2)
 
     return POLICY_LOSS_WEIGHT * policy_loss + VALUE_LOSS_WEIGHT * value_loss
+
+
+def compute_loss_split(model, batch_boards, batch_policies, batch_values):
+    """
+    Same loss as ``compute_loss`` but also returns the (policy, value)
+    components for diagnostics. Called outside the grad path.
+    """
+    pred_policies, pred_values = model(batch_boards)
+    log_probs = mx.log(mx.softmax(pred_policies, axis=-1) + 1e-8)
+    policy_loss = -mx.mean(mx.sum(batch_policies * log_probs, axis=-1))
+    value_loss = mx.mean((pred_values.squeeze() - batch_values) ** 2)
+    total = POLICY_LOSS_WEIGHT * policy_loss + VALUE_LOSS_WEIGHT * value_loss
+    return total, policy_loss, value_loss
 
 
 # ---------------------------------------------------------------------------
@@ -971,6 +982,8 @@ def train(args):
     total_train_steps = 0
     cycle = initial_cycle
     last_loss = 0.0
+    last_policy_loss: float | None = None
+    last_value_loss: float | None = None
     last_probe_wr: float | None = None
     last_ckpt_wr: float = initial_ckpt_wr
     num_checkpoints = 0
@@ -979,6 +992,8 @@ def train(args):
     last_mcts_stats: dict = {}
     mcts_sims_per_sec_history: list[float] = []
     mcts_entropy_history: list[float] = []
+    policy_loss_history: list[float] = []
+    value_loss_history: list[float] = []
 
     # NN opponent (if --eval-opponent specified)
     eval_opponent_alias: str | None = args.eval_opponent
@@ -1103,6 +1118,11 @@ def train(args):
         lines.append(row(f"  Cycle   {cycle:>6d}   │   Loss     {last_loss:>8.4f}   │   Games   {total_games:>7d}"))
         lines.append(row(f"  Steps   {total_train_steps:>6d}   │   Buffer   {len(replay_buffer):>8d}   │   WR  {wr_str:>5}{sm_str}"))
         lines.append(row(f"  Gm/s    {gps:>6.1f}   │   AvgLen   {avg_game_length:>8.1f}   │   vs {opp_str}{mix_str}"))
+        if last_policy_loss is not None and last_value_loss is not None:
+            lines.append(row(
+                f"  P-Loss  {last_policy_loss:>6.3f}   │   V-Loss   {last_value_loss:>8.4f}   │   "
+                f"policy entropy gap: {max(0.0, last_policy_loss):.2f} nats"
+            ))
 
         # --- MCTS stats row (only when MCTS is active) ---
         if MCTS_SIMULATIONS > 0:
@@ -1252,6 +1272,7 @@ def train(args):
                     mcts_entropy_history.append(last_mcts_stats["avg_entropy"])
 
             # ----- Training -----
+            steps_run_this_cycle = 0
             if len(replay_buffer) >= BATCH_SIZE:
                 model.train()
                 cycle_loss = 0.0
@@ -1259,6 +1280,10 @@ def train(args):
                 cycle_len_boost_ratios: list[float] = []
                 cycle_len_damp_ratios: list[float] = []
                 cycle_len_priority_avgs: list[float] = []
+                # Last-batch tensors for out-of-grad loss-split diagnostics
+                last_batch_boards_mx = None
+                last_batch_policies_mx = None
+                last_batch_values_mx = None
                 steps_this_cycle = min(
                     steps_per_cycle,
                     len(replay_buffer) // BATCH_SIZE
@@ -1303,8 +1328,28 @@ def train(args):
 
                     cycle_loss += loss.item()
                     total_train_steps += 1
+                    steps_run_this_cycle += 1
+                    last_batch_boards_mx = batch_boards_mx
+                    last_batch_policies_mx = batch_policies_mx
+                    last_batch_values_mx = batch_values_mx
 
-                last_loss = cycle_loss / steps_this_cycle if steps_this_cycle > 0 else 0.0
+                if steps_run_this_cycle > 0:
+                    last_loss = cycle_loss / steps_run_this_cycle
+                    # Recompute on the last mini-batch to recover the
+                    # policy / value breakdown (one extra forward pass per
+                    # cycle — negligible vs steps_run_this_cycle=50).
+                    if last_batch_boards_mx is not None:
+                        _total, _pl, _vl = compute_loss_split(
+                            model,
+                            last_batch_boards_mx,
+                            last_batch_policies_mx,
+                            last_batch_values_mx,
+                        )
+                        mx.eval(_pl, _vl)
+                        last_policy_loss = float(_pl.item())
+                        last_value_loss = float(_vl.item())
+                        policy_loss_history.append(last_policy_loss)
+                        value_loss_history.append(last_value_loss)
                 if cycle_corrective_ratios:
                     last_corrective_ratio = sum(cycle_corrective_ratios) / len(cycle_corrective_ratios)
                     last_len_boost_ratio = sum(cycle_len_boost_ratios) / len(cycle_len_boost_ratios)
@@ -1319,7 +1364,9 @@ def train(args):
             metric = {
                 "cycle": cycle,
                 "timestamp_s": _time.time() - start_time,
-                "loss": last_loss,
+                "loss": last_loss if steps_run_this_cycle > 0 else None,
+                "policy_loss": last_policy_loss if steps_run_this_cycle > 0 else None,
+                "value_loss": last_value_loss if steps_run_this_cycle > 0 else None,
                 "total_games": total_games,
                 "total_steps": total_train_steps,
                 "buffer_size": len(replay_buffer),
@@ -1329,7 +1376,8 @@ def train(args):
             if cycle % eval_interval == 0 and evaluate_win_rate is not None:
                 model.eval()
                 probe_wr = _quick_eval(model, eval_level, probe_games,
-                                       opponent_model=opponent_model)
+                                       opponent_model=opponent_model,
+                                       num_openings=args.eval_openings)
                 last_probe_wr = probe_wr
                 wr_history.append(probe_wr)
                 metric["win_rate"] = probe_wr
@@ -1356,6 +1404,7 @@ def train(args):
                         num_blocks=num_blocks, num_filters=num_filters,
                         opponent_model=opponent_model,
                         eval_opponent_alias=eval_opponent_alias,
+                        num_openings=args.eval_openings,
                     )
                     last_ckpt_wr = effective_wr
                     num_checkpoints += 1
@@ -1387,10 +1436,16 @@ def train(args):
                             _update_tui()
                             break
 
-            if last_loss > 0:
+            if steps_run_this_cycle > 0 and last_loss > 0:
                 loss_history.append(last_loss)
 
-            _tracker.save_cycle_metric(db_conn, run_id, metric)
+            # Only emit a cycle_metrics row if something meaningful happened
+            # this cycle — either a training step produced a loss, or a
+            # probe eval populated win_rate. Otherwise (time-budget expired
+            # after self-play but before training) we'd pollute the run with
+            # a loss=0 artifact row — see v14 mcts_9th findings §7.4.
+            if steps_run_this_cycle > 0 or metric.get("win_rate") is not None:
+                _tracker.save_cycle_metric(db_conn, run_id, metric)
 
             # Update TUI or print
             if use_tui:
@@ -1437,11 +1492,19 @@ def train(args):
         # Always in-process eval (subprocess has architecture mismatch bug)
         model.eval()
         result = _in_process_eval(model, eval_level, full_eval_games,
-                                  opponent_model=opponent_model)
+                                  opponent_model=opponent_model,
+                                  num_openings=args.eval_openings)
         mx.clear_cache()
         if result:
             final_wr = result.get("win_rate", final_wr)
-            print(f"Final win_rate: {final_wr:.1%}")
+            uniq = result.get("unique_trajectories", 0)
+            n_open = result.get("num_openings", 0)
+            print(
+                f"Final win_rate: {final_wr:.1%}  "
+                f"({result.get('wins', 0)}W/{result.get('losses', 0)}L/"
+                f"{result.get('draws', 0)}D, "
+                f"{uniq} unique games / {n_open} openings)"
+            )
 
             # Save as checkpoint
             ckpt_path = f"{ckpt_dir}/{tag}.safetensors"
@@ -1464,6 +1527,7 @@ def train(args):
                 "model_size_bytes": os.path.getsize(ckpt_path),
                 "train_elapsed_s": total_elapsed,
                 "eval_elapsed_s": result.get("eval_elapsed_s"),
+                "eval_unique_openings": uniq,
             })
             # Save recording metadata
             for gd in result.get("game_details", []):
@@ -1473,12 +1537,15 @@ def train(args):
             num_checkpoints += 1
 
     # ----- Finalize run -----
+    # final_loss: write None rather than 0 if no training step ever ran,
+    # so analyze.py doesn't display a misleading "loss=0.0000" summary.
+    _final_loss = last_loss if total_train_steps > 0 else None
     _tracker.finish_run(db_conn, run_id, {
         "status": "completed" if stop_reason != "interrupted" else "interrupted",
         "total_cycles": cycle - initial_cycle,
         "total_games": total_games,
         "total_steps": total_train_steps,
-        "final_loss": last_loss,
+        "final_loss": _final_loss,
         "final_win_rate": final_wr,
         "num_params": num_params,
         "num_checkpoints": num_checkpoints,
@@ -1501,7 +1568,13 @@ def train(args):
     print(f"Cycles:     {cycle - initial_cycle} (total cycle #{cycle})")
     print(f"Games:      {total_games}")
     print(f"Steps:      {total_train_steps}")
-    print(f"Final loss: {last_loss:.4f}")
+    if total_train_steps > 0:
+        pv = ""
+        if last_policy_loss is not None and last_value_loss is not None:
+            pv = f"  (P:{last_policy_loss:.3f} V:{last_value_loss:.4f})"
+        print(f"Final loss: {last_loss:.4f}{pv}")
+    else:
+        print("Final loss: — (no training steps executed)")
     if final_wr is not None:
         print(f"Win rate:   {final_wr:.1%} (vs {opp_label})")
     print(f"Checkpoints:{num_checkpoints}")
@@ -1531,20 +1604,74 @@ def train(args):
 
 
 def _quick_eval(model, level: int, n_games: int,
-                opponent_model=None) -> float:
-    """In-process lightweight evaluation. Returns win_rate.
-    
-    If opponent_model is provided, plays against it instead of minimax.
+                opponent_model=None, num_openings: int = 0) -> float:
+    """In-process lightweight evaluation. Returns win_rate only.
+
+    Thin wrapper over ``_in_process_eval`` kept for call-site ergonomics.
     """
-    result = _in_process_eval(model, level, n_games, opponent_model)
+    result = _in_process_eval(model, level, n_games, opponent_model,
+                              num_openings=num_openings)
     return result["win_rate"]
 
 
+# Openings bank — a small set of canonical / near-canonical 2-move seeds.
+# Forces each eval game to start from a distinct position so deterministic
+# argmax + (previously) deterministic minimax can no longer collapse the
+# entire eval to a single replayed trajectory. Combined with the stochastic
+# minimax opponents in prepare.py, this restores real statistical power
+# to "N games" eval numbers. See v14 findings §7.3 / §7.8.
+#
+# Each opening is a list of (row, col) stones placed alternating BLACK,
+# WHITE starting from the empty board. Positions are chosen to cover a
+# wide range of classical gomoku openings without handing either side a
+# decisive head-start.
+_EVAL_OPENING_SEEDS: list[list[tuple[int, int]]] = [
+    [],                              # empty — strongest baseline
+    [(7, 7)],                        # center-only
+    [(7, 7), (7, 8)],                # direct (center → right)
+    [(7, 7), (8, 8)],                # indirect (center → diag)
+    [(7, 7), (6, 8)],                # indirect (center → anti-diag)
+    [(7, 7), (8, 7)],                # direct (center → down)
+    [(7, 7), (6, 7)],                # direct (center → up)
+    [(7, 7), (7, 6)],                # direct (center → left)
+    [(7, 7), (5, 7)],                # long-range vertical
+    [(7, 7), (7, 5)],                # long-range horizontal
+    [(7, 7), (5, 5)],                # far diagonal
+    [(7, 7), (9, 9)],                # far diagonal opposite
+    [(7, 7), (5, 9)],                # far anti-diagonal
+    [(7, 7), (9, 5)],                # far anti-diagonal opposite
+    [(6, 7), (7, 8)],                # off-center
+    [(7, 8), (8, 7)],                # off-center opposite
+]
+
+
+def _apply_opening(board, seed: list[tuple[int, int]]) -> None:
+    """Apply an opening sequence to an empty board. Caller owns the board."""
+    for row, col in seed:
+        if board.is_terminal():
+            return
+        # Legal check is defensive — all seeds fit an empty 15x15 board
+        if not board.place(row, col):
+            return
+
+
 def _in_process_eval(model, level: int, n_games: int,
-                     opponent_model=None) -> dict:
+                     opponent_model=None,
+                     num_openings: int = 0) -> dict:
     """In-process evaluation returning full result dict.
 
-    If opponent_model is provided, plays against it instead of minimax.
+    Forces opening diversity: each game is seeded with a distinct opening
+    drawn from ``_EVAL_OPENING_SEEDS``, and the NN plays BLACK for the first
+    half / WHITE for the second half. With stochastic minimax opponents
+    (prepare.opponent_l1/l2/l3 use top-k sampling), this gives real
+    statistical power to the returned win_rate.
+
+    Parameters
+    ----------
+    num_openings
+        Number of distinct opening seeds to use. 0 means "auto" =
+        min(len(_EVAL_OPENING_SEEDS), max(1, n_games // 4)). Capped at the
+        number of seeds defined in _EVAL_OPENING_SEEDS.
     """
     from game import Board
 
@@ -1554,8 +1681,17 @@ def _in_process_eval(model, level: int, n_games: int,
         from prepare import OPPONENTS
         opponent_fn = OPPONENTS[level]
 
+    if num_openings <= 0:
+        num_openings = min(len(_EVAL_OPENING_SEEDS), max(1, n_games // 4))
+    num_openings = min(num_openings, len(_EVAL_OPENING_SEEDS))
+    openings = _EVAL_OPENING_SEEDS[:num_openings]
+
     wins, losses, draws = 0, 0, 0
     total_moves = 0
+    # Track distinct game trajectories seen in this eval — a sanity check
+    # that opening diversification + stochastic opponents actually broke
+    # the "all games identical" failure mode. See v14 findings §7.3.
+    trajectory_fingerprints: set[tuple] = set()
     start = _time.time()
 
     for game_i in range(n_games):
@@ -1563,6 +1699,14 @@ def _in_process_eval(model, level: int, n_games: int,
         nn_player = BLACK if nn_is_black else WHITE
 
         board = Board()
+        # Pick an opening deterministically by game index so the per-opening
+        # games-per-side split stays balanced.
+        side_games = max(1, n_games // 2)
+        local_i = game_i if nn_is_black else game_i - n_games // 2
+        opening = openings[local_i % len(openings)]
+        _apply_opening(board, opening)
+
+        trajectory: list[int] = []
         while not board.is_terminal():
             if board.current_player == nn_player:
                 encoded = board.encode()
@@ -1578,6 +1722,9 @@ def _in_process_eval(model, level: int, n_games: int,
             else:
                 row, col = opponent_fn(board)
             board.place(row, col)
+            trajectory.append(row * BOARD_SIZE + col)
+
+        trajectory_fingerprints.add(tuple(trajectory))
 
         total_moves += board.move_count
         if board.winner == nn_player:
@@ -1598,14 +1745,19 @@ def _in_process_eval(model, level: int, n_games: int,
         "draws": draws,
         "avg_game_length": total_moves / n_games if n_games > 0 else 0,
         "eval_elapsed_s": elapsed,
+        "num_openings": len(openings),
+        "unique_trajectories": len(trajectory_fingerprints),
     }
 
 
-def _nn_opponent_move(opp_model, board, temperature: float = 0.5) -> tuple[int, int]:
+def _nn_opponent_move(opp_model, board, temperature: float = 0.0) -> tuple[int, int]:
     """Make a move using an NN opponent model.
 
-    With temperature > 0, uses softmax sampling for diversity.
-    With temperature = 0, uses deterministic argmax.
+    Default is deterministic argmax (temperature=0). Evaluation against a
+    temperature>0 NN opponent is a v13-era artifact — a noisy opponent
+    inflates win rates with "gift" losses from random opponent blunders
+    rather than measuring actual strength. Callers that want stochastic
+    NN play should pass temperature explicitly.
     """
     encoded = board.encode()
     x = mx.array(encoded[np.newaxis, ...])
@@ -1681,7 +1833,8 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
                    events, log_event_fn, ckpt_dir, recording_dir,
                    threshold=None,
                    num_blocks=NUM_RES_BLOCKS, num_filters=NUM_FILTERS,
-                   opponent_model=None, eval_opponent_alias=None):
+                   opponent_model=None, eval_opponent_alias=None,
+                   num_openings: int = 0):
     """Save checkpoint, run full eval (NN or subprocess minimax), record to DB."""
     import core.db as _tracker
 
@@ -1694,28 +1847,23 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
     opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
     log_event_fn(f"✓ Checkpoint {tag}  wr={win_rate:.1%}")
 
-    # Full eval: always in-process (subprocess has circular import issues with
-    # monkey-patched load_model — the architecture mismatch bug).
-    # Metal buffer safety: model.eval() + mx.clear_cache() after eval.
+    # Full eval: always in-process with opening diversification.
     elapsed = _time.time() - start_time
-    if True:  # always in-process
-        model.eval()
-        result = _in_process_eval(model, eval_level, full_eval_games,
-                                  opponent_model=opponent_model)
-        mx.clear_cache()
-    if False:  # subprocess disabled — kept for reference
-        result = _subprocess_eval(
-            ckpt_path, eval_level, full_eval_games, tag, run_id,
-            recording_dir=recording_dir,
-            num_blocks=num_blocks, num_filters=num_filters,
-        )
+    model.eval()
+    result = _in_process_eval(model, eval_level, full_eval_games,
+                              opponent_model=opponent_model,
+                              num_openings=num_openings)
+    mx.clear_cache()
 
     if result:
         full_wr = result.get("win_rate", win_rate)
+        uniq = result.get("unique_trajectories", 0)
+        n_open = result.get("num_openings", 0)
         log_event_fn(
             f"  Full eval: {full_wr:.1%} "
             f"({result.get('wins', '?')}W/{result.get('losses', '?')}L "
-            f"in {result.get('eval_elapsed_s', 0):.1f}s)"
+            f"in {result.get('eval_elapsed_s', 0):.1f}s, "
+            f"{uniq}uniq/{n_open}op)"
         )
 
         ckpt_id = _tracker.save_checkpoint(db_conn, run_id, {
@@ -1735,6 +1883,7 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
             "model_size_bytes": os.path.getsize(ckpt_path),
             "train_elapsed_s": elapsed,
             "eval_elapsed_s": result.get("eval_elapsed_s"),
+            "eval_unique_openings": uniq,
         })
         # Save recording metadata
         for gd in result.get("game_details", []):
@@ -1785,6 +1934,11 @@ def parse_args() -> argparse.Namespace:
                    help="Sliding window size for smoothed win rate (default: 5)")
     p.add_argument("--full-eval-games", type=int, default=200,
                    help="Games per full evaluation at checkpoint (default: 200)")
+    p.add_argument("--eval-openings", type=int, default=0,
+                   help="Number of distinct opening seeds to force in eval "
+                        "(0 = auto from eval bank, typically ~16). Fixes the "
+                        "'200 games = 2 unique games' collapse documented in "
+                        "v14 findings §7.3.")
     p.add_argument("--parallel-games", type=int, default=PARALLEL_GAMES,
                    help=f"Number of simultaneous self-play games (default: {PARALLEL_GAMES})")
     # Model capacity

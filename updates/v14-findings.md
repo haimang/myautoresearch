@@ -253,3 +253,165 @@ uv run python domains/gomoku/train.py \
 | 增加 mcts-sims > 800 | Focus 27% 已足够，更多 sims 只增加时间不增加质量 |
 | 多进程 worker | C 扩展已提供 6x 加速，够用 |
 | 修改 c_puct | 1.5 是标准值，无数据支持修改 |
+
+---
+
+## 7. mcts_9th 复盘 — 6 小时长训，100% WR 的真实性审查
+
+> 2026-04-13 | 基于 updates/mcts_9th_exp.db + updates/mcts_9th.png
+
+### 7.1 run 概要（789730e3）
+
+| 项目 | 值 |
+|------|-----|
+| 架构 | 8×128（2.49M params）|
+| MCTS | 800 sims（C 原生）|
+| Resume | 无（从零训练）|
+| LR / steps / buffer | 2e-4 / 50 / 100,000（按 §6.2 建议）|
+| Parallel / batch | 10 / 256 |
+| time_budget | 21600s（6 h）|
+| Cycles / games / steps | 457 / 4,570 / 22,135 |
+| Final loss（TUI）| 0.00 |
+| Final WR vs L1（full eval 200 局）| **100% (200/200)** |
+| Probe WR 轨迹 | c20=0%, c60=50%, c80=100%, 260 起稳定 100% |
+
+### 7.2 结论先行
+
+**final_c0457 是对 L1（minimax depth 2）的一个专用解，而不是一个普适 5×5 连珠棋手。** 200 局 full eval 的统计效力实际上只有 **2 局**；loss 在整个训练中几乎没下降；模型学到的是"两条针对确定性 L1 开局的必胜线"，而不是稳健的 policy。下面是证据。
+
+### 7.3 致命发现 1：所谓 200 局 eval，本质只是 2 局
+
+- `_in_process_eval`（train.py:1543）中 NN 走子用 `mx.argmax`（行 1574），对手用 `OPPONENTS[level]`。
+- `opponent_l1` → `minimax_move(depth=2, move_order_fn=_move_order_basic)`（prepare.py:348）。
+- `_move_order_basic`（prepare.py:241）的注释写 "then random shuffle"，但**实现里根本没有 shuffle**，只按中心距离稳定排序。
+- 评估期间棋盘随机性为 0：NN 和 minimax 都是确定性函数，初始盘面也确定。所以：
+  - NN 作黑的 100 局 → 完全相同的 1 局，复制 100 次
+  - NN 作白的 100 局 → 完全相同的 1 局，复制 100 次
+  - **任何一次 full eval 的合法取值只能是 {0.0, 0.5, 1.0}**
+
+数据印证：cycle_metrics 表 22 次 probe（120 局）的 win_rate 全部落在 {0.0, 0.5, 1.0}；checkpoint 表的 200 局 full eval 只见 0.5 和 1.0。这不是巧合，是一个结构性问题。
+
+**因此 "100% (200/200) vs L1" 并不代表 "对 L1 几乎不败"，它代表的是 "模型碰巧找到了两个确定性开局都能走赢的分支"。**
+
+### 7.4 致命发现 2：loss 曲线显示模型几乎没学东西
+
+从 cycle_metrics 抽样：
+
+| cycle | loss | probe WR |
+|-------|------|----------|
+| 1 | 6.363 | — |
+| 20 | 5.633 | 0% |
+| 80 | 4.814 | 100%（开始）|
+| 140 | 4.626 | 100% |
+| 260 | 4.403 | 100%（稳定）|
+| 440 | 4.273 | 100% |
+| 456 | 4.253 | — |
+| 457 | **0.000** | — |
+
+- 6 小时 22k 步，loss 从 6.36 降到 4.25，总下降 **2.11 nats**。
+- 策略+价值联合 loss，考虑到 225 个动作的 uniform 基线 ≈ log(225) = 5.42，模型最终的 policy CE 粗估仍在 **~4.0 左右**，只比随机好一点点。
+- TUI 截图里的 **Entropy = 3.03**（远高于理想的 ≤2.5）与此一致：先验仍是"十几个位置几乎等概率"。
+- "Final loss 0.00" 是 cycle 457 那一行的记账伪影（时间预算耗尽，当 cycle 没有任何 training step，loss 写成 0）。这会污染 analyze.py 的最终指标，应当被视为 **显示 bug**。
+
+**100% WR + 基本没学的 loss** → 唯一解释是：高 MCTS 访问数（800 sims）直接把对 L1 的两条致胜线"背"进了访问分布，NN 只是被驯化到能在这两条线上给出 argmax。泛化能力未被任何证据支持。
+
+### 7.5 致命发现 3：avg_game_length 的塌缩指向同一件事
+
+| checkpoint | avg_game_length |
+|------------|------------------|
+| wr050_c0100 | 28.5 |
+| wr080_c0140 | 13.5 |
+| wr090_c0260 | 15.5 |
+| wr100_c0300 | 14.5 |
+| **final_c0457** | **10.5** |
+
+10.5 步结束一局意味着黑方用 5-6 手就连成五。这是**单一开局 + 单一速赢路线**反复重演的典型特征，不是"普遍强"。真正的稳健棋手面对不同对手，局长分布应当是有方差的。这里每个 checkpoint 的 avg 完全看不到方差——因为本来就没有方差，只有 2 局。
+
+### 7.6 final_c0457 checkpoint 是否可用？
+
+| 用途 | 结论 |
+|------|------|
+| 作为 "80% vs L1 的 S1"，晋升到 L2 训练 | **不可用**。100% 是伪的，换成 L2 就没有先验保护。 |
+| 注册成 web 对手和人类对弈 | **勉强可用，但会很弱**。人类不会走 L1 的确定序列，模型大概率暴露未学会棋型。 |
+| 作为 self-play 初始化（resume） | **不推荐**。作为 prior 它偏向单一开局，会给后续训练带来模式崩塌风险。 |
+| 作为 "L1 专用快速开局库" | 可用，但这不是我们要的东西。 |
+
+**短结论：** final_c0457 不是一个可信的 stage 1 里程碑。不要注册为 S1，也不要基于它 resume 到 L2。
+
+### 7.7 参数评价（§6.2 的建议在实际数据上如何？）
+
+| 参数 | 值 | 评价 |
+|------|-----|------|
+| `num_blocks / num_filters` | 8 / 128 | 合理，2.49M 不算过参数化 |
+| `learning_rate` | 2e-4 | **偏低**。loss 下降 2.11 nats / 22k steps 说明学习太慢，可考虑 3e-4 或加 warmup 后到 5e-4 |
+| `steps_per_cycle` | 50 | 合理，但在 SP 产出过窄时会放大同分布过拟合 |
+| `buffer_size` | 100,000 | 合理，后期 buffer 全满 |
+| `mcts_sims` | 800 | **不是问题**，但配上确定性对手会让 SP 数据分布极窄 |
+| `parallel_games` | 10 | 合理 |
+| `time_budget` | 21600 | 时间花对了，但数据生成路径有结构性缺陷（见 7.8），更多时间不能解决 |
+
+**真正的问题不在超参数上，而在 self-play 和 evaluation 的数据分布太窄。**
+
+### 7.8 框架 / game 代码应当调整的地方
+
+下列改动才是让下一轮训练有意义的前提，优先级由高到低：
+
+1. **给 minimax 对手加随机性（prepare.py）**
+   - `opponent_l1/l2/l3` 在得分近似相等的 top-k 动作中 `random.choice`；或者在最外层 move ordering 真的 shuffle。
+   - 没有这个，任何 "N 局 eval" 的统计效力都等于 "2 局 eval"。这是**阻塞级**问题。
+
+2. **评估开局多样化（train.py: `_in_process_eval`）**
+   - 在 200 局里均匀分配 2–4 手的随机合法开局（或从一个开局库里采样），再交给双方落子。
+   - 这样即便双方都是确定性的，eval 里也能看到真实的分布，而不是 2 份拷贝。
+
+3. **Self-play 加温度和 Dirichlet noise 的正确性复核（train.py）**
+   - 若 temp_threshold=30 但 SP 产出的棋局长度已经掉到 ~10 步，那整局 SP 从头到尾都在 argmax 区间，根本没有探索。需要确认 root-Dirichlet 是否开启、ε 是否合理。
+   - 这是"loss 不降 + 开局单一"的另一可能根因。
+
+4. **Loss 拆分到 policy / value 两路并入库**
+   - 目前 cycle_metrics 只有一个合计 loss，看不出 "模型学不到 policy" 还是 "学不到 value"。加两列 `policy_loss` / `value_loss` 就能一眼看出。
+
+5. **Full eval "200 局" 语义修正**
+   - 在当前实现下 200 局 = 2 局，这条信息应在 TUI 和 DB 里显式标注（例如 `eval_unique_games`），否则 analyze.py 的报告会误导 agent。
+
+6. **cycle 457 的 loss=0 写入应改成 NULL 或继承前一 cycle**
+   - 当前会让 `final_loss` 字段变成 0，污染 runs 表。
+
+**game.py 本身看起来没有问题** — board 引擎是确定性是应该的，不需要改。问题完全在 "对手 + 评估协议" 层。
+
+### 7.9 Web 对弈可行性确认
+
+可以，但有两个前提：
+
+1. **运行环境必须是 Apple Silicon + MLX**。`play_service.py:_load_cached_model` 强依赖 `mlx.core`，当前这台 Linux 开发机无法启动 web_app。
+2. **final_c0457 尚未注册为命名对手**。`opponents` 表现在只有 S0（8×64）和 S1（来自 run c70162b9 的 1 小时 8×128，WR 82%），**并不包含 mcts_9th 的 final_c0457**。
+
+要在 Mac 上通过浏览器和这个 checkpoint 对弈，步骤是：
+
+```bash
+# 1. 注册 checkpoint 为命名对手（在 Mac 的项目根目录）
+uv run python domains/gomoku/train.py \
+  --register-opponent MCTS9 \
+  --from-run 789730e3-822f-482c-bba3-53a2da692f2d \
+  --from-tag final_c0457 \
+  --description "8x128 MCTS-800, 6h, final (⚠ 对 L1 过拟合)"
+
+# 2. 启动 web 服务
+uv run python domains/gomoku/web/web_app.py
+# 然后浏览器打开 http://127.0.0.1:8000
+```
+
+前端 `/api/opponents` 会自动把 `MCTS9` 作为一个 NN 对手选项列出（见 play_service.py:149 `get_frontend_opponents`），选它 + 人类执黑/白即可下棋。
+
+**但请管理预期：** 基于 7.3–7.5 的分析，这个模型面对人类（非确定性、非 L1 风格）的开局极可能很快走出"学过的棋谱"外，表现比 TUI 上的 100% 弱很多。把这次对弈当做"验证伪 100%"的手段，而不是"展示 stage 1 成果"。
+
+### 7.10 下一步建议
+
+优先级顺序：
+
+1. **先修数据分布，再谈训练** — 落地 7.8 里的 1、2、3 项改动；
+2. **用修好的协议重跑 200 局 eval 对 final_c0457**，得到第一份真实 WR 数字；
+3. 如果真实 WR < 60%（高度可能），**丢弃 final_c0457**，在修好的 self-play 协议下从 S0 重新 resume，仍用 8×128 / 800 sims，但 LR 上调到 3e-4；
+4. 只有当某个 checkpoint 在"随机化 L1 对手 + 多样化开局"下稳定 ≥80% vs L1，才注册成 S1 并进入 L2 阶段。
+
+**v14 到此为止的教训可以一句话总结：** 在评估协议有确定性坍缩的前提下，任何 100% 胜率都不可信，任何由它推出来的训练决策都不可信。先把尺子校准，再谈长度。

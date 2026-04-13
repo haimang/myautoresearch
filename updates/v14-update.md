@@ -397,3 +397,197 @@ cp output/tracker.db <共享路径>/v14_test.db
 - Focus：从 10% (50 sims) 应提升到 25%+
 - Entropy：应低于 2.5
 - WR vs L1：resume S0 应能从 >0% 起步
+
+---
+
+## 11. mcts_9th 复盘驱动的框架级修复（2026-04-13）
+
+> 前置：v14-findings.md §7（mcts_9th 复盘：100% 胜率是伪的、loss 没学、200 局=2 局的结构性坍缩）
+
+mcts_9th 6 小时长训暴露的不是超参问题，而是**评估协议 + 指标记录**两层的结构性缺陷。本节修复的是框架层，不是 domain 算法层——因此不涉及"agent 该用什么算法"的判断，只改"基准测度是否可信"。
+
+### 11.1 本轮修复的范围边界
+
+**修了什么：**
+
+1. 评估协议的统计坍缩（minimax 确定 + NN argmax → 200 局 = 2 局）
+2. loss 诊断能力（只有总 loss，看不出 policy/value 哪个没在学）
+3. cycle_metrics 表的 "loss=0 伪影"（时间预算耗尽后的空 cycle 仍写一行）
+4. 评估时 NN 对手 temperature 默认 0.5（v13 遗留，虚增 WR）
+
+**没修什么（out-of-scope）：**
+
+1. MCTS 算法本身（C 扩展、sims 数、c_puct）——agent 的判断空间
+2. self-play 的 Dirichlet noise / 温度衰减——已读过代码，实现正确（train.py:500-520, 478-480 passes dirichlet to native MCTS）
+3. game.py 棋盘引擎——没有 bug
+4. analyze.py 的 Pareto / 报告展示——tracker.db 已有新列，analyze 消费可以后续再接
+
+### 11.2 修改清单
+
+#### A. `domains/gomoku/prepare.py` — 随机化 minimax 对手
+
+**问题：** `opponent_l1/l2/l3` 用 `minimax_move` + 稳定排序 `_move_order_basic`，完全确定。对相同棋盘每次返回相同一手。配合 NN argmax，"N 局 eval" 退化成 2 局 × N/2 次复制。
+
+**修复：**
+
+- 新增 `_root_move_scores(board, depth, player, move_order_fn)`：不返回单一 best_move，而是枚举根层所有候选动作并调用 `_minimax` 获得每个候选的完整得分。这是对现有 `_minimax` 的一次纯数据提取式调用，不改变 alpha-beta 本体。
+- 新增 `minimax_move_sampled(board, depth, player, move_order_fn, top_k, softmax_temp, win_threshold)`：对根层候选排序后，在 top-k 内用 softmax(score/temp) 采样一个动作返回。当任一候选得分 ≥ `win_threshold`（默认 50000，对应 `_PATTERN_SCORES` 的 open-four 量级）时**强制选中**该候选——保证一步必胜 / 必堵永远正确落子，随机性只在非战术位点产生。
+- `opponent_l1` → `minimax_move_sampled(depth=2, top_k=3, softmax_temp=50)`
+- `opponent_l2` → `minimax_move_sampled(depth=4, top_k=3, softmax_temp=60)`
+- `opponent_l3` → `minimax_move_sampled(depth=6, top_k=2, softmax_temp=80)`
+- L0 保持纯随机不变。
+
+**实测验证（Linux dev 机, pytest-style smoke）：** 同一中局位置 20 次调用 `opponent_l1`，分布为 `[(6,8)×16, (8,6)×3, (9,7)×1]`——在策略上仍以最佳一手为主（80%），但产生真实随机性。遇到必胜点时 10/10 全部选中正确位点。强度基本不变，但评估不再是 2 局。
+
+#### B. `domains/gomoku/train.py` — 评估开局多样化 + 轨迹指纹
+
+**问题：** 即使对手随机化了，所有 eval 游戏仍然从空盘开始，argmax NN 的"黑棋开局手"仍然唯一，实际 eval 的开局分布非常窄。
+
+**修复：**
+
+- 模块级常量 `_EVAL_OPENING_SEEDS`：16 条两步开局（含空盘、纯中心、各种近中心方向、远对角 / 反对角），覆盖常见 gomoku 布局母体。
+- `_apply_opening(board, seed)`：把一条 seed 应用到棋盘上。
+- `_in_process_eval(model, level, n_games, opponent_model, num_openings)`：每局评估前按 `game_index % num_openings` 选一条 seed 播种，再让双方正常接续。
+- 同时用 `trajectory_fingerprints: set[tuple]` 记录每局实际走出的完整动作序列——返回的 `result` 字典多出 `num_openings` 和 `unique_trajectories` 两项。这让"200 局 = N 局唯一"的坍缩在下一次出现时立刻可观测。
+- `_quick_eval` 同步签名，接受 `num_openings` 参数。
+- 新 CLI flag `--eval-openings N`（默认 0 = 按 `min(16, n_games // 4)` 自动）。
+- `_do_checkpoint` 和 final eval 都把 `num_openings` 和 `unique_trajectories` 传下去，并写入 DB。
+
+**结果字典新字段：**
+
+```python
+{
+    # ... 原有字段 ...
+    "num_openings": int,           # 本次评估使用了多少条 opening seed
+    "unique_trajectories": int,    # 实际出现了多少条不同的完整游戏序列
+}
+```
+
+**实测验证：** 在 16 条 opening × 简单确定性 NN（一律挑第一个合法点）+ 随机化 L1 对手下跑 24 局 →  unique_trajectories=24。与 mcts_9th 的 "200 局 = 2 局" 坍缩形成对照。
+
+#### C. `domains/gomoku/train.py` — eval 时 NN 对手 temperature 默认 0
+
+**问题：** `_nn_opponent_move(temperature=0.5)` 让 NN 对手在评估阶段也在随机采样。胜率被对手的"意外失误"虚假拉高。
+
+**修复：** 默认参数改为 `0.0`。调用点不变——想要带噪 NN 对手的调用方需要显式传 `temperature=0.5`。文档字符串明确说明这是 v13 遗留。
+
+#### D. `domains/gomoku/train.py` — policy / value loss 拆分
+
+**问题：** `compute_loss` 返回一个合计 loss。mcts_9th 的 loss 从 6.36 只降到 4.25，但单一 loss 数字看不出是 policy 没学还是 value 没学（真相是 policy 基本没动，value 早期稳定——两类信号被加权合并后相互掩盖）。
+
+**修复：**
+
+- 新增 `compute_loss_split(model, boards, policies, values)`：返回 `(total, policy_loss, value_loss)` 三元组。原 `compute_loss` 仅返回总 loss 不变——它是 `nn.value_and_grad` 的目标函数，签名不能乱动。
+- 训练循环在每个 cycle 结束后、在**训练循环外**、对该 cycle 的**最后一个 mini-batch** 跑一次 `compute_loss_split` 获取分量。这是 one extra forward pass per cycle——相对 50 个训练步基本可忽略。
+- 新增 state 变量 `last_policy_loss / last_value_loss`，以及 `policy_loss_history / value_loss_history` 两个 list。
+- TUI 面板：在原 Cycle/Loss/Games 三格行下方，新增一行 `P-Loss / V-Loss / policy entropy gap`。仅当有有效分量时显示。
+
+#### E. `domains/gomoku/train.py` — cycle 457 "loss=0 伪影" 修复
+
+**问题：** mcts_9th 最后 cycle 的 `loss=0.0` 不是真正的 loss——是时间预算耗尽后 cycle 没有执行训练步，但仍然写了一行 cycle_metrics。这污染了 `runs.final_loss` 字段，让 analyze.py 看到一个假的"训练完美收敛"信号。
+
+**修复：**
+
+- 训练循环内新增 `steps_run_this_cycle = 0` 计数器，每个成功的 grad step +1。
+- metric 字典构造时，若 `steps_run_this_cycle == 0`，`loss / policy_loss / value_loss` 全写 `None`。
+- 只有当 `steps_run_this_cycle > 0 或 metric["win_rate"] is not None`（即"本 cycle 做了有意义的事"）才调用 `_tracker.save_cycle_metric`。否则完全跳过。这消除了"空 cycle 污染 DB" 的可能。
+- `finish_run` 写 `final_loss` 时：若 `total_train_steps == 0`（完全没训练过），写 `None` 而不是 0。
+
+#### F. `framework/core/db.py` — 迁移 v15
+
+新增 **cycle_metrics** 列：
+
+```sql
+policy_loss REAL,    -- per-cycle policy cross-entropy (last mini-batch)
+value_loss  REAL     -- per-cycle value MSE (last mini-batch)
+```
+
+新增 **checkpoints** 列：
+
+```sql
+eval_unique_openings INTEGER   -- 该 checkpoint full eval 中出现的唯一轨迹数
+```
+
+- `save_cycle_metric` 和 `save_checkpoint` 的 INSERT 语句扩展对应字段，使用 `dict.get(...)` 读取，旧调用者无需修改。
+- 迁移走现有 `ALTER TABLE ... ADD COLUMN` 的 try/except 套路，旧 tracker.db 自动升级，**不破坏兼容性**。
+- 本迁移**不涉及 schema 主题变化**——只加列，不改表、不加约束。
+
+### 11.3 验证步骤（在 Mac 上）
+
+修复后应先做一次**纯评估验证**：不训练，直接把 mcts_9th 的 final_c0457 加载回来跑 full eval，看在修好的协议下真实 WR 是多少。这可以用一个已存在 checkpoint 做 sanity：
+
+```bash
+git pull origin main
+
+# 用修复后的评估协议，把 789730e3 的 final_c0457 当 NN 注册，
+# 然后让它作为 eval-opponent 对 L1 打，看 unique_trajectories 是不是从 2 变成 16。
+# （如果你只想快速验证协议本身，可以跳过注册，直接用任意一个旧 ckpt
+#  起一个 60s 训练，观察 TUI 的 Full eval 行里有没有 "16uniq/16op"）
+
+uv run python domains/gomoku/train.py \
+  --mcts-sims 0 \
+  --num-blocks 8 --num-filters 128 \
+  --time-budget 60 \
+  --eval-level 1 --no-eval-opponent \
+  --eval-interval 3 --probe-games 40 \
+  --full-eval-games 64 --eval-openings 16 \
+  --resume 789730e3 --seed 42
+```
+
+**验证判据：**
+
+1. TUI `Full eval:` 事件行末尾应出现 `NuniqM/NopenM` 形式，且 `Nuniq` 接近 `NopenM × 2`（两侧）。
+2. cycle_metrics 表新增行应有 `policy_loss` / `value_loss` 两列非空（只要有 ≥1 个训练步）。
+3. 任何没有训练步的 cycle **完全不入库**——用 `sqlite3 output/tracker.db "SELECT cycle, loss FROM cycle_metrics WHERE run_id='<id>' AND loss IS NULL"` 应该只显示 eval-only 的 cycle（可以 0 行也正常）。
+4. 用 sqlite 看 runs：修复后的 run 的 `final_loss` 应是**真实最后一次训练的 loss**，不是 0。
+
+### 11.4 3 小时正式训练命令
+
+目标：在修好的评估协议下，**首次得到一份可信的 8×128 / 800 sims / vs L1 真实胜率曲线**。参数继承自 §6.2 建议（LR 2e-4、steps-per-cycle 50、buffer 100K），但这次的数字有统计意义。
+
+```bash
+git pull origin main
+
+# 编译 C 扩展（如尚未编译）
+cd framework/core && bash build_native.sh && cd ../..
+
+# 3 小时从零训练，vs L1，固定 seed，固定时间预算
+uv run python domains/gomoku/train.py \
+  --mcts-sims 800 --parallel-games 10 --mcts-batch 16 \
+  --num-blocks 8 --num-filters 128 \
+  --learning-rate 2e-4 --steps-per-cycle 50 --buffer-size 100000 \
+  --time-budget 10800 \
+  --eval-level 1 --no-eval-opponent \
+  --eval-interval 5 --probe-games 80 \
+  --full-eval-games 200 --eval-openings 16 \
+  --auto-stop-stagnation --stagnation-window 15 \
+  --seed 42
+```
+
+**时间预算拆分（预期）：**
+
+| 阶段 | 时长 | 说明 |
+|------|------|------|
+| C 扩展 warmup | ~5s | 一次性 |
+| 每个 cycle | ~15-20s | 10 boards × ~50 moves × 800 sims + 50 training steps |
+| 预计 cycles | ~500-600 | 10800 / 18 ≈ 600 |
+| Probe eval | 每 5 cycles 一次，80 局 | 约 2-3s/次 |
+| Full eval | 每次越过阈值 | 200 局 / 16 openings，约 4-6s/次 |
+
+**训练中需要观察的四个核心指标（按优先级）：**
+
+1. **policy_loss 是否下降**（TUI 面板第 4 行的 `P-Loss`）。这是 v14 的真正瓶颈——mcts_9th 的 policy_loss 基本没动。如果修好后的训练 policy_loss 能从 ~4.8 降到 <3.5，说明 MCTS 目标被吸收了；如果仍然卡在 4+，说明问题不在 eval 而在 self-play target 或训练动力学。
+2. **Full eval 的 `uniq/op` 比**。在 `✓ Checkpoint` 之后的 `Full eval:` 日志里应出现类似 `80uniq/16op`——完全满额（200/16 × 2 = 16 最多满）或接近满额。如果只有个位数，说明对手随机化或开局多样化失败。
+3. **Probe WR vs L1 的分布形态**。修复前只能取 {0%, 50%, 100%}；修复后应该看到连续分布（例如 37%, 44%, 52% 这类中间值）。如果仍然只出现 {0, 0.5, 1}，说明开局分桶平分时出了 bug。
+4. **avg_game_length**。mcts_9th 最后坍缩到 10.5 步，是伪胜的特征。在多样化开局下，合格的训练 run 应看到 15-30 步的均值，且有真实方差。
+
+### 11.5 训练结束后你需要带回的东西
+
+1. `output/tracker.db`（或只带 mcts_10 的 run 部分）
+2. TUI 最终截图
+3. 至少一个 checkpoint 文件路径（从 db 的 `checkpoints` 表 final 行读），我需要它来做下一步的 Pareto 定位
+
+我会基于这份数据做三件事：
+- 在 v14-findings.md 追加 §8 "第一份真实 vs L1 数据"
+- 在 pareto-frontier.md §14 的"发现能力表"里补一行 "eval-协议修复前后" 的对照
+- 判断这个 checkpoint 是否可作为 S1 候选，给出下一步动作（resume L2 / 重训 / 换策略）

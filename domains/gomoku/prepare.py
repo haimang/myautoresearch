@@ -300,18 +300,11 @@ def _move_order_killer(moves, grid):
 def minimax_move(board: Board, depth: int, player: int,
                  move_order_fn=None) -> tuple[int, int]:
     """
-    Find the best move for `player` on `board` using minimax with alpha-beta.
+    Deterministic minimax: returns the single best move.
 
-    Parameters
-    ----------
-    board : Board
-    depth : int       — search depth
-    player : int      — BLACK or WHITE
-    move_order_fn     — optional move ordering function
-
-    Returns
-    -------
-    (row, col)
+    Prefer ``minimax_move_sampled`` for evaluation / self-play opponents —
+    fully deterministic play makes "N games" eval statistically worthless
+    (every game becomes a copy of the same trajectory).
     """
     grid = board.grid.copy()
     opponent = WHITE if player == BLACK else BLACK
@@ -326,7 +319,6 @@ def minimax_move(board: Board, depth: int, player: int,
     )
 
     if best_move is None:
-        # Fallback: center or first legal move
         legal = board.get_legal_moves()
         if legal:
             return legal[0]
@@ -335,8 +327,116 @@ def minimax_move(board: Board, depth: int, player: int,
     return best_move
 
 
+def _root_move_scores(board: Board, depth: int, player: int,
+                      move_order_fn=None) -> list[tuple[tuple[int, int], float]]:
+    """
+    Enumerate root-level candidate moves and compute the minimax score of each
+    by running the search one ply shallower below. This is equivalent to the
+    first layer of ``minimax_move``'s alpha-beta loop, but it returns ALL
+    (move, score) pairs instead of just the best one — enabling stochastic
+    sampling from top-k moves.
+    """
+    grid = board.grid.copy()
+    opponent = WHITE if player == BLACK else BLACK
+    candidate_fn = _make_candidate_fn(radius=2)
+
+    moves = candidate_fn(grid)
+    if not moves:
+        return []
+    if move_order_fn is not None:
+        moves = move_order_fn(moves, grid)
+
+    results: list[tuple[tuple[int, int], float]] = []
+    for (r, c) in moves:
+        grid[r, c] = player
+        # Immediate-win shortcut — assign massive score so it stays best
+        if _check_win_fast(grid, r, c, player):
+            grid[r, c] = EMPTY
+            results.append(((r, c), 1e9))
+            continue
+        val, _ = _minimax(
+            grid, depth - 1,
+            -float("inf"), float("inf"),
+            False, player, opponent,
+            candidate_fn, move_order_fn,
+        )
+        grid[r, c] = EMPTY
+        results.append(((r, c), float(val)))
+    return results
+
+
+def minimax_move_sampled(board: Board, depth: int, player: int,
+                         move_order_fn=None,
+                         top_k: int = 3,
+                         softmax_temp: float = 50.0,
+                         win_threshold: float = 50000.0) -> tuple[int, int]:
+    """
+    Stochastic minimax move: compute root-level scores for every candidate,
+    then sample from the top-k by softmax over their scores.
+
+    This fixes the "200 games = 2 unique games" collapse by injecting genuine
+    variance into otherwise-deterministic minimax opponents, while keeping the
+    strength nearly unchanged — forced tactics (immediate win / must-block)
+    short-circuit the sampling and always return the correct move.
+
+    Parameters
+    ----------
+    top_k
+        Consider at most this many top-scoring moves in the sampling pool.
+    softmax_temp
+        Temperature applied to score differences. Larger = flatter sampling;
+        smaller = more greedy. Default 50.0 is calibrated against the
+        pattern-score scale from ``_PATTERN_SCORES`` (half-open three = 100).
+    win_threshold
+        If any single candidate scores above this, we assume a forcing move
+        (own win / must-block / four-threat) and play it deterministically.
+    """
+    scored = _root_move_scores(board, depth, player, move_order_fn=move_order_fn)
+    if not scored:
+        legal = board.get_legal_moves()
+        if legal:
+            return legal[0]
+        return (BOARD_SIZE // 2, BOARD_SIZE // 2)
+
+    # Force the objectively-correct move when one exists — we want randomness
+    # on neutral positions only, never on tactical musts.
+    best_score = max(s for _, s in scored)
+    if best_score >= win_threshold:
+        forced = [m for (m, s) in scored if s >= win_threshold]
+        return random.choice(forced)
+
+    # Sort descending and take top-k
+    scored.sort(key=lambda ms: -ms[1])
+    pool = scored[:max(1, top_k)]
+    moves = [m for (m, _) in pool]
+    scores = [s for (_, s) in pool]
+
+    if len(moves) == 1 or softmax_temp <= 0:
+        return moves[0]
+
+    # Numerically stable softmax over score differences
+    max_s = max(scores)
+    exps = [np.exp((s - max_s) / softmax_temp) for s in scores]
+    total = sum(exps)
+    if total <= 0:
+        return moves[0]
+    probs = [e / total for e in exps]
+    r = random.random()
+    acc = 0.0
+    for i, p in enumerate(probs):
+        acc += p
+        if r <= acc:
+            return moves[i]
+    return moves[-1]
+
+
 # ---------------------------------------------------------------------------
 # Opponent functions (L0 – L3)
+#
+# NOTE: L1/L2/L3 are STOCHASTIC — they sample from the top-k root moves so
+# that repeated evaluation games are not identical. Forced tactics (immediate
+# win / must-block) are always played deterministically via the win_threshold
+# shortcut in ``minimax_move_sampled``.
 # ---------------------------------------------------------------------------
 
 def opponent_l0(board: Board) -> tuple[int, int]:
@@ -346,23 +446,26 @@ def opponent_l0(board: Board) -> tuple[int, int]:
 
 
 def opponent_l1(board: Board) -> tuple[int, int]:
-    """Level 1: minimax depth 2."""
-    return minimax_move(board, depth=2, player=board.current_player,
-                        move_order_fn=_move_order_basic)
+    """Level 1: minimax depth 2 with top-3 sampling."""
+    return minimax_move_sampled(board, depth=2, player=board.current_player,
+                                move_order_fn=_move_order_basic,
+                                top_k=3, softmax_temp=50.0)
 
 
 def opponent_l2(board: Board) -> tuple[int, int]:
-    """Level 2: minimax depth 4 with heuristic move ordering."""
-    return minimax_move(board, depth=4, player=board.current_player,
-                        move_order_fn=_move_order_heuristic)
+    """Level 2: minimax depth 4 with top-3 sampling + heuristic ordering."""
+    return minimax_move_sampled(board, depth=4, player=board.current_player,
+                                move_order_fn=_move_order_heuristic,
+                                top_k=3, softmax_temp=60.0)
 
 
 def opponent_l3(board: Board) -> tuple[int, int]:
-    """Level 3: minimax depth 6 with killer-move heuristic."""
+    """Level 3: minimax depth 6 with top-2 sampling + killer-move heuristic."""
     global _killer_moves
     _killer_moves.clear()
-    return minimax_move(board, depth=6, player=board.current_player,
-                        move_order_fn=_move_order_killer)
+    return minimax_move_sampled(board, depth=6, player=board.current_player,
+                                move_order_fn=_move_order_killer,
+                                top_k=2, softmax_temp=80.0)
 
 
 OPPONENTS = {0: opponent_l0, 1: opponent_l1, 2: opponent_l2, 3: opponent_l3}

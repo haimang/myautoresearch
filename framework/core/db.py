@@ -180,6 +180,20 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    # v15 迁移: 拆分 policy / value loss（总 loss 信号不够诊断，
+    # 有时只有策略在学或只有价值在学，单一 loss 数字会遮蔽这个现象）
+    for col, typ in [("policy_loss", "REAL"), ("value_loss", "REAL")]:
+        try:
+            conn.execute(f"ALTER TABLE cycle_metrics ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+    # v15 迁移: 评估时实际出现的不同开局数 —
+    # 确定性评估会让 "N games" 坍缩成 "2 games"，这一列让该坍缩可观测。
+    for col, typ in [("eval_unique_openings", "INTEGER")]:
+        try:
+            conn.execute(f"ALTER TABLE checkpoints ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     return conn
 
@@ -349,8 +363,9 @@ def save_cycle_metric(conn: sqlite3.Connection, run_id: str,
         """INSERT INTO cycle_metrics (
             run_id, cycle, timestamp_s, loss,
             total_games, total_steps, buffer_size,
-            win_rate, eval_type, eval_games, eval_level
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            win_rate, eval_type, eval_games, eval_level,
+            policy_loss, value_loss
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             metric["cycle"],
@@ -363,6 +378,8 @@ def save_cycle_metric(conn: sqlite3.Connection, run_id: str,
             metric.get("eval_type"),
             metric.get("eval_games"),
             metric.get("eval_level"),
+            metric.get("policy_loss"),
+            metric.get("value_loss"),
         ),
     )
     conn.commit()
@@ -381,8 +398,9 @@ def save_checkpoint(conn: sqlite3.Connection, run_id: str,
             win_rate, eval_level, eval_games,
             wins, losses, draws, avg_game_length,
             num_params, model_path, model_size_bytes,
-            created_at, train_elapsed_s, eval_elapsed_s
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            created_at, train_elapsed_s, eval_elapsed_s,
+            eval_unique_openings
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             data["tag"],
@@ -402,6 +420,7 @@ def save_checkpoint(conn: sqlite3.Connection, run_id: str,
             datetime.now(timezone.utc).isoformat(),
             data.get("train_elapsed_s"),
             data.get("eval_elapsed_s"),
+            data.get("eval_unique_openings"),
         ),
     )
     conn.commit()
