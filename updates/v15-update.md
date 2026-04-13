@@ -830,3 +830,105 @@ self.assertIn("v15.1 hotfix", src)
 ### 13.10 v15.1 一句话总结
 
 > **MLX 的 Metal command buffer 不是线程安全的。Async eval 的设计在 Mac 实机第一次 probe 时立即触发 driver assertion 崩溃。修复办法是回退到同步 eval；之所以可以接受，是因为 v15 C 系的 C minimax 已经把 80-game probe 从 30 分钟压到 13 秒、200-game full eval 从 80 分钟压到 33 秒。13 秒的同步阻塞是完全可承受的代价。所有其他 v15 工作（C minimax、晋升门禁、CLI flags、README 重写）100% 保留。最终 6h 训练预期 cycles ≥ 280（对比 mcts_11 同时长的 70 cycles ≈ 4× 提升）。**
+
+---
+
+## 14. v15.3 hotfix（2026-04-13）— sys.path 排序导致 C minimax 从未生效
+
+### 14.1 触发原因
+
+v15.2 batched eval 落地后进行 10 分钟 smoke test（run `d59fba4e`），32-game probe vs L2 仍然需要 **213 秒**。v15-findings §3 预测 batched eval 应把 probe 压到 ~13 秒。差距 16×，说明 batching 以外还有一个独立的性能问题。
+
+### 14.2 诊断过程
+
+1. **逐组件计时**：给 `_in_process_eval` 加 per-component timing。结果：NN batching 正常（32 局总计 0.3 秒），minimax opponent 占了 **215.5 秒**（310 次调用，平均 695 ms/call）。
+2. **对比 C 直调**：直接调用 `minimax_native.root_scores()` 只要 2.5 ms/board。但 `opponent_l2()` 对同样的棋盘要 720 ms。差距 **280×**。
+3. **追踪 import 链**：`_in_process_eval` 中 `from prepare import OPPONENTS` —— 但项目里有**两个** `prepare.py`：
+   - `domains/gomoku/prepare.py`：域特化版本，`MINIMAX_BACKEND = "c"`，通过 ctypes 调用 `minimax_c.dylib`（L2 depth 4 ≈ 5 ms/call）
+   - `framework/prepare.py`：框架模板/回退版本，**纯 Python minimax**（L2 depth 4 ≈ 700-5600 ms/call）
+4. **确认 `prepare.__file__`**：在 train 上下文中打印 → 指向 `framework/prepare.py`。**C minimax 从来没有在 eval 里生效过**。
+
+### 14.3 根因
+
+`train.py` 的 sys.path 设置（v15 原始代码）：
+
+```python
+# 旧代码（v15 ~ v15.2）
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
+if os.path.join(_PROJECT_ROOT, "framework") not in sys.path:
+    sys.path.insert(0, os.path.join(_PROJECT_ROOT, "framework"))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+```
+
+表面上看，先 insert framework，再 insert _THIS_DIR → _THIS_DIR 在 [0]，framework 在 [1]，域 prepare 优先。**但实际上：**
+
+- Python 在运行 `python domains/gomoku/train.py` 时，**自动把脚本所在目录 `domains/gomoku/` 添加到 `sys.path[0]`**。
+- 于是 `if _THIS_DIR not in sys.path` 为 **False**，insert 被跳过。
+- 只有 framework 的 `insert(0, ...)` 执行了，把 framework 推到 [0]，域目录留在 [1]。
+- 结果：`from prepare import ...` 优先找到 `framework/prepare.py`（纯 Python minimax）。
+
+**Python 模块缓存 `sys.modules` 会固化第一次 import 的结果**。train.py 第 47 行 `from prepare import TIME_BUDGET` 是第一个 import，此后所有 `from prepare import OPPONENTS` 都走缓存，指向错误的模块。
+
+### 14.4 影响范围
+
+| 方面 | 影响 |
+|------|------|
+| v15.0 ~ v15.2 的全部 eval | 使用纯 Python minimax，比 C 慢 100-1000× |
+| v15-findings §3 的性能数据 | "800 ms/move NN latency" 中有一部分其实是 minimax 的开销 |
+| mcts_12 6 小时训练 | eval 每次 probe 阻塞 ~3.5 分钟而非预期的 ~13 秒 |
+| `minimax [?]` 启动日志 | 因为 framework/prepare.py 没有 MINIMAX_BACKEND 属性，所以显示 `[?]` 而非 `[c]` |
+
+### 14.5 修复（1 行逻辑变更）
+
+**核心思路**：framework/ 不能 insert 到 index 0，必须 insert 到 _THIS_DIR 后面。
+
+```python
+# 新代码（v15.3）
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+_fw_path = os.path.join(_PROJECT_ROOT, "framework")
+if _fw_path not in sys.path:
+    # Insert AFTER _THIS_DIR so domain prepare.py takes priority
+    _idx = sys.path.index(_THIS_DIR) + 1 if _THIS_DIR in sys.path else 0
+    sys.path.insert(_idx, _fw_path)
+```
+
+无论 Python 是否自动添加了脚本目录，framework 都会被放在域目录**之后**。
+
+- Commit: `d2aa05f fix(train): ensure domain prepare.py takes priority over framework fallback`
+
+### 14.6 验证
+
+Mac M3 Max 实机，`--mcts-sims 0 --eval-level 2 --probe-games 32 --eval-interval 3`，resume from `6c9c8bdd`：
+
+```
+[21:10:38] Started run 0b3737c3 | 2490.0K params | budget 600s | minimax [c]
+[21:10:41] Probe c177: 0.0% (32g vs L2, 32u/8o, 2.0s)
+[21:10:48] Probe c180: 0.0% (32g vs L2, 32u/8o, 2.1s)
+[21:11:00] Probe c183: 0.0% (32g vs L2, 32u/8o, 1.8s)
+[21:11:17] Probe c186: 0.0% (32g vs L2, 32u/8o, 1.9s)
+[21:11:37] Probe c189: 0.0% (32g vs L2, 32u/8o, 1.8s)
+[21:11:59] Probe c192: 0.0% (32g vs L2, 32u/8o, 2.1s)
+```
+
+| 指标 | v15.2（修复前） | v15.3（修复后） | 加速 |
+|------|----------------|----------------|------|
+| 32-game probe vs L2 | 213 s | **1.8 – 2.1 s** | **109×** |
+| 启动日志 minimax 标识 | `[?]` | **`[c]`** | — |
+| NN batching 耗时 | 0.3 s | 0.3 s | 不变 |
+| Minimax 耗时（310 calls） | 215.5 s | **< 1.5 s** | ~150× |
+
+### 14.7 教训
+
+1. **两个同名模块 + sys.path = 定时炸弹**。`prepare.py` 同时存在于 `domains/gomoku/` 和 `framework/` 下，Python 的 import 语义完全取决于 `sys.path` 顺序。未来应考虑给框架模块加命名空间前缀（如 `framework_prepare.py`），或改用 package import。
+2. **Python 自动添加脚本目录到 sys.path[0]** 是一个容易被忽略的行为。`sys.path.insert(0, x)` 的效果会被它改变。
+3. **`minimax [?]` 是一个被忽略的信号**。如果早期注意到启动日志中的 `[?]` 而非 `[c]`，就能更早发现问题。
+4. **这是第三次"Linux 测试给了虚假安全感"**：v15.1（Metal threading）、v15.2（MLX batch latency）、v15.3（sys.path 因脚本执行方式不同而变化）。**所有影响运行时性能的改动必须 Mac 实机验证**。
+
+### 14.8 v15.3 一句话总结
+
+> **`sys.path` 排序 bug 导致 `from prepare import OPPONENTS` 解析到 `framework/prepare.py`（纯 Python minimax，~700 ms/call）而非 `domains/gomoku/prepare.py`（C minimax，~5 ms/call）。v15.0 以来 C minimax 从未在 eval 中生效过。修复：将 framework/ 插入到域目录之后而非之前。32-game probe 从 213 秒降至 2 秒，加速 109×。**
