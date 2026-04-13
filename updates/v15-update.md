@@ -698,8 +698,135 @@ uv run python domains/gomoku/train.py \
 |------|---------|---------|
 | 启动报 `minimax_c not found` | C 未编译或路径错 | `cd domains/gomoku && bash build_native.sh` |
 | `Error: no checkpoint found for run '6c9c8bdd'` | 父 run 不在 DB 里 | 检查 `analyze.py --runs` 确认存在 |
-| TUI `Eval` 行一直 `running` 超过 2 分钟 | async eval 卡死或死锁 | Ctrl+C，拿回 tracker.db 给我 debug |
+| TUI `Eval` 行一直 `running` 超过 2 分钟 | sync eval 卡死 | Ctrl+C，拿回 tracker.db 给我 debug |
 | RAM 持续涨到 >80 GB | v14.1 clear_cache 可能被 v15 改动破坏 | Ctrl+C，拿 TUI 截图 |
 | `✓ Auto-promoted` 没出现 | 没有 checkpoint 通过 can_promote 门禁 | 训练完成后 `sqlite3 tracker.db "SELECT tag, promotion_eligible, promotion_reason FROM checkpoints WHERE run_id LIKE '%'"` |
 
 中断数据照常带回来，我会基于 interrupted run 的数据分析原因并决定是否需要 v15.1 补丁。
+
+---
+
+## 13. v15.1 hotfix（2026-04-13 晚）— async eval 回退到同步
+
+### 13.1 触发原因
+
+v15 的 §11 工作日志声称 27/27 测试通过，但**测试是 Linux dev box 跑的，那台机器没有 MLX**。Mac 第一次实机运行 mcts_12 命令后，**第一个 probe 触发时立刻崩溃**，错误是：
+
+```
+-[AGXG15XFamilyCommandBuffer tryCoalescingPreviousComputeCommandEncoderWithConfig:nextEncoderClass:]:1090:
+    failed assertion `A command encoder is already encoding to this command buffer'
+```
+
+### 13.2 根因
+
+**MLX/Metal command buffer 不是线程安全的。** 即使我用 `snapshot_model` 给 eval 线程做了一份独立的权重深拷贝，这份"独立"也只是 Python 层面的。在 Metal 层面：
+
+- MLX 内部维护一个**全局 Metal command queue** 和 command buffer
+- 主训练线程的 `model(x)` 调用（self-play 的 forward + training step 的 forward+backward）和 eval 线程的 `model(x)` 调用（probe 的 forward）会**同时往同一个 command buffer 写入 encoder**
+- Metal 的 driver 检测到这个并发写入，触发上面的 assertion，整个进程被立即终止
+
+snapshot 权重不能解决这个问题——问题不在权重读取的并发，而在**Metal API 调用本身的并发**。Python 的 `threading` 模块 + MLX 的设计是根本性不兼容的。
+
+### 13.3 为什么 Linux 测不出来
+
+Linux 没有 Metal。`tests/test_async_eval.py` 用的是一个 sleep-based fake worker，根本不会触碰 MLX/Metal。所有 Linux 测试都跑通了，但**测试覆盖面没有触及 v15 B 系真正会失败的代码路径**。
+
+这是这次 v15 的最大教训：**任何依赖 MLX 的并发设计都必须在 Mac 实机验证后才能合并**。dev box 的 unit test pass 不等于 Mac 上能跑。
+
+### 13.4 修复决策
+
+回退 B 系到同步实现。**之所以可以这样做**：v15 C 系（minimax C 化）已经把 eval 的绝对时长大幅压缩——
+
+- 80-game probe vs L2：30 min → **~13 秒**
+- 200-game full eval vs L2：80 min → **~33 秒**
+
+13 秒的同步阻塞是**完全可接受**的。原本 v14.1 / mcts_11 那个 30 min stall 才是不可接受的。**C 化 minimax 单独已经解决了用户的核心痛点**，async eval 在 v15 这个上下文里反而是"为了解决一个已经被另一条修复线干掉的问题"——回退它没有任何成本。
+
+### 13.5 实际改动（最小回退面）
+
+**保留：**
+
+- C minimax port 全部
+- `_in_process_eval` 的 per-opening breakdown（E3）
+- A 系所有 bug 修复
+- E 系所有观察 / 晋升门禁
+- F 系 v16 入口
+- G 系 README 重写
+- snapshot_model 函数（保留供 v16 多进程方案使用）
+- ThreadPoolExecutor 对象创建（保留以避免进一步代码变动；v15.1 里它是 dormant 的）
+
+**回退（删除）：**
+
+- `_submit_eval(kind, ...)` 函数
+- `_try_integrate_eval()` 函数
+- `_do_checkpoint_from_result(...)` 函数
+- 主循环顶部的 `_try_integrate_eval()` 调用
+- Ctrl+C 路径里的 in-flight eval drain 逻辑
+
+**新增（替代）：**
+
+- `_run_probe_eval(eval_games)` — 同步调用 `_in_process_eval`，返回结果 dict
+- `_integrate_probe_result(result, submit_cycle)` — 把结果写入 wr_history / cycle_metrics，触发 threshold check（同步触发 full eval + checkpoint），处理 stagnation / target WR 早停
+- `_save_full_eval_checkpoint(result, threshold)` — 内联了原 `_do_checkpoint_from_result` 的同步版本
+
+主循环里的 probe 触发现在是这样的：
+
+```python
+if cycle % eval_interval == 0 and evaluate_win_rate is not None:
+    _probe_result = _run_probe_eval(probe_games)
+    _integrate_probe_result(_probe_result, submit_cycle=cycle)
+```
+
+完全同步，没有 future、没有线程、没有 race。
+
+### 13.6 测试更新
+
+`tests/test_async_eval.py::TestSnapshotApiSurface` 原本检查 `_try_integrate_eval` / `_submit_eval` 这两个被删掉的函数存在。改为检查 v15.1 的 sync helpers：
+
+```python
+self.assertIn("def _run_probe_eval(eval_games: int)", src)
+self.assertIn("def _integrate_probe_result(", src)
+self.assertIn("def _save_full_eval_checkpoint(", src)
+self.assertIn("v15.1 hotfix", src)
+```
+
+`TestAsyncEvalMechanics` 其余测试（验证 ThreadPoolExecutor 的 submit/poll/timeout 机制本身）保留——它们测的是 Python 标准库的行为，没有 MLX 依赖，是 framework-level 的健全性。
+
+**测试结果（v15.1 修复后）：** `27/27 pass`（与 v15 完全一致）。
+
+### 13.7 v15.1 后的 6 小时训练命令（最终版本）
+
+**和 §12.3 完全一样**——CLI 参数没有变化，因为 async/sync 是内部实现细节。但**期望的运行行为有差异**：
+
+| 时点 | v15（设想）| **v15.1（实际）** |
+|------|-----------|------------------|
+| Probe 触发 | TUI 立即返回，eval 在后台 | TUI **冻结约 13 秒**（同步执行），然后返回 |
+| Full eval 触发 | TUI 立即返回 | TUI **冻结约 33 秒**，然后 checkpoint 入库 |
+| 3h 真实 cycles | ~200-260 | **~150-200**（每 5 cycles 一次 13s 阻塞 + 偶尔 33s full eval） |
+| 6h 真实 cycles | ~400-500 | **~280-350** |
+| Wall clock 效率 | ~95% | **~85-90%** |
+
+**仍然比 v14.1 (mcts_11) 的 70 cycles / 6h 强 4-5 倍**。最大的赢家是 C minimax，不是 async eval——这一点必须诚实记下来。
+
+### 13.8 v15.1 的运行时验收判据（更新）
+
+| 时点 | 指标 | 期望 |
+|------|------|------|
+| 启动第 1 分钟 | TUI 左上角 `[C-native minimax]` | ✓ |
+| 启动第 5 分钟 | 第一次 probe 完成，事件日志 `Probe c<N>: X% (...)`，**不应有 `[AGXG15X...]` 报错** | ✓ |
+| Probe 期间 | TUI Eval 行短暂显示 `⋯ running (sync, Ns)`（10-15 秒内），然后回到 `★ idle` | ✓ |
+| Full eval 期间 | TUI 同上，但 elapsed 更长（30-40 秒） | ✓ |
+| 启动第 30 分钟 | 主循环 cycle 数 ≥ 25 | ✓ |
+| RAM 峰值 | ≤ 40 GB | ✓ |
+| 6h 训练结束时 | `total_cycles` ≥ 280 | ✓ |
+| 6h 训练结束时 | `--auto-promote-to S2` 成功 | ✓ |
+
+### 13.9 v15.2+ 还想做的（不在本版本内）
+
+- **多进程 eval worker**：用 `multiprocessing.Process(spawn)` 让 eval 跑在独立 Python 进程里（独立 MLX context），避免 Metal 线程问题。复杂度：~1-2 天。代价：snapshot 权重要通过共享内存或文件传递。**这是 v16 的工作**。
+- **MLX 全局锁**：用一个 `threading.Lock` 包住所有 MLX 调用。技术上能让 v15 的 async 设计跑通，但 lock 争用会让 eval 线程把训练线程阻塞 10-15 秒（因为 MLX 调用是细粒度的），收益接近零。**不推荐**。
+- **Eval 完全外包给 subprocess**：每次 probe 启动一个新 Python 进程跑 eval，结果通过 stdout JSON 返回。代价：每次 probe ~2 秒进程启动开销，但**没有 MLX 线程问题**。**这是 v16 的备选方案**。
+
+### 13.10 v15.1 一句话总结
+
+> **MLX 的 Metal command buffer 不是线程安全的。Async eval 的设计在 Mac 实机第一次 probe 时立即触发 driver assertion 崩溃。修复办法是回退到同步 eval；之所以可以接受，是因为 v15 C 系的 C minimax 已经把 80-game probe 从 30 分钟压到 13 秒、200-game full eval 从 80 分钟压到 33 秒。13 秒的同步阻塞是完全可承受的代价。所有其他 v15 工作（C minimax、晋升门禁、CLI flags、README 重写）100% 保留。最终 6h 训练预期 cycles ≥ 280（对比 mcts_11 同时长的 70 cycles ≈ 4× 提升）。**

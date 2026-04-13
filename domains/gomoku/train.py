@@ -1114,16 +1114,18 @@ def train(args):
     policy_loss_history: list[float] = []
     value_loss_history: list[float] = []
 
-    # v15 B2: async eval state. Single worker thread runs probes (and full
-    # evals on threshold crossings) on a frozen weight snapshot. Main loop
-    # polls `pending_eval` at the top of each cycle and integrates the
-    # result into cycle_metrics + checkpoint logic without blocking.
+    # v15 B2 → v15.1 hotfix: `eval_executor` and `pending_eval` are kept
+    # on the books for a possible v16 multi-process redesign, but during
+    # v15.1 normal training they are dormant. Eval runs synchronously inside
+    # _run_probe_eval(); see the helper definitions below for the rationale
+    # (MLX/Metal command-buffer thread-safety assertion). The C minimax
+    # port made the synchronous path acceptable (~13s for 80 games vs L2).
     eval_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="eval-worker"
     )
-    pending_eval: dict | None = None  # {"future", "kind", "submit_cycle", ...}
-    eval_status_str = "idle"   # for TUI display
-    eval_submit_time: float = 0.0  # for TUI elapsed display
+    pending_eval: dict | None = None  # always None in v15.1
+    eval_status_str = "idle"   # set briefly to "running" inside _run_probe_eval
+    eval_submit_time: float = 0.0  # for TUI elapsed display while running
 
     # NN opponent (if --eval-opponent specified)
     eval_opponent_alias: str | None = args.eval_opponent
@@ -1215,160 +1217,126 @@ def train(args):
         w = min(window, len(wr_history))
         return sum(wr_history[-w:]) / w
 
-    # ─── v15 B2-B6: async eval submit / integrate helpers ────────────────
-    # `pending_eval` is a dict (or None) defined in the outer training state,
-    # accessed via nonlocal because Python closures cannot rebind ints/dicts
-    # otherwise. The nested functions modify it via `nonlocal`.
+    # ─── v15.1 hotfix: synchronous eval helpers ──────────────────────────
+    #
+    # The original v15 B 系 design ran eval in a background ThreadPoolExecutor
+    # to avoid blocking the main training loop. That design was killed by an
+    # MLX threading bug:
+    #
+    #     [AGXG15XFamilyCommandBuffer ...]:1090: failed assertion
+    #     `A command encoder is already encoding to this command buffer'
+    #
+    # Root cause: MLX/Metal command buffers are NOT thread-safe. Even with a
+    # snapshot of the weights, the GPU command queue is shared across threads,
+    # so two simultaneous `model(x)` calls (one in the eval thread, one in the
+    # main self-play / training thread) race and fire the assertion.
+    #
+    # Fix: revert to synchronous eval. Because v15 C 系 already brought
+    # probe eval down from ~30 min → ~13 sec via the C minimax port, the
+    # synchronous block is now a tolerable cost (cf v15-update §11.2 numbers).
+    # All other v15 work (C minimax, checkpoint policy, observability,
+    # promotion gate, --auto-promote-to, --initial-opponent, README) is
+    # preserved — only B 系 is rolled back.
+    #
+    # `pending_eval`, `eval_executor`, `snapshot_model` are kept on the
+    # books for v16's potential multi-process redesign, but during normal
+    # training pending_eval stays None.
 
-    def _submit_eval(kind: str, eval_games: int, integrate_as_threshold: float | None):
-        """v15 B2: snapshot the model and submit an eval to the worker pool.
+    def _run_probe_eval(eval_games: int) -> dict:
+        """v15.1 sync probe — replaces the old async submit/integrate flow.
 
-        kind: 'probe' or 'full'
-        integrate_as_threshold: when not None, this eval result is also used
-                                to save a checkpoint at the given threshold
-                                (i.e. the result of a full eval triggered by a
-                                probe crossing).
+        Called inline from the main loop. Returns the full eval result dict
+        so the caller can update wr_history and trigger checkpoint logic.
         """
-        nonlocal pending_eval, eval_status_str, eval_submit_time
-        if pending_eval is not None:
-            # Skip — only one eval in flight at a time
-            _log_event(
-                f"⊘ Eval {kind} skipped (cycle {cycle}): previous "
-                f"{pending_eval['kind']} still running "
-                f"(elapsed {(_time.time()-eval_submit_time):.0f}s)"
-            )
-            return
-        snap = snapshot_model(model, num_blocks=num_blocks, num_filters=num_filters)
-        f = eval_executor.submit(
-            _eval_worker, snap, eval_level, eval_games,
-            args.eval_openings, opponent_model,
-        )
-        pending_eval = {
-            "future": f,
-            "kind": kind,
-            "submit_cycle": cycle,
-            "submit_time": _time.time(),
-            "n_games": eval_games,
-            "integrate_as_threshold": integrate_as_threshold,
-        }
+        nonlocal eval_status_str, eval_submit_time
         eval_status_str = "running"
         eval_submit_time = _time.time()
-        _log_event(
-            f"→ Eval {kind} submitted (cycle {cycle}, {eval_games} games)"
-        )
-
-    def _try_integrate_eval():
-        """v15 B3: poll the in-flight eval; integrate if done.
-
-        Called once per cycle at the top. Non-blocking: if not done, returns
-        immediately. If done, writes cycle_metrics, checks checkpoint
-        threshold, and may trigger a chained full-eval.
-        """
-        nonlocal pending_eval, last_probe_wr, last_ckpt_wr, num_checkpoints
-        nonlocal eval_status_str, stop_reason
-        if pending_eval is None:
-            return
-        f: Future = pending_eval["future"]
-        if not f.done():
-            return
-        try:
-            result = f.result()
-        except Exception as exc:
-            _log_event(f"✗ Eval {pending_eval['kind']} failed: {exc}")
-            pending_eval = None
-            eval_status_str = "idle"
-            return
-
-        kind = pending_eval["kind"]
-        submit_cycle = pending_eval["submit_cycle"]
-        threshold_for_ckpt = pending_eval["integrate_as_threshold"]
-        elapsed = _time.time() - pending_eval["submit_time"]
-        pending_eval = None
+        # Use the live model directly — single-threaded, no race with itself.
+        model.eval()
+        result = _in_process_eval(model, eval_level, eval_games,
+                                  opponent_model=opponent_model,
+                                  num_openings=args.eval_openings)
+        mx.clear_cache()
         eval_status_str = "idle"
+        return result
+
+    def _integrate_probe_result(result: dict, submit_cycle: int):
+        """Apply a probe result to wr_history, cycle_metrics, threshold
+        check, target WR, and stagnation logic. Triggers a synchronous full
+        eval + checkpoint save if a threshold was crossed.
+        """
+        nonlocal last_probe_wr, last_ckpt_wr, num_checkpoints, stop_reason
 
         wr = result["win_rate"]
         uniq = result.get("unique_trajectories", 0)
         n_open = result.get("num_openings", 0)
         n_g = result.get("wins", 0) + result.get("losses", 0) + result.get("draws", 0)
+        elapsed = result.get("eval_elapsed_s", 0.0)
 
-        if kind == "probe":
-            last_probe_wr = wr
-            wr_history.append(wr)
-            sm_wr = _smoothed_wr()
-            sm_str = f" (avg:{sm_wr:.1%})" if sm_wr is not None and len(wr_history) > 1 else ""
-            opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
-            _log_event(
-                f"✓ Probe done c{submit_cycle}: {wr:.1%}{sm_str} "
-                f"({n_g} games vs {opp_label}, {uniq}u/{n_open}o, {elapsed:.0f}s)"
-            )
-            # Write a probe row to cycle_metrics, attributed to the SUBMIT cycle
-            _tracker.save_cycle_metric(db_conn, run_id, {
-                "cycle": cycle,  # row index = current; submit_cycle stored separately
-                "timestamp_s": _time.time() - start_time,
-                "loss": last_loss,
-                "policy_loss": last_policy_loss,
-                "value_loss": last_value_loss,
-                "total_games": total_games,
-                "total_steps": total_train_steps,
-                "buffer_size": len(replay_buffer),
-                "win_rate": wr,
-                "eval_type": "probe",
-                "eval_games": n_g,
-                "eval_level": eval_level,
-                "eval_submitted_cycle": submit_cycle,
-            })
+        last_probe_wr = wr
+        wr_history.append(wr)
+        sm_wr = _smoothed_wr()
+        sm_str = f" (avg:{sm_wr:.1%})" if sm_wr is not None and len(wr_history) > 1 else ""
+        opp_label = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
+        _log_event(
+            f"Probe c{submit_cycle}: {wr:.1%}{sm_str} "
+            f"({n_g}g vs {opp_label}, {uniq}u/{n_open}o, {elapsed:.1f}s)"
+        )
 
-            # Threshold check: did smoothed WR cross a checkpoint gate?
-            effective_wr = sm_wr if sm_wr is not None else wr
-            crossed = _tracker.crossed_threshold(effective_wr, last_ckpt_wr)
-            if crossed is not None:
-                # Submit a full eval — checkpoint gets saved when full eval returns
-                _submit_eval("full", full_eval_games, integrate_as_threshold=crossed)
-                last_ckpt_wr = effective_wr  # advance even though full eval pending
+        _tracker.save_cycle_metric(db_conn, run_id, {
+            "cycle": submit_cycle,
+            "timestamp_s": _time.time() - start_time,
+            "loss": last_loss,
+            "policy_loss": last_policy_loss,
+            "value_loss": last_value_loss,
+            "total_games": total_games,
+            "total_steps": total_train_steps,
+            "buffer_size": len(replay_buffer),
+            "win_rate": wr,
+            "eval_type": "probe",
+            "eval_games": n_g,
+            "eval_level": eval_level,
+            "eval_submitted_cycle": submit_cycle,
+        })
 
-            # Target WR / stagnation early stop checks
-            if target_win_rate and effective_wr >= target_win_rate:
-                _log_event(f"🎯 Target {target_win_rate:.0%} reached (avg:{effective_wr:.1%})")
-                stop_reason = "target_win_rate"
-
-            if auto_stop_stagnation and len(wr_history) >= stagnation_window:
-                _sw = wr_history[-stagnation_window:]
-                _xs = list(range(len(_sw)))
-                _n = len(_sw)
-                _sx = sum(_xs); _sy = sum(_sw)
-                _sxy = sum(x*y for x,y in zip(_xs, _sw))
-                _sxx = sum(x*x for x in _xs)
-                _denom = _n*_sxx - _sx*_sx
-                if abs(_denom) > 1e-12:
-                    _slope = (_n*_sxy - _sx*_sy) / _denom
-                    _mean = _sy / _n
-                    _std = (sum((w-_mean)**2 for w in _sw) / _n) ** 0.5
-                    _expected = abs(_slope * _n)
-                    if _expected < _std and _std > 0.01:
-                        _log_event(
-                            f"⚠ Stagnation: WR plateau for {stagnation_window} "
-                            f"evals (std={_std:.1%})"
-                        )
-                        stop_reason = "stagnation"
-
-        elif kind == "full":
-            # Full eval result → save checkpoint
-            _do_checkpoint_from_result(
-                result, cycle=cycle, threshold=threshold_for_ckpt,
-            )
+        # Threshold check: did smoothed WR cross a checkpoint gate?
+        effective_wr = sm_wr if sm_wr is not None else wr
+        crossed = _tracker.crossed_threshold(effective_wr, last_ckpt_wr)
+        if crossed is not None:
+            _log_event(f"→ Threshold {crossed:.0%} crossed, full eval ({full_eval_games}g)…")
+            full_result = _run_probe_eval(full_eval_games)
+            _save_full_eval_checkpoint(full_result, threshold=crossed)
             num_checkpoints += 1
-            _log_event(
-                f"✓ Full eval done c{submit_cycle}: {wr:.1%} "
-                f"({result.get('wins',0)}W/{result.get('losses',0)}L, "
-                f"{uniq}u/{n_open}o, {elapsed:.0f}s) → checkpoint saved"
-            )
+            last_ckpt_wr = effective_wr
 
-    def _do_checkpoint_from_result(result: dict, cycle: int, threshold: float | None):
-        """v15 B4: save a checkpoint built from an async full-eval result.
+        # Target WR early stop
+        if target_win_rate and effective_wr >= target_win_rate:
+            _log_event(f"🎯 Target {target_win_rate:.0%} reached (avg:{effective_wr:.1%})")
+            stop_reason = "target_win_rate"
 
-        Inlines the relevant bits of the old _do_checkpoint() that came after
-        the eval call (which is now in the worker thread).
-        """
+        # Stagnation early stop
+        if auto_stop_stagnation and len(wr_history) >= stagnation_window:
+            _sw = wr_history[-stagnation_window:]
+            _xs = list(range(len(_sw)))
+            _n = len(_sw)
+            _sx = sum(_xs); _sy = sum(_sw)
+            _sxy = sum(x * y for x, y in zip(_xs, _sw))
+            _sxx = sum(x * x for x in _xs)
+            _denom = _n * _sxx - _sx * _sx
+            if abs(_denom) > 1e-12:
+                _slope = (_n * _sxy - _sx * _sy) / _denom
+                _mean = _sy / _n
+                _std = (sum((w - _mean) ** 2 for w in _sw) / _n) ** 0.5
+                _expected = abs(_slope * _n)
+                if _expected < _std and _std > 0.01:
+                    _log_event(
+                        f"⚠ Stagnation: WR plateau for {stagnation_window} "
+                        f"evals (std={_std:.1%})"
+                    )
+                    stop_reason = "stagnation"
+
+    def _save_full_eval_checkpoint(result: dict, threshold: float | None):
+        """Save a checkpoint built from a synchronous full-eval result."""
         wr_pct = int((threshold if threshold is not None else result["win_rate"]) * 100)
         tag = f"wr{wr_pct:03d}_c{cycle:04d}"
         ckpt_path = f"{ckpt_dir}/{tag}.safetensors"
@@ -1376,15 +1344,16 @@ def train(args):
         elapsed = _time.time() - start_time
         full_wr = result.get("win_rate", 0.0)
         uniq = result.get("unique_trajectories", 0)
+        n_eval = result.get("wins", 0) + result.get("losses", 0) + result.get("draws", 0)
 
-        _tracker.save_checkpoint(db_conn, run_id, {
+        ckpt_id = _tracker.save_checkpoint(db_conn, run_id, {
             "tag": tag,
             "cycle": cycle,
             "step": total_train_steps,
             "loss": last_loss,
             "win_rate": full_wr,
             "eval_level": eval_level,
-            "eval_games": result.get("wins", 0) + result.get("losses", 0) + result.get("draws", 0),
+            "eval_games": n_eval,
             "wins": result.get("wins"),
             "losses": result.get("losses"),
             "draws": result.get("draws"),
@@ -1397,15 +1366,13 @@ def train(args):
             "eval_unique_openings": uniq,
             "recent_smoothed_wr": list(wr_history[-5:]) if wr_history else [],
         })
-        # Persist per-opening breakdown for E3 diagnostics
         if result.get("wr_by_opening"):
-            ckpt_id = db_conn.execute(
-                "SELECT id FROM checkpoints WHERE run_id=? AND tag=?",
-                (run_id, tag),
-            ).fetchone()
-            if ckpt_id is not None:
-                _tracker.save_eval_breakdown(db_conn, ckpt_id[0],
-                                             result["wr_by_opening"])
+            _tracker.save_eval_breakdown(db_conn, ckpt_id, result["wr_by_opening"])
+        _log_event(
+            f"✓ Checkpoint {tag} (full eval {full_wr:.1%}, "
+            f"{result.get('wins',0)}W/{result.get('losses',0)}L, "
+            f"{uniq}u/{result.get('num_openings',0)}o)"
+        )
 
     def _recent_avg(values: list[float], window: int = 5) -> float | None:
         if not values:
@@ -1456,14 +1423,14 @@ def train(args):
                 f"policy entropy gap: {max(0.0, last_policy_loss):.2f} nats"
             ))
 
-        # --- v15 B5: async eval status row ---
-        if pending_eval is not None:
-            kind = pending_eval["kind"]
-            ec = pending_eval["submit_cycle"]
-            ng = pending_eval["n_games"]
-            elapsed_e = _time.time() - pending_eval["submit_time"]
+        # --- v15.1 sync eval status row ---
+        # eval_status_str is set briefly to "running" inside _run_probe_eval()
+        # while the synchronous eval is in progress, then back to "idle".
+        # Most cycles will see "idle" because eval is fast.
+        if eval_status_str == "running":
+            elapsed_e = _time.time() - eval_submit_time
             lines.append(row(
-                f"  Eval    ⋯ {kind:<5} (submit c{ec}, {ng}g, {elapsed_e:>4.0f}s)         "
+                f"  Eval    ⋯ running (sync, {elapsed_e:>4.0f}s)                              "
             ))
         else:
             lines.append(row(f"  Eval    ★ idle                                                       "))
@@ -1590,14 +1557,6 @@ def train(args):
                 break
             if target_games and total_games >= target_games:
                 stop_reason = "target_games"
-                break
-
-            # v15 B3: poll any in-flight async eval and integrate the result
-            # into cycle_metrics / checkpoint logic. Non-blocking — costs
-            # ~1 μs when no eval is pending.
-            _try_integrate_eval()
-            if stop_reason in ("target_win_rate", "stagnation"):
-                _update_tui()
                 break
 
             cycle += 1
@@ -1767,12 +1726,13 @@ def train(args):
                 "buffer_size": len(replay_buffer),
             }
 
-            # ----- Probe evaluation (v15 B2: async submit; results integrated
-            #  by _try_integrate_eval() at the top of each subsequent cycle) ----
+            # ----- Probe evaluation (v15.1: synchronous call, see hotfix in
+            #  _run_probe_eval). Async eval was killed by an MLX/Metal
+            #  command-buffer thread-safety assertion; with C minimax the
+            #  synchronous probe is ~13s for 80 games vs L2, acceptable. ----
             if cycle % eval_interval == 0 and evaluate_win_rate is not None:
-                _submit_eval("probe", probe_games, integrate_as_threshold=None)
-                # Stagnation/target/WR integration now happens when the probe
-                # result is polled in (see _try_integrate_eval).
+                _probe_result = _run_probe_eval(probe_games)
+                _integrate_probe_result(_probe_result, submit_cycle=cycle)
 
             if stop_reason in ("target_win_rate", "stagnation"):
                 _update_tui()
@@ -1783,7 +1743,7 @@ def train(args):
 
             # Only emit a cycle_metrics row if something meaningful happened
             # this cycle. Probe rows are written separately by
-            # _try_integrate_eval() when the async result arrives.
+            # _integrate_probe_result() (v15.1 sync path).
             if steps_run_this_cycle > 0:
                 _tracker.save_cycle_metric(db_conn, run_id, metric)
 
@@ -1811,18 +1771,14 @@ def train(args):
         stop_reason = "interrupted"
         _log_event("Training interrupted by user")
     finally:
-        # v15 B8: drain in-flight eval before shutdown so we don't lose data
-        # or hang the executor. Bounded wait — if eval is pathologically slow
-        # we cancel and warn rather than block forever.
-        if pending_eval is not None:
-            try:
-                _log_event("Waiting for in-flight eval to complete (up to 30s)…")
-                pending_eval["future"].result(timeout=30)
-                _try_integrate_eval()
-            except Exception as exc:
-                _log_event(f"⚠ Eval drain timed out / failed: {exc}")
-                pending_eval = None
-        eval_executor.shutdown(wait=False, cancel_futures=True)
+        # v15.1: eval is synchronous now (see hotfix comment near
+        # _run_probe_eval). No in-flight future to drain. The unused
+        # eval_executor and pending_eval are kept on the books for v16's
+        # potential multi-process redesign, but they're no-ops in v15.1.
+        try:
+            eval_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
         if use_tui:
             # Print final state after clearing
