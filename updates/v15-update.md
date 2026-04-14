@@ -1139,3 +1139,166 @@ PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
 ### 16.5 v15.5 一句话总结
 
 > **Run c4b44746 确认 spc=200 有效（水平封堵 5%→97%），但 8×128 模型 3h 仅 1.51 更新/参数，不足以学会对角线战术。推荐切换 4×64 + 400 sims（同等时间 31.6× 训练密度），预计 1 小时内出首胜。**
+
+---
+
+## §17 v15 双机实验总结与训练路径推荐 — 2026-04-14
+
+### 17.1 实验执行
+
+在 §16 (c4b44746, 8×128) 揭示了模型过大导致训练密度不足的瓶颈后，按照推荐方案在两台设备上并行执行了缩小模型的训练实验：
+
+| 实验 | 设备 | 模型 | MCTS | 时间 | Run ID |
+|------|------|------|------|------|--------|
+| 实验 A | M4 Pro (14核/64GB) | 4×64 (416K) | 400 sims | 2h | c2ae880e |
+| 实验 B | M3 Max (16核/40GPU/128GB) | 8×96 (1.45M) | 400 sims | 6h | 83e2edea |
+
+### 17.2 核心成果
+
+**里程碑：首次对 C-L1 获得非零胜率**
+
+| Run | 模型 | 200-game WR | 最佳 Probe WR | PL (最终) |
+|-----|------|-------------|---------------|-----------|
+| c2ae880e | 4×64 | **3.0%** (6W/194L) | 2.5% | 4.183 |
+| 83e2edea | 8×96 | 0.5% (1W/199L) | 1.25% | 4.187 |
+
+对比前两个 run（均为 0% WR），这是 v15 优化系列首次突破"零分"门槛。
+
+### 17.3 关键发现
+
+1. **训练密度 > 模型容量**（在当前阶段）：4×64 只用 2h、37.3 s/p 就获得了 3.0% WR；8×96 用 6h、16.4 s/p 只获得 0.5%
+2. **4×64 容量天花板已确认**：PL 在 ~4.16 plateau，37.3 s/p 后 slope ≈ 0
+3. **8×96 密度不足**：6h 后仅 16.4 s/p，PL 仍在缓慢下降但 WR 未随之提升
+4. **AvgLen 反直觉**：8×96 (PL 3.98) 平均对局 16.6 手，比 4×64 (PL 4.16) 的 21.7 手 **短 5 手**——PL 低不等于下棋强
+5. **WR 出现是随机的**：在 PL 3.87-4.32 范围内，WR 与 PL 无强相关，更依赖 C-L1 的随机采样机会
+
+### 17.4 v15 全版本演进回顾
+
+| 版本 | 修复内容 | 验证结果 |
+|------|---------|---------|
+| v15.1 | 发现 ALL prior WR 无效（Python minimax ≠ C minimax） | 建立真实基准线 |
+| v15.2 | hotfix: 诊断 prepare.py shadowing → eval 213s 未改善 | 问题未解决 |
+| v15.3 | sys.path 根治 → eval 213s → **2.0s** | ✅ 性能修复 |
+| v15.4 | framework/prepare.py 重命名 + mx.compile() + play.py 修复 | ✅ 架构清理 |
+| v15.5 | 440f81ae (spc=30) → 0% WR → 诊断 spc 瓶颈 | SPC 不足 |
+| v15.5 | c4b44746 (spc=200, 8×128) → 0% WR → 诊断模型过大 | 密度不足 |
+| v15.6 | c2ae880e (4×64, 2h) → **3.0% WR** ✅ | 首次非零 WR |
+| v15.6 | 83e2edea (8×96, 6h) → 0.5% WR | 验证密度假说 |
+
+### 17.5 核心矛盾：容量-密度两难
+
+v15 到目前为止暴露了一个核心两难困境：
+
+```
+小模型 (4×64, 416K)
+  ✅ 训练密度高: 18.6 s/p/h
+  ✅ WR 更高: 3.0%
+  ❌ PL plateau 于 4.16: 容量天花板
+  
+大模型 (8×96, 1.45M)
+  ✅ PL 更低: 3.98 (且仍在下降)
+  ❌ 训练密度低: 2.7 s/p/h
+  ❌ WR 更低: 0.5%
+  ❌ 对局更短: 输得更快
+```
+
+**解决方向**：需要找到 **容量刚好够** 且 **密度足够高** 的中间模型。
+
+### 17.6 推荐训练路径
+
+#### 路径 A：Sub-1M 快速验证（推荐优先执行）
+
+**模型: 6×64 (564,467 参数)**
+
+选择理由：
+- 比 4×64 多 **36%** 参数（2 层额外 residual block）
+- 预估 cycle 速度 ~25s (M4 Pro) / ~50s (M3 Max)
+- 4h 训练可达 **50.9 s/p**（4×64 plateau 时仅 37.3）
+- 若 PL 能突破 3.8，则确认容量足够
+
+```bash
+# 路径 A: M4 Pro 4h 训练 (6×64)
+PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
+  --eval-level 1 \
+  --mcts-sims 400 \
+  --parallel-games 16 \
+  --num-blocks 6 \
+  --num-filters 64 \
+  --eval-interval 5 \
+  --probe-games 80 \
+  --steps-per-cycle 200 \
+  --target-win-rate 0.55 \
+  --time-budget 14400
+
+# 路径 A: M3 Max 4h 训练 (6×64)
+PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
+  --eval-level 1 \
+  --mcts-sims 400 \
+  --parallel-games 16 \
+  --num-blocks 6 \
+  --num-filters 64 \
+  --eval-interval 5 \
+  --probe-games 80 \
+  --steps-per-cycle 200 \
+  --target-win-rate 0.55 \
+  --time-budget 14400
+```
+
+**判定标准**：
+- 若 2h 内 PL < 4.0 且持续下降 → 继续到 4h
+- 若 2h 时 PL plateau 于 4.1+ → 6×64 容量仍不够，转路径 B
+- 若 4h 时 WR > 5% → 可以考虑延长到 8h
+
+#### 路径 B：1M+ 长线训练
+
+**模型: 6×96 (1,120,467 参数)**
+
+选择理由：
+- 比 8×96 少 **23%** 参数，但 cycle 速度快 ~20%
+- 预估 cycle ~34s (M4 Pro) / ~68s (M3 Max)
+- 8h 训练可达 **34.7 s/p**（8×96 在 6h 仅 16.4）
+- 足够的容量应对 PL < 3.5 的需求
+
+```bash
+# 路径 B: M3 Max 8h 训练 (6×96)
+PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
+  --eval-level 1 \
+  --mcts-sims 400 \
+  --parallel-games 16 \
+  --num-blocks 6 \
+  --num-filters 96 \
+  --eval-interval 5 \
+  --probe-games 80 \
+  --steps-per-cycle 200 \
+  --target-win-rate 0.55 \
+  --time-budget 28800
+
+# 路径 B: M4 Pro 8h 训练 (6×96)
+PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
+  --eval-level 1 \
+  --mcts-sims 400 \
+  --parallel-games 16 \
+  --num-blocks 6 \
+  --num-filters 96 \
+  --eval-interval 5 \
+  --probe-games 80 \
+  --steps-per-cycle 200 \
+  --target-win-rate 0.55 \
+  --time-budget 28800
+```
+
+**判定标准**：
+- 若 4h 时 PL < 3.5 → 良好趋势，等待 8h 完成
+- 若 4h 时 PL 在 3.8-4.0 → 趋势类似 8×96，可能需要 12h+
+- 若 WR 达到 10%+ → 可考虑挑战 C-L2
+
+### 17.7 训练策略建议
+
+1. **优先执行路径 A**：4h 6×64 足以判断是否有容量提升
+2. **双机并行**：若两台都空闲，可同时跑 A (M4 Pro) 和 B (M3 Max)
+3. **关注 C200 时 PL**：这是判断模型容量是否足够的关键时点
+4. **200-game final eval**：训练结束时的 200-game 最终评估是最可靠的 WR 指标
+
+### 17.8 §17 一句话总结
+
+> **v15 双机实验（4×64/2h 和 8×96/6h）首次实现对 C-L1 的非零胜率（3.0% 和 0.5%），揭示了"容量-密度两难"：小模型 WR 高但 PL plateau，大模型 PL 低但 WR 更差且对局更短。下一步推荐 6×64 (564K) 4h 快速验证（路径 A）和 6×96 (1.12M) 8h 长线训练（路径 B），目标找到容量与密度的最优平衡点。**
