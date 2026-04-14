@@ -1069,3 +1069,73 @@ SDL_VIDEODRIVER=dummy PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
 ### 15.8 v15.4 一句话总结
 
 > **消除 `framework/prepare.py` 同名隐患（重命名为 `prepare_template.py`），修复 play.py/play_service.py sys.path，添加 `mx.compile()` 实现 MCTS NN 推理 22% 加速，增加启动日志验证。基础设施就绪，可开始 C-L1 课程训练。**
+
+---
+
+## §16 v15.5 — Run c4b44746 Inspection 与训练方案升级
+
+> 日期：2026-04-14
+> 触发：用户执行 spc=200 的 3 小时 C-L1 训练（run c4b44746），仍 0% WR，要求完整 inspection
+
+### 16.1 Inspection 结果摘要
+
+Run c4b44746 使用 `--steps-per-cycle 200`（§12 推荐的 P0 修复），结果：
+
+- **训练量验证**：14,689 步（vs 440f81ae 的 3,004），**4.9× 提升**，仅多 49% wall time
+- **Loss 显著下降**：PL 5.41→4.15（perplexity 223→63），VL 0.72→0.17
+- **战术能力突破**：水平 4 连封堵从 5.1% 提升到 **97.1%**
+- **但仍 0% WR**：对角线封堵仅 5.2%，模型在实战中被对角线威胁击杀
+
+### 16.2 瓶颈转移
+
+| 版本 | 瓶颈 | 根因 |
+|------|------|------|
+| §12 (spc=30) | 每 cycle 训练步数不足 | `steps_per_cycle=30` 太低 |
+| **§13 (spc=200)** | **模型太大，更新密度低** | **8×128 (2.49M) 需要太多梯度更新** |
+
+### 16.3 推荐训练命令
+
+**P0：4×64 小模型快速验证**（1 小时内应出首胜）：
+
+```bash
+PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
+    --eval-level 1 \
+    --mcts-sims 400 \
+    --parallel-games 16 \
+    --num-blocks 4 --num-filters 64 \
+    --eval-interval 5 \
+    --probe-games 32 \
+    --steps-per-cycle 200 \
+    --target-win-rate 0.55 \
+    --time-budget 3600
+```
+
+**预期**：~190 cycles/h, 69.6 更新/参数 @ 3h。如 1 小时内 WR > 0，说明训练管线无问题，瓶颈确认是模型大小。
+
+**P1：成功后切换 8×128 长时间训练**（8 小时）：
+
+```bash
+PYTHONUNBUFFERED=1 uv run python domains/gomoku/train.py \
+    --eval-level 1 \
+    --mcts-sims 400 \
+    --parallel-games 16 \
+    --num-blocks 8 --num-filters 128 \
+    --eval-interval 5 \
+    --probe-games 32 \
+    --steps-per-cycle 200 \
+    --target-win-rate 0.55 \
+    --time-budget 28800
+```
+
+### 16.4 详细分析
+
+完整技术分析已写入 `updates/v15-findings.md` §13，包含：
+- Loss 趋势（7 个阶段分析，确认未平台化）
+- 4 种战术场景的模型响应测试
+- 20 局实战复盘（含 move-by-move trace）
+- 时间分解（self-play 79.6%, training 20.4%）
+- 5 种训练方案的 3 小时投影对比
+
+### 16.5 v15.5 一句话总结
+
+> **Run c4b44746 确认 spc=200 有效（水平封堵 5%→97%），但 8×128 模型 3h 仅 1.51 更新/参数，不足以学会对角线战术。推荐切换 4×64 + 400 sims（同等时间 31.6× 训练密度），预计 1 小时内出首胜。**
