@@ -4,12 +4,34 @@
 """
 
 
+def _fit_series(values: list[float], width: int) -> list[float]:
+    """Return exactly width samples for stable chart boundaries."""
+    if not values or width <= 0:
+        return []
+
+    recent = list(values[-width:])
+    if len(recent) == width:
+        return recent
+    if len(recent) == 1:
+        return recent * width
+
+    last = len(recent) - 1
+    scaled: list[float] = []
+    for index in range(width):
+        pos = index * last / (width - 1)
+        lo = int(pos)
+        hi = min(lo + 1, last)
+        frac = pos - lo
+        scaled.append(recent[lo] * (1.0 - frac) + recent[hi] * frac)
+    return scaled
+
+
 def sparkline(values: list[float], width: int = 30) -> str:
     """单行火花图，用于紧凑展示趋势。"""
     if not values:
         return ""
     chars = "▁▂▃▄▅▆▇█"
-    recent = values[-width:]
+    recent = _fit_series(values, width)
     lo, hi = min(recent), max(recent)
     span = hi - lo if hi > lo else 1.0
     return "".join(chars[min(int((v - lo) / span * 7), 7)] for v in recent)
@@ -26,7 +48,7 @@ def sparkline2(values: list[float], width: int = 40) -> tuple[str, str]:
         return ("", "")
     lo_chars = " ▁▂▃▄▅▆▇"  # 0-7: 下半
     hi_chars = " ▁▂▃▄▅▆▇"  # 8-15: 上半
-    recent = values[-width:]
+    recent = _fit_series(values, width)
     lo, hi = min(recent), max(recent)
     span = hi - lo if hi > lo else 1.0
     upper = []
@@ -54,7 +76,7 @@ def sparkline3(values: list[float], width: int = 40) -> tuple[str, str, str]:
         return ("", "", "")
 
     chars = " ▁▂▃▄▅▆▇"
-    recent = values[-width:]
+    recent = _fit_series(values, width)
     lo, hi = min(recent), max(recent)
     span = hi - lo if hi > lo else 1.0
 
@@ -88,7 +110,7 @@ def sparkline4(values: list[float], width: int = 40) -> tuple[str, str, str, str
         return ("", "", "", "")
 
     chars = " ▁▂▃▄▅▆▇"
-    recent = values[-width:]
+    recent = _fit_series(values, width)
     lo, hi = min(recent), max(recent)
     span = hi - lo if hi > lo else 1.0
 

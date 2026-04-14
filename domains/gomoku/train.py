@@ -1408,145 +1408,203 @@ def train(args):
         return _progress_bar_fn(elapsed, budget, width)
 
     def _draw_panel():
-        """Render the full text TUI panel with fixed-width columns."""
-        W = 76  # inner width (~20% wider than before)
-        chip = hw_info.get("chip", "")
+        """Render the full text TUI panel with stable cell and chart alignment."""
+        W = 90  # inner width (+10 columns plus 2-char side gutters)
+        PAD = 2
+        CONTENT_W = W - PAD * 2
+        chip = hw_info.get("chip", "") or "unknown"
         elapsed = _time.time() - start_time
         gps = total_games / elapsed if elapsed > 0 else 0.0
+        elapsed_m, elapsed_s = divmod(int(elapsed), 60)
 
         def row(text: str) -> str:
-            """Pad or truncate text to exactly W chars inside box borders."""
-            return "│" + text[:W].ljust(W) + "│"
+            return "│" + (" " * PAD) + text[:CONTENT_W].ljust(CONTENT_W) + (" " * PAD) + "│"
+
+        def divider(char: str = "─") -> str:
+            return "├" + char * W + "┤"
+
+        def clip(text: object, width: int, align: str = "left") -> str:
+            width = max(0, width)
+            text_str = str(text)
+            if len(text_str) > width:
+                text_str = text_str[-width:] if align == "right" else text_str[:width]
+            if align == "right":
+                return text_str.rjust(width)
+            if align == "center":
+                return text_str.center(width)
+            return text_str.ljust(width)
+
+        def kv_cell(label: object, value: object, width: int) -> str:
+            label_text = str(label)
+            value_text = str(value)
+            if width <= 0:
+                return ""
+            if len(value_text) >= width:
+                return clip(value_text, width, align="right")
+            label_width = max(0, width - len(value_text) - 1)
+            return clip(label_text, label_width) + " " + value_text.rjust(width - label_width - 1)
+
+        def top_cell(label: object, value: object, width: int) -> str:
+            label_text = clip(label, min(6, max(0, width - 1)))
+            value_width = max(0, width - len(label_text) - 1)
+            return label_text + " " + clip(value, value_width)
+
+        def cell_row(cells: list[tuple[object, object] | str], sep: str = " │ ") -> str:
+            usable = CONTENT_W - len(sep) * max(0, len(cells) - 1)
+            base, extra = divmod(usable, max(1, len(cells)))
+            widths = [base + (1 if idx < extra else 0) for idx in range(len(cells))]
+            parts: list[str] = []
+            for idx, cell in enumerate(cells):
+                width = widths[idx]
+                if isinstance(cell, tuple):
+                    parts.append(kv_cell(cell[0], cell[1], width))
+                else:
+                    parts.append(clip(cell, width))
+            return row(sep.join(parts))
+
+        def lr_row(left: object, right: object) -> str:
+            left_text = str(left)
+            right_text = str(right)
+            if len(right_text) >= CONTENT_W:
+                return row(clip(right_text, CONTENT_W, align="right"))
+            left_space = max(0, CONTENT_W - len(right_text) - 1)
+            left_text = clip(left_text, left_space)
+            gap = max(1, CONTENT_W - len(left_text) - len(right_text))
+            return row(left_text + " " * gap + right_text)
+
+        chart_label_w = 11
+        chart_value_w = 8
+        chart_gap = 3
+        chart_width = max(8, CONTENT_W - chart_label_w - chart_gap - chart_value_w)
+        top_left_w = 18
+        top_mid_w = 22
+        top_gap = "   "
+
+        def chart_row(label: object, plot: str, value: object = "") -> str:
+            left = clip(label, chart_label_w)
+            center = clip(plot, chart_width)
+            right = clip(value, chart_value_w, align="right")
+            return row(left + center + (" " * chart_gap) + right)
+
+        def chart_divider() -> str:
+            return chart_row("", "╌" * chart_width, "")
 
         lines = []
         lines.append("╭" + "─" * W + "╮")
-        prov = "[benchmark]" if is_benchmark else "[exploratory]"
-        resumed = " resumed" if resumed_from else ""
-        lines.append(row(f" Run: {run_id_short}   {chip}   {num_params/1000:.1f}K params   {prov}{resumed}"))
-        if time_budget is not None:
-            lines.append(row(" " + _progress_bar(elapsed, time_budget)))
-        else:
-            tgt = f"  Target: {target_win_rate:.0%} WR" if target_win_rate else ""
-            em, es = divmod(int(elapsed), 60)
-            lines.append(row(f" Elapsed: {em}:{es:02d}{tgt}"))
 
-        # --- Stats block (3 rows, fixed column widths) ---
-        # Col layout: "  {lbl} {val:>6}  │  {lbl} {val:>7}  │  {lbl} {val}"
-        lines.append("├" + "─" * W + "┤")
+        run_type = "benchmark" if is_benchmark else "exploratory"
+        resumed = f" resume:{resumed_from[:8]}" if resumed_from else ""
+        top_left = top_cell("Run", run_id_short, top_left_w)
+        top_mid = top_cell("Type", f"{run_type}{resumed}", top_mid_w)
+        lines.append(lr_row(top_left + top_gap + top_mid, f"Device {chip}"))
+        lines.append(row(top_cell("Model", f"{num_blocks}x{num_filters}", top_left_w) + top_gap + top_cell("Params", f"{num_params/1000:.1f}K", top_mid_w)))
+        if time_budget is not None:
+            lines.append(row(" " + _progress_bar(elapsed, time_budget, width=56)))
+        else:
+            target = f"Target WR {target_win_rate:.0%}" if target_win_rate else "Target WR —"
+            lines.append(lr_row(target, f"Elapsed {elapsed_m}:{elapsed_s:02d}"))
+
+        lines.append(divider())
         wr_str = f"{last_probe_wr:.0%}" if last_probe_wr is not None else "—"
         sm_wr = _smoothed_wr()
-        sm_str = f" avg:{sm_wr:.0%}" if sm_wr is not None and len(wr_history) > 1 else ""
+        sm_str = f"{wr_str} avg:{sm_wr:.0%}" if sm_wr is not None and len(wr_history) > 1 else wr_str
         opp_str = eval_opponent_alias if eval_opponent_alias else f"L{eval_level}"
         mix_str = f" mix:{train_opponent_alias}({opponent_mix:.0%})" if train_opponent_alias else ""
-        lines.append(row(f"  Cycle   {cycle:>6d}   │   Loss     {last_loss:>8.4f}   │   Games   {total_games:>7d}"))
-        lines.append(row(f"  Steps   {total_train_steps:>6d}   │   Buffer   {len(replay_buffer):>8d}   │   WR  {wr_str:>5}{sm_str}"))
-        lines.append(row(f"  Gm/s    {gps:>6.1f}   │   AvgLen   {avg_game_length:>8.1f}   │   vs {opp_str}{mix_str}"))
+        lines.append(cell_row([("Cycle", cycle), ("Loss", f"{last_loss:.4f}"), ("Games", total_games)]))
+        lines.append(cell_row([("Steps", total_train_steps), ("Buffer", len(replay_buffer)), ("WR", sm_str)]))
+        lines.append(cell_row([("Gm/s", f"{gps:.1f}"), ("AvgLen", f"{avg_game_length:.1f}"), ("vs", f"{opp_str}{mix_str}")]))
         if last_policy_loss is not None and last_value_loss is not None:
-            lines.append(row(
-                f"  P-Loss  {last_policy_loss:>6.3f}   │   V-Loss   {last_value_loss:>8.4f}   │   "
-                f"policy entropy gap: {max(0.0, last_policy_loss):.2f} nats"
-            ))
+            lines.append(cell_row([("P-Loss", f"{last_policy_loss:.3f}"), ("V-Loss", f"{last_value_loss:.4f}")]))
 
-        # --- v15.1 sync eval status row ---
-        # eval_status_str is set briefly to "running" inside _run_probe_eval()
-        # while the synchronous eval is in progress, then back to "idle".
-        # Most cycles will see "idle" because eval is fast.
         if eval_status_str == "running":
             elapsed_e = _time.time() - eval_submit_time
-            lines.append(row(
-                f"  Eval    ⋯ running (sync, {elapsed_e:>4.0f}s)                              "
-            ))
+            eval_state = f"run {elapsed_e:.0f}s"
         else:
-            lines.append(row(f"  Eval    ★ idle                                                       "))
+            eval_state = "idle"
 
-        # --- v15 E4: training health row ---
-        h_learning = "★"
+        h_learning = "ok"
         if len(policy_loss_history) >= 20:
             recent = policy_loss_history[-10:]
             older = policy_loss_history[-20:-10]
-            if sum(recent)/10 >= sum(older)/10 - 0.005:
-                h_learning = "⚠"
-        h_diverse = "★"
+            if sum(recent) / 10 >= sum(older) / 10 - 0.005:
+                h_learning = "warn"
+        h_diverse = "ok"
         if last_probe_wr is not None and last_value_loss is not None:
-            # Diversity proxy: probe was recently run and finished
             pass
-        h_value = "★" if (last_value_loss is None or 0.05 <= last_value_loss <= 0.6) else "⚠"
-        h_plateau = "⚠" if (len(wr_history) >= 5
-                              and max(wr_history[-5:]) - min(wr_history[-5:]) < 0.02
-                              and max(wr_history[-5:]) < 0.95) else "★"
-        h_collapse = "★"  # filled in by full-eval; default ★
-        lines.append(row(
-            f"  Health  learn:{h_learning}  diverse:{h_diverse}  plateau:{h_plateau}  "
-            f"value:{h_value}  collapse:{h_collapse}"
-        ))
+        h_value = "ok" if (last_value_loss is None or 0.05 <= last_value_loss <= 0.6) else "warn"
+        h_plateau = "warn" if (
+            len(wr_history) >= 5
+            and max(wr_history[-5:]) - min(wr_history[-5:]) < 0.02
+            and max(wr_history[-5:]) < 0.95
+        ) else "ok"
+        h_collapse = "ok"
 
-        # --- MCTS stats row (only when MCTS is active) ---
+        lines.append(divider())
+        lines.append(row(" Health"))
+        lines.append(cell_row([("Eval", eval_state), ("Learn", h_learning), ("Diverse", h_diverse)]))
+        lines.append(cell_row([("Plateau", h_plateau), ("Value", h_value), ("Collapse", h_collapse)]))
+
         if MCTS_SIMULATIONS > 0:
             sps = last_mcts_stats.get("sims_per_sec", 0) if last_mcts_stats else 0
             top1 = last_mcts_stats.get("avg_top1_share", 0) if last_mcts_stats else 0
             ent = last_mcts_stats.get("avg_entropy", 0) if last_mcts_stats else 0
             sp_t = last_mcts_stats.get("search_time_s", 0) if last_mcts_stats else 0
             lines.append("│" + "╌" * W + "│")
-            lines.append(row(f"  MCTS    {MCTS_SIMULATIONS:>4}sims   │   Sim/s   {sps:>8.0f}   │   SP time  {sp_t:>5.1f}s"))
-            lines.append(row(f"  Focus   {top1:>6.0%}   │   Entropy  {ent:>8.2f}   │   c_puct    {C_PUCT:>4.1f}"))
+            lines.append(cell_row([("MCTS", f"{MCTS_SIMULATIONS} sims"), ("Sim/s", f"{sps:.0f}"), ("SP time", f"{sp_t:.1f}s")]))
+            lines.append(cell_row([("Focus", f"{top1:.0%}"), ("Entropy", f"{ent:.2f}"), ("c_puct", f"{C_PUCT:.1f}")]))
 
-        # --- Charts block (WR + Loss, each 4-row height) ---
-        CW = 52  # chart width
         if wr_history or loss_history:
-            lines.append("├" + "─" * W + "┤")
+            lines.append(divider())
             if wr_history:
-                top, up, mid, lo = _sparkline4(wr_history, CW)
+                top, up, mid, lo = _sparkline4(wr_history, chart_width)
                 wr_last = wr_history[-1]
-                lines.append(row(f"  Win Rate   {' ' * (CW - len(top) + 2)}{top}   {wr_last:>4.0%}"))
-                lines.append(row(f"             {' ' * (CW - len(up) + 2)}{up}        "))
-                lines.append(row(f"             {' ' * (CW - len(mid) + 2)}{mid}        "))
-                lines.append(row(f"             {' ' * (CW - len(lo) + 2)}{lo}        "))
+                lines.append(chart_row("Win Rate", top, f"{wr_last:.0%}"))
+                lines.append(chart_row("", up))
+                lines.append(chart_row("", mid))
+                lines.append(chart_row("", lo))
             if wr_history and loss_history:
-                lines.append("│" + "╌" * W + "│")
+                lines.append(chart_divider())
             if loss_history:
-                top, up, mid, lo = _sparkline4(loss_history, CW)
-                lines.append(row(f"  Loss       {' ' * (CW - len(top) + 2)}{top}   {last_loss:>5.2f}"))
-                lines.append(row(f"             {' ' * (CW - len(up) + 2)}{up}        "))
-                lines.append(row(f"             {' ' * (CW - len(mid) + 2)}{mid}        "))
-                lines.append(row(f"             {' ' * (CW - len(lo) + 2)}{lo}        "))
+                top, up, mid, lo = _sparkline4(loss_history, chart_width)
+                lines.append(chart_row("Loss", top, f"{last_loss:.2f}"))
+                lines.append(chart_row("", up))
+                lines.append(chart_row("", mid))
+                lines.append(chart_row("", lo))
 
-        # --- MCTS quality block (entropy + sims/sec sparklines) ---
         if MCTS_SIMULATIONS > 0 and len(mcts_entropy_history) > 1:
-            lines.append("├" + "─" * W + "┤")
-            ent_up, ent_lo = _sparkline2(mcts_entropy_history, CW)
-            sps_up, sps_lo = _sparkline2(mcts_sims_per_sec_history, CW)
+            lines.append(divider())
+            ent_up, ent_lo = _sparkline2(mcts_entropy_history, chart_width)
+            sps_up, sps_lo = _sparkline2(mcts_sims_per_sec_history, chart_width)
             ent_last = mcts_entropy_history[-1] if mcts_entropy_history else 0
             sps_last = mcts_sims_per_sec_history[-1] if mcts_sims_per_sec_history else 0
-            lines.append(row(f"  Entropy    {' ' * (CW - len(ent_up) + 2)}{ent_up}   {ent_last:>5.2f}"))
-            lines.append(row(f"             {' ' * (CW - len(ent_lo) + 2)}{ent_lo}        "))
-            lines.append(row(f"  Sim/s      {' ' * (CW - len(sps_up) + 2)}{sps_up}   {sps_last:>5.0f}"))
-            lines.append(row(f"             {' ' * (CW - len(sps_lo) + 2)}{sps_lo}        "))
+            lines.append(chart_row("Entropy", ent_up, f"{ent_last:.2f}"))
+            lines.append(chart_row("", ent_lo))
+            lines.append(chart_divider())
+            lines.append(chart_row("Sim/s", sps_up, f"{sps_last:.0f}"))
+            lines.append(chart_row("", sps_lo))
 
-        # --- Signal-quality block ---
         if last_corrective_ratio is not None:
-            lines.append("├" + "─" * W + "┤")
+            lines.append(divider())
             corr_avg = _recent_avg(corrective_ratio_history)
             corr_avg_str = f"{corr_avg:.0%}" if corr_avg is not None and len(corrective_ratio_history) > 1 else "—"
-            len_avg = _recent_avg(len_priority_avg_history)
-            len_avg_val = f"x{len_avg:.2f}" if len_avg is not None and len(len_priority_avg_history) > 1 else "—"
             corr_str = f"{last_corrective_ratio:.0%}"
             boost_str = f"{last_len_boost_ratio:.0%}" if last_len_boost_ratio is not None else "—"
             damp_str = f"{last_len_damp_ratio:.0%}" if last_len_damp_ratio is not None else "—"
             lp_str = f"x{(last_len_priority_avg or 1.0):.2f}"
-            sig_up, sig_lo = _sparkline2(corrective_ratio_history, CW)
-            len_up, len_lo = _sparkline2(len_priority_avg_history, CW)
-            lines.append(row(f"  Signal  {corr_str:>6}   │   Avg      {corr_avg_str:>8}   │"))
-            lines.append(row(f"          {' ' * (CW - len(sig_up) + 2)}{sig_up}        "))
-            lines.append(row(f"          {' ' * (CW - len(sig_lo) + 2)}{sig_lo}        "))
-            lines.append(row(f"  Length  {lp_str:>6}   │   Boost    {boost_str:>8}   │   Damp    {damp_str:>6}"))
-            lines.append(row(f"          {' ' * (CW - len(len_up) + 2)}{len_up}        "))
-            lines.append(row(f"          {' ' * (CW - len(len_lo) + 2)}{len_lo}        "))
+            sig_up, sig_lo = _sparkline2(corrective_ratio_history, chart_width)
+            len_up, len_lo = _sparkline2(len_priority_avg_history, chart_width)
+            lines.append(cell_row([("Signal", corr_str), ("Avg", corr_avg_str)]))
+            lines.append(chart_row("", sig_up))
+            lines.append(chart_row("", sig_lo))
+            lines.append(chart_divider())
+            lines.append(cell_row([("Length", lp_str), ("Boost", boost_str), ("Damp", damp_str)]))
+            lines.append(chart_row("", len_up))
+            lines.append(chart_row("", len_lo))
 
-        # --- Events block ---
         if events:
-            lines.append("├" + "─" * W + "┤")
+            lines.append(divider())
             for e in events[-10:]:
-                lines.append(row(f"  {e}"))
+                lines.append(row(str(e)))
         lines.append("╰" + "─" * W + "╯")
         return "\n".join(lines)
 
