@@ -68,6 +68,8 @@ def parse_args():
                    help="跳过 tracker.db 中已存在的 tag+seed 配置")
     p.add_argument("--dry-run", action="store_true",
                    help="只打印矩阵，不实际运行")
+    p.add_argument("--no-auto-pareto", action="store_true",
+                   help="完成后不自动生成 Pareto 分析和图表")
 
     return p.parse_args()
 
@@ -266,6 +268,23 @@ def main():
                 print(f"  {tag}")
 
     print(f"\n查看结果: uv run python framework/analyze.py --matrix {args.tag}")
+
+    # v20: Auto-generate Pareto analysis + plot after sweep
+    if n_ok > 0 and not args.no_auto_pareto:
+        print(f"\n{'─'*60}")
+        print("自动 Pareto 分析...")
+        print(f"{'─'*60}\n")
+        pareto_plot_path = f"output/pareto_{args.tag}.png"
+        pareto_cmd = [
+            sys.executable, os.path.join(os.path.dirname(__file__), "analyze.py"),
+            "--pareto", "--sweep-tag", args.tag,
+            "--plot", "--output", pareto_plot_path,
+        ]
+        proc = subprocess.run(pareto_cmd, capture_output=False, text=True)
+        if proc.returncode == 0:
+            print(f"\n查看 Pareto 图: open {pareto_plot_path}")
+        else:
+            print(f"\n⚠  Pareto 分析执行失败 (退出码 {proc.returncode})")
 
 
 if __name__ == "__main__":

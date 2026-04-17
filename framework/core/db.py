@@ -278,6 +278,20 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE cycle_metrics ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    # v20: frontier_snapshots — Pareto frontier version history
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS frontier_snapshots (
+            id              TEXT PRIMARY KEY,
+            created_at      TEXT NOT NULL,
+            maximize_axes   TEXT NOT NULL,
+            minimize_axes   TEXT NOT NULL,
+            front_run_ids   TEXT NOT NULL,
+            dominated_count INTEGER NOT NULL,
+            total_runs      INTEGER NOT NULL,
+            eval_level      INTEGER,
+            sweep_tag       TEXT
+        )
+    """)
     conn.commit()
     return conn
 

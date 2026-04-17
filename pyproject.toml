@@ -5,6 +5,7 @@ description = "Gomoku AI trained via autoresearch loop on Apple Silicon (MLX)"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
+    "matplotlib>=3.8.0",
     "mlx>=0.22.0",
     "numpy>=1.26.0",
     "pygame>=2.5.0",

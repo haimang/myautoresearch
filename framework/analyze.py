@@ -571,86 +571,197 @@ def _pareto_front(points: list[dict], maximize: list[str],
     return front, dominated
 
 
-def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md") -> None:
+def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
+               maximize: list[str] | None = None,
+               minimize: list[str] | None = None,
+               eval_level: int | None = None,
+               sweep_tag: str | None = None,
+               plot: bool = False,
+               output_path: str | None = None) -> None:
     """对 completed runs 执行非支配排序，输出 Pareto 前沿。
 
     默认轴: maximize WR, minimize params 和 wall_time.
-    只分析 completed runs 且有 final_win_rate 的数据。
+    支持 --eval-level 和 --sweep-tag 过滤，确保同 benchmark 条件比较。
+    支持 --plot 生成 PNG 散点图。
     """
+    maximize = maximize or ["wr"]
+    minimize = minimize or ["params", "wall_s"]
+
+    # Build WHERE clause with optional filters
+    where_clauses = ["status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')",
+                     "final_win_rate IS NOT NULL"]
+    params_sql: list = []
+    if eval_level is not None:
+        where_clauses.append("eval_level = ?")
+        params_sql.append(eval_level)
+    if sweep_tag is not None:
+        where_clauses.append("sweep_tag LIKE ?")
+        params_sql.append(sweep_tag + "%")
+
+    where_str = " AND ".join(where_clauses)
     rows = conn.execute(
-        """SELECT id, num_res_blocks, num_filters, num_params,
-                  final_win_rate, wall_time_s, total_games, eval_level,
-                  eval_opponent, is_benchmark, learning_rate,
-                  train_steps_per_cycle, parallel_games
+        f"""SELECT id, num_res_blocks, num_filters, num_params,
+                  final_win_rate, wall_time_s, total_games, total_cycles,
+                  total_steps, eval_level, eval_opponent, is_benchmark,
+                  learning_rate, train_steps_per_cycle, parallel_games,
+                  sweep_tag
            FROM runs
-           WHERE status = 'completed' AND final_win_rate IS NOT NULL
-           ORDER BY final_win_rate DESC"""
+           WHERE {where_str}
+           ORDER BY final_win_rate DESC""",
+        params_sql
     ).fetchall()
 
     if not rows:
-        print("No completed runs with win-rate data.")
+        print("No completed runs with win-rate data matching filters.")
+        if eval_level is not None:
+            print(f"  (filter: eval_level={eval_level})")
+        if sweep_tag is not None:
+            print(f"  (filter: sweep_tag={sweep_tag}*)")
         return
+
+    # Auto eval_level grouping: warn if data crosses levels and no filter set
+    levels = set(r["eval_level"] for r in rows if r["eval_level"] is not None)
+    if len(levels) > 1 and eval_level is None:
+        from collections import Counter
+        level_counts = Counter(r["eval_level"] for r in rows if r["eval_level"] is not None)
+        most_common_level = level_counts.most_common(1)[0][0]
+        print(f"⚠  Data spans eval_levels {sorted(levels)}. "
+              f"Auto-selecting level {most_common_level} (most data: {level_counts[most_common_level]} runs).")
+        print(f"   Use --eval-level N to override.\n")
+        rows = [r for r in rows if r["eval_level"] == most_common_level]
+        eval_level = most_common_level
 
     points = []
     for r in rows:
+        wall_s = r["wall_time_s"]
+        games = r["total_games"]
+        throughput = (games / wall_s) if (games and wall_s and wall_s > 0) else None
         points.append({
             "run": r["id"][:8],
+            "run_full": r["id"],
             "arch": f"{r['num_res_blocks'] or '?'}x{r['num_filters'] or '?'}",
             "params": r["num_params"],
             "wr": r["final_win_rate"],
-            "wall_s": r["wall_time_s"],
-            "games": r["total_games"],
+            "wall_s": wall_s,
+            "games": games,
+            "cycles": r["total_cycles"],
+            "steps": r["total_steps"],
             "lr": r["learning_rate"],
+            "throughput": throughput,
             "eval_level": r["eval_level"],
             "eval_opponent": r["eval_opponent"],
             "is_benchmark": r["is_benchmark"],
+            "sweep_tag": r["sweep_tag"],
         })
 
-    front, dominated = _pareto_front(points, maximize=["wr"], minimize=["params", "wall_s"])
+    front, dominated = _pareto_front(points, maximize=maximize, minimize=minimize)
 
-    # Sort front by WR descending
-    front.sort(key=lambda p: -(p["wr"] or 0))
-    dominated.sort(key=lambda p: -(p["wr"] or 0))
+    # Sort front by first maximize axis descending
+    sort_key = maximize[0] if maximize else "wr"
+    front.sort(key=lambda p: -(p.get(sort_key) or 0))
+    dominated.sort(key=lambda p: -(p.get(sort_key) or 0))
+
+    # --- Save frontier snapshot ---
+    _save_frontier_snapshot(conn, front, dominated, maximize, minimize,
+                           eval_level, sweep_tag)
 
     if fmt == "json":
         import json as _j
         output = {
             "pareto_front": front,
             "dominated": dominated,
-            "axes": {"maximize": ["wr"], "minimize": ["params", "wall_s"]},
+            "axes": {"maximize": maximize, "minimize": minimize},
             "total_runs": len(points),
+            "eval_level": eval_level,
+            "sweep_tag": sweep_tag,
         }
         print(_j.dumps(output, indent=2, ensure_ascii=False))
-        return
-
-    # Markdown output
-    print(f"Pareto Front (maximize WR, minimize params + wall_time)")
-    print(f"{'─' * 80}")
-    print(f"  Total runs analyzed: {len(points)}")
-    print(f"  Front points: {len(front)}  |  Dominated: {len(dominated)}")
-    print()
-
-    print("  ★ PARETO FRONT:")
-    print(f"  {'Run':>10}  {'Arch':>8}  {'Params':>8}  {'WR':>7}  {'Wall':>7}  {'Games':>7}  {'Opp':>6}")
-    print(f"  {'─' * 68}")
-    for p in front:
-        opp = p["eval_opponent"] if p["eval_opponent"] else f"L{p['eval_level'] or 0}"
-        params = f"{p['params']/1000:.0f}K" if p["params"] else "?"
-        wall = f"{p['wall_s']:.0f}s" if p["wall_s"] else "?"
-        print(f"  {p['run']:>10}  {p['arch']:>8}  {params:>8}  {p['wr']:.1%}  {wall:>7}  {str(p['games'] or '-'):>7}  {opp:>6}")
-
-    if dominated:
+    else:
+        # Markdown text output (backward compatible)
+        max_str = ", ".join(maximize)
+        min_str = ", ".join(minimize)
+        print(f"Pareto Front (maximize {max_str}, minimize {min_str})")
+        print(f"{'─' * 80}")
+        filter_info = ""
+        if eval_level is not None:
+            filter_info += f"  eval_level={eval_level}"
+        if sweep_tag is not None:
+            filter_info += f"  sweep_tag={sweep_tag}*"
+        print(f"  Total runs analyzed: {len(points)}{filter_info}")
+        print(f"  Front points: {len(front)}  |  Dominated: {len(dominated)}")
         print()
-        print("  ○ DOMINATED:")
+
+        print("  ★ PARETO FRONT:")
         print(f"  {'Run':>10}  {'Arch':>8}  {'Params':>8}  {'WR':>7}  {'Wall':>7}  {'Games':>7}  {'Opp':>6}")
         print(f"  {'─' * 68}")
-        for p in dominated:
+        for p in front:
             opp = p["eval_opponent"] if p["eval_opponent"] else f"L{p['eval_level'] or 0}"
-            params = f"{p['params']/1000:.0f}K" if p["params"] else "?"
+            params_s = f"{p['params']/1000:.0f}K" if p["params"] else "?"
             wall = f"{p['wall_s']:.0f}s" if p["wall_s"] else "?"
-            print(f"  {p['run']:>10}  {p['arch']:>8}  {params:>8}  {p['wr']:.1%}  {wall:>7}  {str(p['games'] or '-'):>7}  {opp:>6}")
+            print(f"  {p['run']:>10}  {p['arch']:>8}  {params_s:>8}  {p['wr']:.1%}  {wall:>7}  {str(p['games'] or '-'):>7}  {opp:>6}")
 
-    print()
+        if dominated:
+            print()
+            print("  ○ DOMINATED:")
+            print(f"  {'Run':>10}  {'Arch':>8}  {'Params':>8}  {'WR':>7}  {'Wall':>7}  {'Games':>7}  {'Opp':>6}")
+            print(f"  {'─' * 68}")
+            for p in dominated:
+                opp = p["eval_opponent"] if p["eval_opponent"] else f"L{p['eval_level'] or 0}"
+                params_s = f"{p['params']/1000:.0f}K" if p["params"] else "?"
+                wall = f"{p['wall_s']:.0f}s" if p["wall_s"] else "?"
+                print(f"  {p['run']:>10}  {p['arch']:>8}  {params_s:>8}  {p['wr']:.1%}  {wall:>7}  {str(p['games'] or '-'):>7}  {opp:>6}")
+
+        print()
+
+    # --- Plot if requested ---
+    if plot:
+        from pareto_plot import plot_pareto
+        # Determine x/y axes for plot: y = first maximize, x = first minimize
+        y_axis = maximize[0] if maximize else "wr"
+        x_axis = minimize[0] if minimize else "params"
+        size_axis = minimize[1] if len(minimize) > 1 else None
+
+        if output_path is None:
+            output_path = "output/pareto_front.png"
+
+        path = plot_pareto(
+            front, dominated,
+            x_key=x_axis, y_key=y_axis,
+            size_key=size_axis,
+            output_path=output_path,
+            eval_level=eval_level,
+            sweep_tag=sweep_tag,
+        )
+        print(f"  📊 Plot saved: {path}")
+
+
+def _save_frontier_snapshot(conn: sqlite3.Connection,
+                            front: list[dict], dominated: list[dict],
+                            maximize: list[str], minimize: list[str],
+                            eval_level: int | None, sweep_tag: str | None) -> None:
+    """Persist a frontier snapshot to the frontier_snapshots table."""
+    import uuid
+    try:
+        conn.execute(
+            """INSERT INTO frontier_snapshots
+               (id, created_at, maximize_axes, minimize_axes, front_run_ids,
+                dominated_count, total_runs, eval_level, sweep_tag)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                datetime.now(timezone.utc).isoformat(),
+                _json.dumps(maximize),
+                _json.dumps(minimize),
+                _json.dumps([p.get("run_full", p.get("run", "")) for p in front]),
+                len(dominated),
+                len(front) + len(dominated),
+                eval_level,
+                sweep_tag,
+            )
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # table not yet migrated
 
 
 # ---------------------------------------------------------------------------
@@ -1381,6 +1492,20 @@ def main():
     parser.add_argument("--recent", type=int, default=5,
                         help="Number of recent runs in report (default: 5)")
 
+    # v20: Pareto configuration
+    parser.add_argument("--plot", action="store_true",
+                        help="Generate PNG scatter plot (used with --pareto)")
+    parser.add_argument("--maximize", type=str, default=None,
+                        help="Comma-separated axes to maximize (default: wr)")
+    parser.add_argument("--minimize", type=str, default=None,
+                        help="Comma-separated axes to minimize (default: params,wall_s)")
+    parser.add_argument("--eval-level", type=int, default=None,
+                        help="Filter runs by eval_level for Pareto analysis")
+    parser.add_argument("--sweep-tag", type=str, default=None,
+                        help="Filter runs by sweep_tag prefix for Pareto analysis")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output path for plot PNG (default: output/pareto_front.png)")
+
     args = parser.parse_args()
     conn = _connect(args.db)
 
@@ -1403,7 +1528,12 @@ def main():
     elif args.stagnation:
         cmd_stagnation(conn, args.stagnation)
     elif args.pareto:
-        cmd_pareto(conn, fmt=args.format)
+        max_axes = args.maximize.split(",") if args.maximize else None
+        min_axes = args.minimize.split(",") if args.minimize else None
+        cmd_pareto(conn, fmt=args.format,
+                   maximize=max_axes, minimize=min_axes,
+                   eval_level=args.eval_level, sweep_tag=args.sweep_tag,
+                   plot=args.plot, output_path=args.output)
     elif args.compare_by_steps:
         cmd_compare_by_steps(conn, args.compare_by_steps[0], args.compare_by_steps[1])
     elif args.promotion_chain:
