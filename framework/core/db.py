@@ -8,10 +8,12 @@ recordings（对局记录）、opponents（注册对手）。
 所有路径以项目根目录为基准存储（如 "output/<uuid>/checkpoints/xxx.safetensors"）。
 """
 
+import json as _json
 import os
 import platform
 import sqlite3
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -292,6 +294,54 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             sweep_tag       TEXT
         )
     """)
+    for col, typ in [("campaign_id", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE frontier_snapshots ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+    # v20.1: campaign + search-space governance
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS search_spaces (
+            id            TEXT PRIMARY KEY,
+            created_at    TEXT NOT NULL,
+            domain        TEXT NOT NULL,
+            name          TEXT NOT NULL,
+            version       TEXT NOT NULL,
+            profile_json  TEXT NOT NULL,
+            profile_hash  TEXT NOT NULL UNIQUE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id              TEXT PRIMARY KEY,
+            created_at      TEXT NOT NULL,
+            name            TEXT NOT NULL UNIQUE,
+            domain          TEXT NOT NULL,
+            train_script    TEXT NOT NULL,
+            search_space_id TEXT NOT NULL REFERENCES search_spaces(id),
+            protocol_json   TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'active',
+            notes           TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS campaign_runs (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id       TEXT NOT NULL REFERENCES campaigns(id),
+            run_id            TEXT NOT NULL REFERENCES runs(id),
+            stage             TEXT,
+            sweep_tag         TEXT,
+            seed              INTEGER,
+            axis_values_json  TEXT NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'linked',
+            created_at        TEXT NOT NULL,
+            UNIQUE(campaign_id, run_id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_campaign_runs_campaign "
+                 "ON campaign_runs(campaign_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_campaign_runs_run "
+                 "ON campaign_runs(run_id)")
     conn.commit()
     return conn
 
@@ -449,6 +499,142 @@ def finish_run(conn: sqlite3.Connection, run_id: str, summary: dict) -> None:
         ),
     )
     conn.commit()
+
+
+def _stable_json(value: object) -> str:
+    return _json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def save_search_space(conn: sqlite3.Connection, profile: dict) -> str:
+    """Persist a normalized search-space profile; return its id."""
+    profile_json = _stable_json(profile)
+    profile_hash = profile.get("profile_hash")
+    if not profile_hash:
+        raise ValueError("profile missing profile_hash")
+
+    row = conn.execute(
+        "SELECT id FROM search_spaces WHERE profile_hash = ?",
+        (profile_hash,),
+    ).fetchone()
+    if row:
+        return row["id"]
+
+    space_id = str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO search_spaces
+           (id, created_at, domain, name, version, profile_json, profile_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            space_id,
+            datetime.now(timezone.utc).isoformat(),
+            profile["domain"],
+            profile["name"],
+            profile["version"],
+            profile_json,
+            profile_hash,
+        ),
+    )
+    conn.commit()
+    return space_id
+
+
+def get_campaign(conn: sqlite3.Connection, campaign: str) -> Optional[sqlite3.Row]:
+    """Resolve a campaign by exact id or exact name."""
+    row = conn.execute(
+        "SELECT * FROM campaigns WHERE id = ? OR name = ? ORDER BY created_at DESC LIMIT 1",
+        (campaign, campaign),
+    ).fetchone()
+    return row
+
+
+def get_or_create_campaign(conn: sqlite3.Connection, *,
+                           name: str,
+                           domain: str,
+                           train_script: str,
+                           search_space_id: str,
+                           protocol: dict,
+                           notes: Optional[str] = None) -> dict:
+    """Create a campaign if missing, otherwise verify compatibility."""
+    protocol_json = _stable_json(protocol)
+    row = get_campaign(conn, name)
+    if row:
+        mismatches = []
+        if row["domain"] != domain:
+            mismatches.append(f"domain={row['domain']} != {domain}")
+        if row["train_script"] != train_script:
+            mismatches.append(f"train_script={row['train_script']} != {train_script}")
+        if row["search_space_id"] != search_space_id:
+            mismatches.append("search_space profile differs")
+        if row["protocol_json"] != protocol_json:
+            mismatches.append("protocol differs")
+        if mismatches:
+            raise ValueError(
+                f"campaign '{name}' already exists with incompatible config: " + "; ".join(mismatches)
+            )
+        return dict(row)
+
+    campaign_id = str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO campaigns
+           (id, created_at, name, domain, train_script, search_space_id,
+            protocol_json, status, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+        (
+            campaign_id,
+            datetime.now(timezone.utc).isoformat(),
+            name,
+            domain,
+            train_script,
+            search_space_id,
+            protocol_json,
+            notes,
+        ),
+    )
+    conn.commit()
+    row = get_campaign(conn, campaign_id)
+    return dict(row)
+
+
+def link_run_to_campaign(conn: sqlite3.Connection, *,
+                         campaign_id: str,
+                         run_id: str,
+                         stage: Optional[str],
+                         sweep_tag: Optional[str],
+                         seed: Optional[int],
+                         axis_values: dict,
+                         status: str = "linked") -> None:
+    """Attach a run to a campaign with structured axis metadata."""
+    conn.execute(
+        """INSERT INTO campaign_runs
+           (campaign_id, run_id, stage, sweep_tag, seed, axis_values_json, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(campaign_id, run_id) DO UPDATE SET
+               stage = excluded.stage,
+               sweep_tag = excluded.sweep_tag,
+               seed = excluded.seed,
+               axis_values_json = excluded.axis_values_json,
+               status = excluded.status""",
+        (
+            campaign_id,
+            run_id,
+            stage,
+            sweep_tag,
+            seed,
+            _stable_json(axis_values),
+            status,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def find_run_by_sweep_tag(conn: sqlite3.Connection, sweep_tag: str) -> Optional[str]:
+    """Return the most recent run id for an exact sweep tag."""
+    row = conn.execute(
+        "SELECT id FROM runs WHERE sweep_tag = ? ORDER BY started_at DESC LIMIT 1",
+        (sweep_tag,),
+    ).fetchone()
+    return row["id"] if row else None
 
 
 # ---------------------------------------------------------------------------

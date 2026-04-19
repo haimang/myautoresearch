@@ -20,7 +20,7 @@ import sys
 import os
 from datetime import datetime, timezone
 
-from core.db import DB_PATH, init_db
+from core.db import DB_PATH, get_campaign, init_db
 
 
 def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -29,6 +29,44 @@ def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
         print(f"Error: database not found at {db_path}")
         sys.exit(1)
     return init_db(db_path)
+
+
+def _resolve_campaign_or_exit(conn: sqlite3.Connection, campaign: str) -> dict:
+    row = get_campaign(conn, campaign)
+    if not row:
+        print(f"Campaign not found: {campaign}")
+        sys.exit(1)
+    data = dict(row)
+    data["protocol"] = _json.loads(data["protocol_json"])
+    return data
+
+
+def _campaign_run_rows(conn: sqlite3.Connection, campaign_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT r.*, cr.stage, cr.axis_values_json
+           FROM campaign_runs cr
+           JOIN runs r ON r.id = cr.run_id
+           WHERE cr.campaign_id = ?
+           ORDER BY r.started_at""",
+        (campaign_id,),
+    ).fetchall()
+
+
+def _campaign_drift(rows: list[sqlite3.Row], protocol: dict) -> list[dict]:
+    drift = []
+    for row in rows:
+        reasons = []
+        if protocol.get("eval_level") != row["eval_level"]:
+            reasons.append(f"eval_level={row['eval_level']} != {protocol.get('eval_level')}")
+        if protocol.get("eval_opponent") != row["eval_opponent"]:
+            reasons.append(f"eval_opponent={row['eval_opponent']!r} != {protocol.get('eval_opponent')!r}")
+        if bool(protocol.get("is_benchmark", False)) != bool(row["is_benchmark"]):
+            reasons.append(
+                f"is_benchmark={bool(row['is_benchmark'])} != {bool(protocol.get('is_benchmark', False))}"
+            )
+        if reasons:
+            drift.append({"run_id": row["id"], "reasons": reasons})
+    return drift
 
 
 def _col(text: str, width: int) -> str:
@@ -234,16 +272,95 @@ def cmd_opponents(conn: sqlite3.Connection) -> None:
               f"{wr:>6}  {dt:>12}  {desc}")
 
 
-def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
-    """按标签前缀分组展示 sweep 结果。"""
-
+def cmd_list_campaigns(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT id, status, sweep_tag, total_cycles, total_games, "
-        "final_loss, final_win_rate, wall_time_s, num_params, "
-        "learning_rate, train_steps_per_cycle, num_res_blocks, num_filters, "
-        "replay_buffer_size, seed "
-        "FROM runs WHERE sweep_tag IS NOT NULL ORDER BY started_at"
+        """SELECT c.id, c.name, c.domain, c.status, c.created_at, COUNT(cr.run_id) AS run_count
+           FROM campaigns c
+           LEFT JOIN campaign_runs cr ON cr.campaign_id = c.id
+           GROUP BY c.id
+           ORDER BY c.created_at DESC"""
     ).fetchall()
+    if not rows:
+        print("No campaigns found.")
+        return
+    print(f"{'Campaign':>18}  {'ID':>8}  {'Domain':>8}  {'Status':>10}  {'Runs':>4}  {'Date':>12}")
+    print("-" * 74)
+    for row in rows:
+        print(f"{row['name']:>18}  {row['id'][:8]:>8}  {row['domain']:>8}  "
+              f"{row['status']:>10}  {row['run_count']:>4}  {(row['created_at'] or '')[:10]:>12}")
+
+
+def cmd_campaign_summary(conn: sqlite3.Connection, campaign: str) -> None:
+    c = _resolve_campaign_or_exit(conn, campaign)
+    search_space = conn.execute(
+        "SELECT * FROM search_spaces WHERE id = ?",
+        (c["search_space_id"],),
+    ).fetchone()
+    rows = _campaign_run_rows(conn, c["id"])
+    status_counts: dict[str, int] = {}
+    axis_coverage: dict[str, set] = {}
+    for row in rows:
+        status = row["status"] or "?"
+        status_counts[status] = status_counts.get(status, 0) + 1
+        axis_values = _json.loads(row["axis_values_json"])
+        for key, value in axis_values.items():
+            axis_coverage.setdefault(key, set()).add(str(value))
+    drift = _campaign_drift(rows, c["protocol"])
+    frontier_count_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM frontier_snapshots WHERE campaign_id = ?",
+        (c["id"],),
+    ).fetchone()
+
+    print(f"Campaign Summary: {c['name']} ({c['id'][:8]})")
+    print("=" * 72)
+    print(f"  Domain:        {c['domain']}")
+    print(f"  Train script:  {c['train_script']}")
+    print(f"  Status:        {c['status']}")
+    print(f"  Created:       {(c['created_at'] or '')[:19]}")
+    print(f"  Search space:  {search_space['name']} v{search_space['version']} ({search_space['profile_hash'][:12]})")
+    print(f"  Protocol:      {c['protocol']}")
+    print(f"  Runs:          {len(rows)}")
+    print(f"  Frontier snapshots: {frontier_count_row['n']}")
+    print()
+    print("Status counts:")
+    for key in sorted(status_counts):
+        print(f"  - {key}: {status_counts[key]}")
+    print()
+    print("Axis coverage:")
+    for key in sorted(axis_coverage):
+        values = ", ".join(sorted(axis_coverage[key], key=lambda v: (len(v), v)))
+        print(f"  - {key}: {values}")
+    print()
+    if drift:
+        print(f"Protocol drift: {len(drift)} run(s)")
+        for item in drift[:8]:
+            print(f"  - {item['run_id'][:8]}: {'; '.join(item['reasons'])}")
+    else:
+        print("Protocol drift: none")
+    print()
+
+
+def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str, campaign: str | None = None,
+               allow_drift: bool = False) -> None:
+    """按标签前缀分组展示 sweep 结果。"""
+    filter_info = tag_prefix
+    if campaign:
+        c = _resolve_campaign_or_exit(conn, campaign)
+        rows = _campaign_run_rows(conn, c["id"])
+        drift = _campaign_drift(rows, c["protocol"])
+        if drift and not allow_drift:
+            print(f"Campaign '{c['name']}' has {len(drift)} drift run(s); refusing matrix output.")
+            print("Use --allow-drift to override.")
+            return
+        filter_info = f"{tag_prefix} (campaign={c['name']})"
+    else:
+        rows = conn.execute(
+            "SELECT id, status, sweep_tag, total_cycles, total_games, "
+            "final_loss, final_win_rate, wall_time_s, num_params, "
+            "learning_rate, train_steps_per_cycle, num_res_blocks, num_filters, "
+            "replay_buffer_size, seed "
+            "FROM runs WHERE sweep_tag IS NOT NULL ORDER BY started_at"
+        ).fetchall()
 
     # 过滤匹配 sweep_tag 前缀的运行
     groups: dict[str, list[dict]] = {}
@@ -268,11 +385,11 @@ def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str) -> None:
         groups.setdefault(base_tag, []).append(entry)
 
     if not groups:
-        print(f"No runs found with sweep_tag prefix '{tag_prefix}'")
+        print(f"No runs found with sweep_tag prefix '{filter_info}'")
         return
 
     # 从超参中提取变化轴
-    print(f"Sweep Matrix: {tag_prefix}  ({sum(len(v) for v in groups.values())} runs in {len(groups)} configs)")
+    print(f"Sweep Matrix: {filter_info}  ({sum(len(v) for v in groups.values())} runs in {len(groups)} configs)")
     print("=" * 95)
     print(f"  {'Config':<35} {'Seeds':>5}  {'WR Mean':>7}  {'WR Std':>6}  "
           f"{'Loss':>7}  {'Games/s':>7}  {'Params':>8}")
@@ -575,7 +692,9 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
                maximize: list[str] | None = None,
                minimize: list[str] | None = None,
                eval_level: int | None = None,
-               sweep_tag: str | None = None,
+                sweep_tag: str | None = None,
+               campaign: str | None = None,
+               allow_drift: bool = False,
                plot: bool = False,
                output_path: str | None = None) -> None:
     """对 completed runs 执行非支配排序，输出 Pareto 前沿。
@@ -587,10 +706,43 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
     maximize = maximize or ["wr"]
     minimize = minimize or ["params", "wall_s"]
 
+    campaign_row = None
+    campaign_id = None
+    select_sql = """SELECT id, num_res_blocks, num_filters, num_params,
+                           final_win_rate, wall_time_s, total_games, total_cycles,
+                           total_steps, eval_level, eval_opponent, is_benchmark,
+                           learning_rate, train_steps_per_cycle, parallel_games,
+                           sweep_tag
+                    FROM runs"""
+
+    status_col = "status"
+    wr_col = "final_win_rate"
+
     # Build WHERE clause with optional filters
-    where_clauses = ["status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')",
-                     "final_win_rate IS NOT NULL"]
+    where_clauses = [f"{status_col} IN ('completed', 'time_budget', 'target_win_rate', 'target_games')",
+                     f"{wr_col} IS NOT NULL"]
     params_sql: list = []
+    if campaign is not None:
+        campaign_row = _resolve_campaign_or_exit(conn, campaign)
+        campaign_id = campaign_row["id"]
+        drift = _campaign_drift(_campaign_run_rows(conn, campaign_id), campaign_row["protocol"])
+        if drift and not allow_drift:
+            print(f"Campaign '{campaign_row['name']}' has {len(drift)} drift run(s); refusing Pareto output.")
+            print("Use --allow-drift to override.")
+            return
+        select_sql = """SELECT r.id, r.num_res_blocks, r.num_filters, r.num_params,
+                               r.final_win_rate, r.wall_time_s, r.total_games, r.total_cycles,
+                               r.total_steps, r.eval_level, r.eval_opponent, r.is_benchmark,
+                                r.learning_rate, r.train_steps_per_cycle, r.parallel_games,
+                                r.sweep_tag
+                         FROM runs r
+                         JOIN campaign_runs cr ON cr.run_id = r.id"""
+        status_col = "r.status"
+        wr_col = "r.final_win_rate"
+        where_clauses = [f"{status_col} IN ('completed', 'time_budget', 'target_win_rate', 'target_games')",
+                         f"{wr_col} IS NOT NULL"]
+        where_clauses.append("cr.campaign_id = ?")
+        params_sql.append(campaign_id)
     if eval_level is not None:
         where_clauses.append("eval_level = ?")
         params_sql.append(eval_level)
@@ -600,12 +752,7 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
 
     where_str = " AND ".join(where_clauses)
     rows = conn.execute(
-        f"""SELECT id, num_res_blocks, num_filters, num_params,
-                  final_win_rate, wall_time_s, total_games, total_cycles,
-                  total_steps, eval_level, eval_opponent, is_benchmark,
-                  learning_rate, train_steps_per_cycle, parallel_games,
-                  sweep_tag
-           FROM runs
+        f"""{select_sql}
            WHERE {where_str}
            ORDER BY final_win_rate DESC""",
         params_sql
@@ -617,6 +764,8 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
             print(f"  (filter: eval_level={eval_level})")
         if sweep_tag is not None:
             print(f"  (filter: sweep_tag={sweep_tag}*)")
+        if campaign_row is not None:
+            print(f"  (filter: campaign={campaign_row['name']})")
         return
 
     # Auto eval_level grouping: warn if data crosses levels and no filter set
@@ -663,7 +812,7 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
 
     # --- Save frontier snapshot ---
     _save_frontier_snapshot(conn, front, dominated, maximize, minimize,
-                           eval_level, sweep_tag)
+                           eval_level, sweep_tag, campaign_id)
 
     if fmt == "json":
         import json as _j
@@ -674,6 +823,7 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
             "total_runs": len(points),
             "eval_level": eval_level,
             "sweep_tag": sweep_tag,
+            "campaign": campaign_row["name"] if campaign_row is not None else None,
         }
         print(_j.dumps(output, indent=2, ensure_ascii=False))
     else:
@@ -687,6 +837,8 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
             filter_info += f"  eval_level={eval_level}"
         if sweep_tag is not None:
             filter_info += f"  sweep_tag={sweep_tag}*"
+        if campaign_row is not None:
+            filter_info += f"  campaign={campaign_row['name']}"
         print(f"  Total runs analyzed: {len(points)}{filter_info}")
         print(f"  Front points: {len(front)}  |  Dominated: {len(dominated)}")
         print()
@@ -738,15 +890,16 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
 def _save_frontier_snapshot(conn: sqlite3.Connection,
                             front: list[dict], dominated: list[dict],
                             maximize: list[str], minimize: list[str],
-                            eval_level: int | None, sweep_tag: str | None) -> None:
+                            eval_level: int | None, sweep_tag: str | None,
+                            campaign_id: str | None = None) -> None:
     """Persist a frontier snapshot to the frontier_snapshots table."""
     import uuid
     try:
         conn.execute(
             """INSERT INTO frontier_snapshots
                (id, created_at, maximize_axes, minimize_axes, front_run_ids,
-                dominated_count, total_runs, eval_level, sweep_tag)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                dominated_count, total_runs, eval_level, sweep_tag, campaign_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 str(uuid.uuid4()),
                 datetime.now(timezone.utc).isoformat(),
@@ -757,6 +910,7 @@ def _save_frontier_snapshot(conn: sqlite3.Connection,
                 len(front) + len(dominated),
                 eval_level,
                 sweep_tag,
+                campaign_id,
             )
         )
         conn.commit()
@@ -1474,6 +1628,10 @@ def main():
                        help="Training stability report for a run")
     group.add_argument("--matrix", metavar="TAG_PREFIX",
                        help="Sweep matrix results grouped by tag prefix")
+    group.add_argument("--list-campaigns", action="store_true",
+                       help="List campaign ledgers")
+    group.add_argument("--campaign-summary", metavar="CAMPAIGN",
+                       help="Show one campaign summary")
     group.add_argument("--stagnation", metavar="RUN_ID",
                        help="Detect training stagnation (WR plateau) for a run")
     group.add_argument("--pareto", action="store_true",
@@ -1503,6 +1661,10 @@ def main():
                         help="Filter runs by eval_level for Pareto analysis")
     parser.add_argument("--sweep-tag", type=str, default=None,
                         help="Filter runs by sweep_tag prefix for Pareto analysis")
+    parser.add_argument("--campaign", type=str, default=None,
+                        help="Filter Pareto/matrix to a specific campaign")
+    parser.add_argument("--allow-drift", action="store_true",
+                        help="Allow protocol-drift runs inside campaign-scoped analyses")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path for plot PNG (default: output/pareto_front.png)")
 
@@ -1524,7 +1686,11 @@ def main():
     elif args.stability:
         cmd_stability(conn, args.stability)
     elif args.matrix:
-        cmd_matrix(conn, args.matrix)
+        cmd_matrix(conn, args.matrix, campaign=args.campaign, allow_drift=args.allow_drift)
+    elif args.list_campaigns:
+        cmd_list_campaigns(conn)
+    elif args.campaign_summary:
+        cmd_campaign_summary(conn, args.campaign_summary)
     elif args.stagnation:
         cmd_stagnation(conn, args.stagnation)
     elif args.pareto:
@@ -1533,6 +1699,7 @@ def main():
         cmd_pareto(conn, fmt=args.format,
                    maximize=max_axes, minimize=min_axes,
                    eval_level=args.eval_level, sweep_tag=args.sweep_tag,
+                   campaign=args.campaign, allow_drift=args.allow_drift,
                    plot=args.plot, output_path=args.output)
     elif args.compare_by_steps:
         cmd_compare_by_steps(conn, args.compare_by_steps[0], args.compare_by_steps[1])

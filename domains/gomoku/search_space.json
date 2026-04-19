@@ -1,0 +1,61 @@
+{
+  "domain": "gomoku",
+  "name": "cold-start-core",
+  "version": "1.0",
+  "description": "Cold-start architecture and training sweep space for early Gomoku campaigns.",
+  "protocol": {
+    "eval_level": 0,
+    "eval_opponent": null,
+    "is_benchmark": true
+  },
+  "axes": {
+    "num_blocks": {
+      "type": "int",
+      "values": [4, 6, 8],
+      "scale": "linear",
+      "role": "structure",
+      "allow_continuation": false,
+      "description": "Residual block depth."
+    },
+    "num_filters": {
+      "type": "int",
+      "values": [32, 64, 128],
+      "scale": "linear",
+      "role": "structure",
+      "allow_continuation": false,
+      "description": "Channel width."
+    },
+    "learning_rate": {
+      "type": "float",
+      "values": [0.0003, 0.0005, 0.0007],
+      "scale": "log",
+      "role": "training",
+      "allow_continuation": true,
+      "description": "Optimizer learning rate."
+    },
+    "steps_per_cycle": {
+      "type": "int",
+      "values": [20, 30, 40, 50],
+      "scale": "linear",
+      "role": "training",
+      "allow_continuation": false,
+      "description": "SGD/Adam steps per cycle."
+    },
+    "buffer_size": {
+      "type": "int",
+      "values": [50000, 100000, 150000],
+      "scale": "linear",
+      "role": "training",
+      "allow_continuation": false,
+      "description": "Replay buffer size."
+    },
+    "seed": {
+      "type": "int",
+      "values": [42, 137],
+      "scale": "linear",
+      "role": "training",
+      "allow_continuation": false,
+      "description": "Random seed for replication."
+    }
+  }
+}

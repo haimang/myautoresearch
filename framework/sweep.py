@@ -1,23 +1,7 @@
 #!/usr/bin/env python3
-"""autoresearch 超参数扫描工具 — 批量实验。
+"""autoresearch 超参数扫描工具 — 批量实验。"""
 
-顺序执行一组训练配置的笛卡尔积，每次运行带唯一标签，
-便于用 `analyze.py --matrix` 进行对比。
-
-用法:
-    # 单轴扫描（其他轴使用默认值）
-    uv run python framework/sweep.py --train-script domains/gomoku/train.py \
-        --num-filters 32,48,64 --time-budget 120 --seeds 42,137
-
-    # 全矩阵（所有轴的笛卡尔积）
-    uv run python framework/sweep.py --train-script domains/gomoku/train.py \
-        --num-blocks 6,8 --num-filters 32,64 \
-        --learning-rate 3e-4,5e-4 \
-        --seeds 42,137 --time-budget 120 --tag v9-screen
-
-    # 恢复中断的扫描（跳过已完成的 tag+seed 组合）
-    uv run python framework/sweep.py --train-script domains/gomoku/train.py ... --resume
-"""
+from __future__ import annotations
 
 import argparse
 import itertools
@@ -28,11 +12,22 @@ import subprocess
 import sys
 import time
 
-from core.db import DB_PATH
+from core.db import (
+    DB_PATH,
+    find_run_by_sweep_tag,
+    get_campaign,
+    get_or_create_campaign,
+    init_db,
+    link_run_to_campaign,
+    save_search_space,
+)
+from search_space import describe_profile, load_profile, validate_selected_axes
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="autoresearch 超参数扫描工具")
+    p.add_argument("--db", type=str, default=DB_PATH,
+                   help="tracker.db 路径（默认: output/tracker.db）")
 
     # 训练脚本路径 — 领域无关
     p.add_argument("--train-script", type=str, required=True,
@@ -56,16 +51,21 @@ def parse_args():
     p.add_argument("--seeds", type=str, default="42",
                    help="逗号分隔的随机种子 (默认: 42)")
     p.add_argument("--tag", type=str, default="sweep",
-                   help="运行分组的标签前缀 (默认: sweep)")
+                   help="运行分组的标签前缀（默认: sweep；若传 --campaign 且未改 tag，则自动取 campaign 名）")
+    p.add_argument("--campaign", type=str, default=None,
+                   help="本轮研究的 campaign 名称")
+    p.add_argument("--search-space", type=str, default=None,
+                   help="JSON search-space profile 路径（v20.1）")
 
     # 额外固定参数，透传至 train.py
+    p.add_argument("--eval-level", type=int, default=None)
     p.add_argument("--eval-opponent", type=str, default=None)
     p.add_argument("--parallel-games", type=int, default=None)
     p.add_argument("--target-win-rate", type=float, default=None)
 
     # 控制
     p.add_argument("--resume", action="store_true",
-                   help="跳过 tracker.db 中已存在的 tag+seed 配置")
+                   help="跳过 tracker.db 中已存在的已完成配置")
     p.add_argument("--dry-run", action="store_true",
                    help="只打印矩阵，不实际运行")
     p.add_argument("--no-auto-pareto", action="store_true",
@@ -75,20 +75,41 @@ def parse_args():
 
 
 def parse_csv(val, dtype):
-    """解析逗号分隔字符串为指定类型的值列表。"""
     if val is None:
         return [None]
     return [dtype(v.strip()) for v in val.split(",")]
 
 
-def get_completed_tags(db_path):
-    """获取 tracker.db 中已完成的 sweep_tag 集合。"""
+def get_completed_tags(db_path: str) -> set[str]:
     if not os.path.exists(db_path):
         return set()
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT sweep_tag FROM runs WHERE status IN ('completed', 'time_budget', 'target_win_rate', 'target_games') AND sweep_tag IS NOT NULL"
+            "SELECT sweep_tag FROM runs "
+            "WHERE status IN ('completed', 'time_budget', 'target_win_rate', 'target_games') "
+            "AND sweep_tag IS NOT NULL"
+        ).fetchall()
+        return {r[0] for r in rows}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
+
+
+def get_completed_campaign_tags(db_path: str, campaign_id: str) -> set[str]:
+    if not os.path.exists(db_path):
+        return set()
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT cr.sweep_tag
+               FROM campaign_runs cr
+               JOIN runs r ON r.id = cr.run_id
+               WHERE cr.campaign_id = ?
+                 AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')
+                 AND cr.sweep_tag IS NOT NULL""",
+            (campaign_id,),
         ).fetchall()
         return {r[0] for r in rows}
     except sqlite3.OperationalError:
@@ -99,8 +120,6 @@ def get_completed_tags(db_path):
 
 def build_matrix(args):
     """从扫描轴生成配置字典列表。"""
-    axes = {}
-
     blocks = parse_csv(args.num_blocks, int)
     filters_ = parse_csv(args.num_filters, int)
     lrs = parse_csv(args.learning_rate, float)
@@ -108,7 +127,6 @@ def build_matrix(args):
     bufs = parse_csv(args.buffer_size, int)
     seeds = parse_csv(args.seeds, int)
 
-    # 只包含显式指定的轴
     axis_names = []
     axis_values = []
 
@@ -136,19 +154,66 @@ def build_matrix(args):
     for combo in itertools.product(*axis_values):
         cfg = dict(zip(axis_names, combo))
         for seed in seeds:
-            # 生成描述性标签
             parts = [args.tag]
             for name, val in cfg.items():
-                short = {"num_blocks": "b", "num_filters": "f",
-                         "learning_rate": "lr", "steps_per_cycle": "s",
-                         "buffer_size": "buf"}[name]
+                short = {
+                    "num_blocks": "b",
+                    "num_filters": "f",
+                    "learning_rate": "lr",
+                    "steps_per_cycle": "s",
+                    "buffer_size": "buf",
+                }[name]
                 parts.append(f"{short}{val}")
             parts.append(f"sd{seed}")
             tag = "_".join(parts)
-
             configs.append({**cfg, "seed": seed, "sweep_tag": tag})
-
     return configs
+
+
+def _derive_protocol(args, profile: dict | None) -> dict:
+    profile_protocol = (profile or {}).get("protocol", {})
+    eval_level = args.eval_level if args.eval_level is not None else profile_protocol.get("eval_level")
+    eval_opponent = args.eval_opponent if args.eval_opponent is not None else profile_protocol.get("eval_opponent")
+    is_benchmark = bool(profile_protocol.get("is_benchmark", False))
+    if args.eval_opponent is None and eval_opponent is not None:
+        # profile-defined NN opponent keeps exploratory semantics
+        is_benchmark = False
+    if eval_opponent is None and eval_level is not None:
+        is_benchmark = True
+    return {
+        "eval_level": eval_level,
+        "eval_opponent": eval_opponent,
+        "is_benchmark": is_benchmark,
+        "train_script": args.train_script,
+    }
+
+
+def _ensure_profile_protocol(profile: dict, protocol: dict) -> None:
+    expected = profile["protocol"]
+    mismatches = []
+    for key in ("eval_level", "eval_opponent", "is_benchmark"):
+        if expected.get(key) != protocol.get(key):
+            mismatches.append(f"{key}={protocol.get(key)!r} != profile {expected.get(key)!r}")
+    if mismatches:
+        raise ValueError("protocol does not match search-space profile: " + "; ".join(mismatches))
+
+
+def _ensure_campaign(conn, args, profile: dict | None, protocol: dict):
+    if not args.campaign:
+        return None, None
+    if profile is None:
+        raise ValueError("--campaign requires --search-space")
+
+    search_space_id = save_search_space(conn, profile)
+    campaign = get_or_create_campaign(
+        conn,
+        name=args.campaign,
+        domain=profile["domain"],
+        train_script=args.train_script,
+        search_space_id=search_space_id,
+        protocol=protocol,
+    )
+    return campaign, search_space_id
 
 
 def run_one(cfg, args, idx, total):
@@ -161,7 +226,6 @@ def run_one(cfg, args, idx, total):
            "--seed", str(seed),
            "--sweep-tag", tag]
 
-    # 扫描轴参数
     if "num_blocks" in cfg and cfg["num_blocks"] is not None:
         cmd += ["--num-blocks", str(cfg["num_blocks"])]
     if "num_filters" in cfg and cfg["num_filters"] is not None:
@@ -173,7 +237,8 @@ def run_one(cfg, args, idx, total):
     if "buffer_size" in cfg and cfg["buffer_size"] is not None:
         cmd += ["--buffer-size", str(cfg["buffer_size"])]
 
-    # 固定透传参数
+    if args.eval_level is not None:
+        cmd += ["--eval-level", str(args.eval_level)]
     if args.eval_opponent:
         cmd += ["--eval-opponent", args.eval_opponent]
     if args.parallel_games:
@@ -181,9 +246,7 @@ def run_one(cfg, args, idx, total):
     if args.target_win_rate:
         cmd += ["--target-win-rate", str(args.target_win_rate)]
 
-    # 运行头部信息
-    axis_desc = "  ".join(f"{k}={v}" for k, v in cfg.items()
-                          if k not in ("seed", "sweep_tag"))
+    axis_desc = "  ".join(f"{k}={v}" for k, v in cfg.items() if k not in ("seed", "sweep_tag"))
     print(f"\n{'='*60}")
     print(f"[{idx}/{total}] {tag}")
     print(f"  {axis_desc}  seed={seed}")
@@ -197,13 +260,11 @@ def run_one(cfg, args, idx, total):
     if proc.returncode != 0:
         print(f"  失败 (退出码 {proc.returncode})")
         if proc.stderr:
-            # 显示 stderr 最后几行
             lines = proc.stderr.strip().split("\n")
             for line in lines[-5:]:
                 print(f"  {line}")
         return tag, False, elapsed
 
-    # 从 stdout 提取最终胜率
     wr_line = ""
     for line in proc.stdout.splitlines():
         if "Win rate:" in line or "win_rate" in line.lower():
@@ -215,13 +276,57 @@ def run_one(cfg, args, idx, total):
     return tag, True, elapsed
 
 
+def _print_matrix_preview(configs, profile: dict | None, args, protocol: dict):
+    if profile is not None:
+        print(describe_profile(profile))
+        print()
+    if args.campaign:
+        print(f"Campaign: {args.campaign}")
+        print(f"Protocol: {json.dumps(protocol, ensure_ascii=False, sort_keys=True)}")
+        print()
+    print(f"{'Tag':<55} {'Params'}")
+    print("-" * 96)
+    for c in configs:
+        axis_desc = "  ".join(f"{k}={v}" for k, v in c.items() if k not in ("seed", "sweep_tag"))
+        print(f"{c['sweep_tag']:<55} {axis_desc}")
+
+
 def main():
     args = parse_args()
-    configs = build_matrix(args)
 
-    # 恢复: 跳过已完成的标签
+    if args.campaign and args.tag == "sweep":
+        args.tag = args.campaign
+
+    try:
+        profile = load_profile(args.search_space) if args.search_space else None
+        configs = build_matrix(args)
+
+        selected_axes = {}
+        for key in ("num_blocks", "num_filters", "learning_rate", "steps_per_cycle", "buffer_size"):
+            raw = getattr(args, key)
+            if raw is not None:
+                dtype = float if key == "learning_rate" else int
+                selected_axes[key] = parse_csv(raw, dtype)
+        if profile is not None:
+            validate_selected_axes(profile, selected_axes)
+
+        protocol = _derive_protocol(args, profile)
+        if profile is not None:
+            _ensure_profile_protocol(profile, protocol)
+
+        db_conn = init_db(args.db)
+        campaign = None
+        if args.campaign:
+            campaign, _ = _ensure_campaign(db_conn, args, profile, protocol)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
     if args.resume:
-        completed = get_completed_tags(DB_PATH)
+        if campaign:
+            completed = get_completed_campaign_tags(args.db, campaign["id"])
+        else:
+            completed = get_completed_tags(args.db)
         before = len(configs)
         configs = [c for c in configs if c["sweep_tag"] not in completed]
         skipped = before - len(configs)
@@ -235,24 +340,33 @@ def main():
 
     print(f"扫描: {total} 个配置 × {args.time_budget}s = ~{total * args.time_budget / 60:.0f} 分钟")
     print(f"标签前缀: {args.tag}")
+    if campaign:
+        print(f"Campaign: {campaign['name']} ({campaign['id'][:8]})")
 
     if args.dry_run:
-        print(f"\n{'Tag':<55} {'Params'}")
-        print("-" * 80)
-        for c in configs:
-            axis_desc = "  ".join(f"{k}={v}" for k, v in c.items()
-                                  if k not in ("seed", "sweep_tag"))
-            print(f"{c['sweep_tag']:<55} {axis_desc}")
+        _print_matrix_preview(configs, profile, args, protocol)
         return
 
     results = []
     sweep_start = time.time()
-
     for i, cfg in enumerate(configs, 1):
         tag, ok, elapsed = run_one(cfg, args, i, total)
         results.append((tag, ok, elapsed))
+        if campaign:
+            run_id = find_run_by_sweep_tag(db_conn, tag)
+            if run_id:
+                axis_values = {k: v for k, v in cfg.items() if k not in ("seed", "sweep_tag")}
+                link_run_to_campaign(
+                    db_conn,
+                    campaign_id=campaign["id"],
+                    run_id=run_id,
+                    stage=None,
+                    sweep_tag=tag,
+                    seed=cfg["seed"],
+                    axis_values=axis_values,
+                    status="linked" if ok else "failed",
+                )
 
-    # 汇总
     sweep_elapsed = time.time() - sweep_start
     n_ok = sum(1 for _, ok, _ in results if ok)
     n_fail = total - n_ok
@@ -268,23 +382,31 @@ def main():
                 print(f"  {tag}")
 
     print(f"\n查看结果: uv run python framework/analyze.py --matrix {args.tag}")
+    if campaign:
+        print(f"Campaign 汇总: uv run python framework/analyze.py --campaign-summary {campaign['name']}")
 
-    # v20: Auto-generate Pareto analysis + plot after sweep
     if n_ok > 0 and not args.no_auto_pareto:
         print(f"\n{'─'*60}")
         print("自动 Pareto 分析...")
         print(f"{'─'*60}\n")
-        pareto_plot_path = f"output/pareto_{args.tag}.png"
+        plot_key = campaign["name"] if campaign else args.tag
+        pareto_plot_path = f"output/pareto_{plot_key}.png"
         pareto_cmd = [
             sys.executable, os.path.join(os.path.dirname(__file__), "analyze.py"),
-            "--pareto", "--sweep-tag", args.tag,
-            "--plot", "--output", pareto_plot_path,
+            "--pareto", "--plot", "--output", pareto_plot_path,
+            "--db", args.db,
         ]
+        if campaign:
+            pareto_cmd += ["--campaign", campaign["name"]]
+        else:
+            pareto_cmd += ["--sweep-tag", args.tag]
         proc = subprocess.run(pareto_cmd, capture_output=False, text=True)
         if proc.returncode == 0:
             print(f"\n查看 Pareto 图: open {pareto_plot_path}")
         else:
             print(f"\n⚠  Pareto 分析执行失败 (退出码 {proc.returncode})")
+
+    db_conn.close()
 
 
 if __name__ == "__main__":
