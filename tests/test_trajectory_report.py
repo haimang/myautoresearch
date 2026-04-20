@@ -129,6 +129,73 @@ class TestTrajectoryReport(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)  # analyze prints friendly msg, doesn't crash
         self.assertIn("not found", proc.stdout.lower())
 
+    def test_branch_tree_shows_multiple_children(self):
+        """Branch tree correctly groups multiple children under one parent."""
+        # Add a second child branch
+        conn = init_db(self.db_path)
+        create_run(conn, "child-run-2", {"sweep_tag": "child2", "eval_level": 0}, is_benchmark=True)
+        finish_run(conn, "child-run-2", {
+            "status": "completed", "final_win_rate": 0.90,
+            "wall_time_s": 130.0, "num_params": 100000, "total_games": 650,
+        })
+        save_run_branch(
+            conn,
+            branch_id="br-traj-2",
+            campaign_id=self.campaign["id"],
+            parent_run_id="parent-run",
+            parent_checkpoint_id=None,
+            from_stage="D",
+            branch_reason="mcts_upshift",
+            branch_params_json='{"mcts_simulations": 600}',
+            delta_json='{"mcts_simulations": 600}',
+            status="completed",
+            result_summary_json='{"elapsed_s": 130}',
+        )
+        conn.execute(
+            "UPDATE run_branches SET child_run_id = ? WHERE id = ?",
+            ("child-run-2", "br-traj-2"),
+        )
+        conn.commit()
+        conn.close()
+        proc = self._run(str(ANALYZE), "--db", self.db_path, "--branch-tree", "traj-test")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("mcts_upshift", proc.stdout)
+        self.assertIn("child2", proc.stdout)
+        self.assertIn("90.0%", proc.stdout)
+
+    def test_trajectory_report_best_child_highlighted(self):
+        """Trajectory report should show the best child among siblings."""
+        conn = init_db(self.db_path)
+        create_run(conn, "child-run-2", {"sweep_tag": "child2", "eval_level": 0}, is_benchmark=True)
+        finish_run(conn, "child-run-2", {
+            "status": "completed", "final_win_rate": 0.90,
+            "wall_time_s": 130.0, "num_params": 100000, "total_games": 650,
+        })
+        save_run_branch(
+            conn,
+            branch_id="br-traj-2",
+            campaign_id=self.campaign["id"],
+            parent_run_id="parent-run",
+            parent_checkpoint_id=None,
+            from_stage="D",
+            branch_reason="mcts_upshift",
+            branch_params_json='{"mcts_simulations": 600}',
+            delta_json='{"mcts_simulations": 600}',
+            status="completed",
+            result_summary_json='{"elapsed_s": 130}',
+        )
+        conn.execute(
+            "UPDATE run_branches SET child_run_id = ? WHERE id = ?",
+            ("child-run-2", "br-traj-2"),
+        )
+        conn.commit()
+        conn.close()
+        proc = self._run(str(ANALYZE), "--db", self.db_path, "--trajectory-report", "traj-test")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("mcts_upshift", proc.stdout)
+        # Should show ΔWR for both children
+        self.assertIn("ΔWR", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
