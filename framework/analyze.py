@@ -423,6 +423,146 @@ def cmd_promotion_log(conn: sqlite3.Connection, campaign: str) -> None:
     print()
 
 
+def cmd_branch_tree(conn: sqlite3.Connection, campaign: str) -> None:
+    """Show parent/child branch tree for a campaign."""
+    c = _resolve_campaign_or_exit(conn, campaign)
+    rows = conn.execute(
+        """SELECT rb.id, rb.parent_run_id, rb.child_run_id,
+                  rb.branch_reason, rb.delta_json, rb.status,
+                  p.sweep_tag AS parent_tag, p.final_win_rate AS parent_wr,
+                  c.sweep_tag AS child_tag, c.final_win_rate AS child_wr
+           FROM run_branches rb
+           LEFT JOIN runs p ON p.id = rb.parent_run_id
+           LEFT JOIN runs c ON c.id = rb.child_run_id
+           WHERE rb.campaign_id = ?
+           ORDER BY rb.created_at""",
+        (c["id"],),
+    ).fetchall()
+
+    print(f"Branch Tree: {c['name']} ({c['id'][:8]})")
+    print("=" * 72)
+    if not rows:
+        print("  (No branches recorded.)")
+        return
+
+    # Group by parent
+    from collections import defaultdict
+    parent_groups = defaultdict(list)
+    for row in rows:
+        parent_groups[row["parent_run_id"]].append(row)
+
+    for parent_id, branches in parent_groups.items():
+        parent_tag = branches[0]["parent_tag"] or parent_id[:8]
+        parent_wr = branches[0]["parent_wr"]
+        wr_str = f"{parent_wr:.1%}" if parent_wr is not None else "?"
+        print(f"\n  Parent: {parent_tag}  WR={wr_str}")
+        print(f"  {'Branch':>8}  {'Reason':>18}  {'Status':>10}  {'Child':>20}  {'WR':>7}")
+        print(f"  {'─' * 68}")
+        for b in branches:
+            child_wr = b["child_wr"]
+            cwr_str = f"{child_wr:.1%}" if child_wr is not None else "?"
+            child_tag = b["child_tag"] or "(not yet linked)"
+            print(
+                f"  {b['id'][:8]:>8}  "
+                f"{b['branch_reason']:>18}  "
+                f"{b['status']:>10}  "
+                f"{child_tag[:20]:>20}  "
+                f"{cwr_str:>7}"
+            )
+    print()
+
+
+def cmd_trajectory_report(conn: sqlite3.Connection, campaign: str) -> None:
+    """Show trajectory report: reason / delta / result for all branches."""
+    c = _resolve_campaign_or_exit(conn, campaign)
+    rows = conn.execute(
+        """SELECT rb.*,
+                  p.sweep_tag AS parent_tag, p.final_win_rate AS parent_wr, p.wall_time_s AS parent_wall,
+                  c.sweep_tag AS child_tag, c.final_win_rate AS child_wr, c.wall_time_s AS child_wall,
+                  c.num_params AS child_params
+           FROM run_branches rb
+           LEFT JOIN runs p ON p.id = rb.parent_run_id
+           LEFT JOIN runs c ON c.id = rb.child_run_id
+           WHERE rb.campaign_id = ?
+           ORDER BY rb.created_at""",
+        (c["id"],),
+    ).fetchall()
+
+    print(f"Trajectory Report: {c['name']} ({c['id'][:8]})")
+    print("=" * 72)
+    if not rows:
+        print("  (No branches recorded.)")
+        return
+
+    for row in rows:
+        delta = _json.loads(row["delta_json"] or "{}")
+        delta_str = ", ".join(f"{k}={v}" for k, v in delta.items()) if delta else "(no change)"
+        parent_wr = row["parent_wr"]
+        child_wr = row["child_wr"]
+        improvement = ""
+        if parent_wr is not None and child_wr is not None:
+            diff = child_wr - parent_wr
+            icon = "📈" if diff > 0 else ("📉" if diff < 0 else "➡")
+            improvement = f"  {icon} ΔWR={diff:+.1%}"
+
+        parent_wr_str = f"{parent_wr:.1%}" if parent_wr is not None else "?"
+        child_wr_str = f"{child_wr:.1%}" if child_wr is not None else "?"
+        print(f"\n  Branch {row['id'][:8]} | {row['branch_reason']} | {row['status']}")
+        print(f"    Parent: {row['parent_tag'] or row['parent_run_id'][:8]}  WR={parent_wr_str}")
+        print(f"    Child:  {row['child_tag'] or '(pending)'}  WR={child_wr_str}{improvement}")
+        print(f"    Delta:  {delta_str}")
+    print()
+
+
+def cmd_compare_parent_child(conn: sqlite3.Connection, branch_id: str) -> None:
+    """Compare parent and child for a specific branch."""
+    row = conn.execute(
+        """SELECT rb.*,
+                  p.sweep_tag AS parent_tag, p.final_win_rate AS parent_wr,
+                  p.wall_time_s AS parent_wall, p.num_params AS parent_params,
+                  p.total_games AS parent_games,
+                  c.sweep_tag AS child_tag, c.final_win_rate AS child_wr,
+                  c.wall_time_s AS child_wall, c.num_params AS child_params,
+                  c.total_games AS child_games
+           FROM run_branches rb
+           LEFT JOIN runs p ON p.id = rb.parent_run_id
+           LEFT JOIN runs c ON c.id = rb.child_run_id
+           WHERE rb.id = ?""",
+        (branch_id,),
+    ).fetchone()
+
+    if not row:
+        print(f"Branch not found: {branch_id}")
+        return
+
+    delta = _json.loads(row["delta_json"] or "{}")
+
+    print(f"Parent-Child Compare: Branch {branch_id[:8]}")
+    print("=" * 72)
+    print(f"  Reason: {row['branch_reason']}")
+    print(f"  Delta:  {_json.dumps(delta, ensure_ascii=False)}")
+    print()
+    print(f"  {'Metric':>14}  {'Parent':>14}  {'Child':>14}  {'Δ':>10}")
+    print(f"  {'─' * 56}")
+
+    metrics = [
+        ("WR", row["parent_wr"], row["child_wr"], lambda x: f"{x:.1%}" if x is not None else "?"),
+        ("Wall(s)", row["parent_wall"], row["child_wall"], lambda x: f"{x:.0f}" if x is not None else "?"),
+        ("Params", row["parent_params"], row["child_params"], lambda x: f"{x/1e3:.0f}K" if x else "?"),
+        ("Games", row["parent_games"], row["child_games"], lambda x: f"{x}" if x is not None else "?"),
+    ]
+    for name, pval, cval, fmt in metrics:
+        pstr = fmt(pval)
+        cstr = fmt(cval)
+        if pval is not None and cval is not None:
+            diff = cval - pval
+            dstr = f"{diff:+.1%}" if name == "WR" else f"{diff:+.0f}"
+        else:
+            dstr = "?"
+        print(f"  {name:>14}  {pstr:>14}  {cstr:>14}  {dstr:>10}")
+    print()
+
+
 def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str, campaign: str | None = None,
                allow_drift: bool = False) -> None:
     """按标签前缀分组展示 sweep 结果。"""
@@ -1743,6 +1883,12 @@ def main():
                        help="Per-opening WR breakdown for a run's checkpoints")
     group.add_argument("--report", action="store_true",
                        help="Generate structured experiment report for agent/human")
+    group.add_argument("--branch-tree", metavar="CAMPAIGN",
+                       help="Show parent/child branch tree for a campaign (v20.3)")
+    group.add_argument("--trajectory-report", metavar="CAMPAIGN",
+                       help="Show trajectory report for a campaign (v20.3)")
+    group.add_argument("--compare-parent-child", metavar="BRANCH_ID",
+                       help="Compare parent and child for a branch (v20.3)")
 
     parser.add_argument("--format", choices=["md", "json"], default="md",
                         help="Report format: md (Chinese markdown) or json (structured)")
@@ -1815,6 +1961,12 @@ def main():
         cmd_opening_breakdown(conn, args.opening_breakdown)
     elif args.report:
         cmd_report(conn, n_recent=args.recent, fmt=args.format)
+    elif args.branch_tree:
+        cmd_branch_tree(conn, args.branch_tree)
+    elif args.trajectory_report:
+        cmd_trajectory_report(conn, args.trajectory_report)
+    elif args.compare_parent_child:
+        cmd_compare_parent_child(conn, args.compare_parent_child)
 
     conn.close()
 
