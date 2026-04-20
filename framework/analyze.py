@@ -15,9 +15,10 @@
 import argparse
 import json as _json
 import math
+import os
 import sqlite3
 import sys
-import os
+import uuid
 from datetime import datetime, timezone
 
 from core.db import DB_PATH, get_campaign, init_db
@@ -56,13 +57,13 @@ def _campaign_drift(rows: list[sqlite3.Row], protocol: dict) -> list[dict]:
     drift = []
     for row in rows:
         reasons = []
-        if protocol.get("eval_level") != row["eval_level"]:
-            reasons.append(f"eval_level={row['eval_level']} != {protocol.get('eval_level')}")
-        if protocol.get("eval_opponent") != row["eval_opponent"]:
-            reasons.append(f"eval_opponent={row['eval_opponent']!r} != {protocol.get('eval_opponent')!r}")
-        if bool(protocol.get("is_benchmark", False)) != bool(row["is_benchmark"]):
+        if "eval_level" in protocol and protocol["eval_level"] != row["eval_level"]:
+            reasons.append(f"eval_level={row['eval_level']} != {protocol['eval_level']}")
+        if "eval_opponent" in protocol and protocol["eval_opponent"] != row["eval_opponent"]:
+            reasons.append(f"eval_opponent={row['eval_opponent']!r} != {protocol['eval_opponent']!r}")
+        if "is_benchmark" in protocol and bool(protocol["is_benchmark"]) != bool(row["is_benchmark"]):
             reasons.append(
-                f"is_benchmark={bool(row['is_benchmark'])} != {bool(protocol.get('is_benchmark', False))}"
+                f"is_benchmark={bool(row['is_benchmark'])} != {bool(protocol['is_benchmark'])}"
             )
         if reasons:
             drift.append({"run_id": row["id"], "reasons": reasons})
@@ -561,6 +562,238 @@ def cmd_compare_parent_child(conn: sqlite3.Connection, branch_id: str) -> None:
             dstr = "?"
         print(f"  {name:>14}  {pstr:>14}  {cstr:>14}  {dstr:>10}")
     print()
+
+
+# ---------------------------------------------------------------------------
+# v21: Surrogate-Guided Selector
+# ---------------------------------------------------------------------------
+
+def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
+                       selector_policy: str | None = None,
+                       candidate_type: str | None = None,
+                       limit: int = 5,
+                       fmt: str = "md") -> None:
+    """Generate and display recommendations for a campaign."""
+    from selector_policy import load_selector_policy, policy_hash
+    from selector import recommend_for_campaign, build_recommendation_id
+    from core.db import (
+        get_campaign,
+        save_recommendation_batch,
+        save_recommendation,
+        get_latest_recommendation_batch,
+    )
+
+    c = get_campaign(conn, campaign)
+    if not c:
+        print(f"Campaign not found: {campaign}")
+        return
+
+    # Load selector policy
+    if selector_policy:
+        policy = load_selector_policy(selector_policy)
+    else:
+        # Default: look for domain selector policy
+        default_path = f"domains/{c['domain']}/selector_policy.json"
+        if os.path.isfile(default_path):
+            policy = load_selector_policy(default_path)
+        else:
+            print(f"No selector policy found for domain '{c['domain']}'")
+            return
+
+    # Verify domain match
+    if policy["domain"] != c["domain"]:
+        print(f"Error: policy domain '{policy['domain']}' != campaign domain '{c['domain']}'")
+        return
+
+    # Protocol drift guard: check campaign runs against protocol
+    drift_rows = conn.execute(
+        """SELECT r.id, r.eval_level, r.is_benchmark, r.eval_opponent
+           FROM campaign_runs cr
+           JOIN runs r ON r.id = cr.run_id
+           WHERE cr.campaign_id = ? AND r.status IN ('completed','time_budget','target_win_rate','target_games')""",
+        (c["id"],),
+    ).fetchall()
+    campaign_protocol = {}
+    if c and c["protocol_json"]:
+        try:
+            campaign_protocol = _json.loads(c["protocol_json"])
+        except Exception:
+            campaign_protocol = {}
+    drift = _campaign_drift(drift_rows, campaign_protocol)
+    if drift:
+        print(f"Error: protocol drift detected in {len(drift)} run(s). Cannot recommend until resolved.")
+        for d in drift[:3]:
+            print(f"  Run {d['run_id']}: {', '.join(d['reasons'])}")
+        return
+
+    recommendations = recommend_for_campaign(conn, c, policy,
+                                              candidate_type=candidate_type,
+                                              limit=limit)
+
+    if not recommendations:
+        print(f"No recommendations for campaign '{campaign}'")
+        return
+
+    # Invalidate stale planned recommendations before creating new batch
+    conn.execute(
+        """UPDATE recommendations
+           SET status = 'invalidated'
+           WHERE batch_id IN (
+               SELECT id FROM recommendation_batches WHERE campaign_id = ?
+           ) AND status = 'planned'""",
+        (c["id"],),
+    )
+    conn.commit()
+
+    # Persist batch + recommendations
+    batch_id = f"batch-{uuid.uuid4().hex[:16]}"
+    save_recommendation_batch(
+        conn,
+        batch_id=batch_id,
+        campaign_id=c["id"],
+        selector_name=policy["name"],
+        selector_version=policy["version"],
+        selector_hash=policy_hash(policy),
+    )
+    for rank, rec in enumerate(recommendations, 1):
+        rec_id = build_recommendation_id(batch_id, rec)
+        save_recommendation(
+            conn,
+            recommendation_id=rec_id,
+            batch_id=batch_id,
+            candidate_type=rec["candidate_type"],
+            candidate_key=rec.get("candidate_key"),
+            rank=rank,
+            score_total=rec["score_total"],
+            score_breakdown_json=_json.dumps(rec["score_breakdown"], ensure_ascii=False, sort_keys=True),
+            rationale_json=_json.dumps(rec["rationale"], ensure_ascii=False, sort_keys=True),
+            axis_values_json=_json.dumps(rec.get("axis_values", {}), ensure_ascii=False, sort_keys=True) if rec.get("axis_values") else None,
+            branch_reason=rec.get("branch_reason"),
+            delta_json=rec.get("delta_json"),
+        )
+
+    if fmt == "json":
+        output = {
+            "campaign": campaign,
+            "batch_id": batch_id,
+            "selector": policy["name"],
+            "recommendations": recommendations,
+        }
+        print(_json.dumps(output, indent=2, ensure_ascii=False))
+    else:
+        print(f"Recommendations for: {campaign}")
+        print(f"Selector: {policy['name']} v{policy['version']}")
+        print(f"Batch: {batch_id}")
+        print("=" * 80)
+        print(f"  {'#':>3}  {'Type':>16}  {'Score':>8}  {'Key':>20}  {'Rationale'}")
+        print("-" * 80)
+        for i, rec in enumerate(recommendations, 1):
+            key = (rec.get("candidate_key") or "")[:18]
+            rationale = rec["rationale"].get("summary", "")
+            print(f"  {i:>3}  {rec['candidate_type']:>16}  {rec['score_total']:>8.3f}  {key:>20}  {rationale}")
+        print()
+        print(f"Total: {len(recommendations)} recommendations")
+        print(f"To accept: update status to 'accepted', then execute via sweep.py or branch.py")
+
+
+def cmd_recommendation_log(conn: sqlite3.Connection, campaign: str, fmt: str = "md") -> None:
+    """Show recommendation history for a campaign."""
+    from core.db import get_campaign, list_recommendation_batches, list_recommendations_for_batch
+
+    c = get_campaign(conn, campaign)
+    if not c:
+        print(f"Campaign not found: {campaign}")
+        return
+
+    batches = list_recommendation_batches(conn, c["id"])
+    if not batches:
+        print(f"No recommendation batches for campaign '{campaign}'")
+        return
+
+    if fmt == "json":
+        output = {"campaign": campaign, "batches": []}
+        for b in batches:
+            recs = list_recommendations_for_batch(conn, b["id"])
+            output["batches"].append({
+                "batch_id": b["id"],
+                "created_at": b["created_at"],
+                "selector": f"{b['selector_name']} v{b['selector_version']}",
+                "recommendations": recs,
+            })
+        print(_json.dumps(output, indent=2, ensure_ascii=False))
+    else:
+        print(f"Recommendation Log: {campaign}")
+        print("=" * 80)
+        for b in batches:
+            recs = list_recommendations_for_batch(conn, b["id"])
+            status_counts = {}
+            for r in recs:
+                status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+            print(f"\n  Batch: {b['id'][:16]} | {b['selector_name']} v{b['selector_version']}")
+            print(f"  Created: {b['created_at']}")
+            print(f"  Status: {', '.join(f'{k}={v}' for k, v in status_counts.items())}")
+            print(f"  {'#':>3}  {'Type':>16}  {'Score':>8}  {'Status':>10}  {'Key'}")
+            print(f"  {'─' * 60}")
+            for r in recs:
+                key = (r.get("candidate_key") or "")[:30]
+                print(f"  {r['rank']:>3}  {r['candidate_type']:>16}  {r['score_total']:>8.3f}  {r['status']:>10}  {key}")
+        print()
+
+
+def cmd_recommendation_outcomes(conn: sqlite3.Connection, campaign: str, fmt: str = "md") -> None:
+    """Show recommendation outcome summary for a campaign."""
+    from core.db import (
+        get_campaign,
+        list_recommendation_batches,
+        list_recommendations_for_batch,
+        list_recommendation_outcomes,
+    )
+
+    c = get_campaign(conn, campaign)
+    if not c:
+        print(f"Campaign not found: {campaign}")
+        return
+
+    batches = list_recommendation_batches(conn, c["id"])
+    if not batches:
+        print(f"No recommendation batches for campaign '{campaign}'")
+        return
+
+    all_outcomes = []
+    for b in batches:
+        recs = list_recommendations_for_batch(conn, b["id"])
+        for r in recs:
+            outcomes = list_recommendation_outcomes(conn, r["id"])
+            for o in outcomes:
+                all_outcomes.append({
+                    "batch_id": b["id"],
+                    "recommendation_id": r["id"],
+                    "candidate_type": r["candidate_type"],
+                    "rank": r["rank"],
+                    "outcome_label": o["outcome_label"],
+                    "observed_metrics": o["observed_metrics_json"],
+                })
+
+    if not all_outcomes:
+        print(f"No outcomes recorded for campaign '{campaign}'")
+        return
+
+    if fmt == "json":
+        print(_json.dumps({"campaign": campaign, "outcomes": all_outcomes}, indent=2, ensure_ascii=False))
+    else:
+        print(f"Recommendation Outcomes: {campaign}")
+        print("=" * 80)
+        print(f"  {'Rank':>4}  {'Type':>16}  {'Outcome':>12}  {'Metrics'}")
+        print("-" * 80)
+        for o in all_outcomes:
+            metrics = o.get("observed_metrics", "{}")[:40]
+            print(f"  {o['rank']:>4}  {o['candidate_type']:>16}  {o['outcome_label']:>12}  {metrics}")
+        print()
+        labels = {}
+        for o in all_outcomes:
+            labels[o["outcome_label"]] = labels.get(o["outcome_label"], 0) + 1
+        print(f"Summary: {', '.join(f'{k}={v}' for k, v in labels.items())}")
+        print()
 
 
 def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str, campaign: str | None = None,
@@ -1889,6 +2122,12 @@ def main():
                        help="Show trajectory report for a campaign (v20.3)")
     group.add_argument("--compare-parent-child", metavar="BRANCH_ID",
                        help="Compare parent and child for a branch (v20.3)")
+    group.add_argument("--recommend-next", metavar="CAMPAIGN",
+                       help="Recommend next point / branch candidates for a campaign (v21)")
+    group.add_argument("--recommendation-log", metavar="CAMPAIGN",
+                       help="Show recommendation history for a campaign (v21)")
+    group.add_argument("--recommendation-outcomes", metavar="CAMPAIGN",
+                       help="Show recommendation outcome summary for a campaign (v21)")
 
     parser.add_argument("--format", choices=["md", "json"], default="md",
                         help="Report format: md (Chinese markdown) or json (structured)")
@@ -1914,6 +2153,14 @@ def main():
                         help="Allow protocol-drift runs inside campaign-scoped analyses")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path for plot PNG (default: output/pareto_front.png)")
+
+    # v21: selector configuration
+    parser.add_argument("--selector-policy", type=str, default=None,
+                        help="Path to selector policy JSON (used with --recommend-next)")
+    parser.add_argument("--candidate-type", type=str, default=None,
+                        help="Filter recommendations by candidate type (new_point, seed_recheck, continue_branch, eval_upgrade)")
+    parser.add_argument("--limit", type=int, default=5,
+                        help="Maximum number of recommendations to output (default: 5)")
 
     args = parser.parse_args()
     conn = _connect(args.db)
@@ -1967,6 +2214,16 @@ def main():
         cmd_trajectory_report(conn, args.trajectory_report)
     elif args.compare_parent_child:
         cmd_compare_parent_child(conn, args.compare_parent_child)
+    elif args.recommend_next:
+        cmd_recommend_next(conn, args.recommend_next,
+                           selector_policy=args.selector_policy,
+                           candidate_type=args.candidate_type,
+                           limit=args.limit,
+                           fmt=args.format)
+    elif args.recommendation_log:
+        cmd_recommendation_log(conn, args.recommendation_log, fmt=args.format)
+    elif args.recommendation_outcomes:
+        cmd_recommendation_outcomes(conn, args.recommendation_outcomes, fmt=args.format)
 
     conn.close()
 
