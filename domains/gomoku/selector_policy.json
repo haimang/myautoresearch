@@ -1,0 +1,59 @@
+{
+  "domain": "gomoku",
+  "name": "cold-start-selector",
+  "version": "1.0",
+  "description": "Lightweight selector for Gomoku cold-start campaigns. Recommends next points, seed rechecks, and branch continuations based on frontier gaps, uncertainty, and dominance.",
+  "search_space_ref": {
+    "domain": "gomoku",
+    "name": "cold-start-core",
+    "version": "1.0"
+  },
+  "stage_policy_ref": {
+    "domain": "gomoku",
+    "name": "cold-start-promotion",
+    "version": "1.0"
+  },
+  "branch_policy_ref": {
+    "domain": "gomoku",
+    "name": "cold-start-continuation",
+    "version": "1.0"
+  },
+  "candidate_kinds": {
+    "new_point": {
+      "description": "Sample a new configuration point in the search space, preferring frontier-adjacent sparse regions.",
+      "max_per_batch": 3,
+      "default_budget_s": 60
+    },
+    "seed_recheck": {
+      "description": "Re-run an existing high-variance or single-seed candidate with a different seed to verify stability.",
+      "max_per_batch": 2,
+      "default_budget_s": 60
+    },
+    "continue_branch": {
+      "description": "Continue training from a promising parent checkpoint with a branch reason delta (e.g. lr_decay, mcts_upshift).",
+      "max_per_batch": 2,
+      "default_budget_s": 120
+    },
+    "eval_upgrade": {
+      "description": "Upgrade evaluation benchmark for a candidate that has plateaued at its current eval_level.",
+      "max_per_batch": 1,
+      "default_budget_s": 120
+    },
+    "skip_dominated": {
+      "description": "Explicitly mark dominated regions so the selector does not waste budget there.",
+      "max_per_batch": 0,
+      "default_budget_s": 0
+    }
+  },
+  "score_weights": {
+    "frontier_gap": 1.0,
+    "uncertainty": 0.8,
+    "cost_penalty": 0.5,
+    "dominance_penalty": 1.2
+  },
+  "limits": {
+    "default_batch_size": 5,
+    "min_runs_for_variance": 2,
+    "max_wr_std_for_confident": 0.05
+  }
+}
