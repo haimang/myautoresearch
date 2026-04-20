@@ -1,0 +1,49 @@
+{
+  "domain": "gomoku",
+  "name": "cold-start-promotion",
+  "version": "1.0",
+  "description": "Multi-fidelity promotion policy for Gomoku cold-start campaigns. Stage A screens, Stage B replicates seeds, Stage C confirms with long budget, Stage D is a handoff slot for v20.3 continuation.",
+  "search_space_ref": {
+    "domain": "gomoku",
+    "name": "cold-start-core",
+    "version": "1.0"
+  },
+  "stages": [
+    {
+      "name": "A",
+      "description": "Short-budget screening: quickly eliminate poor candidates.",
+      "time_budget": 60,
+      "seed_count": 1,
+      "promote_top_k": 4,
+      "metric": "win_rate",
+      "min_runs": 1
+    },
+    {
+      "name": "B",
+      "description": "Medium-budget re-screening: seed replication + re-ranking.",
+      "time_budget": 180,
+      "seed_count": 3,
+      "promote_top_k": 2,
+      "metric": "win_rate",
+      "min_runs": 1
+    },
+    {
+      "name": "C",
+      "description": "Long-budget confirmation: expensive validation of few candidates.",
+      "time_budget": 600,
+      "seed_count": 3,
+      "promote_top_k": 1,
+      "metric": "win_rate",
+      "min_runs": 1
+    },
+    {
+      "name": "D",
+      "description": "Handoff slot for v20.3 checkpoint continuation / branch execution. Not executed in v20.2.",
+      "time_budget": 1800,
+      "seed_count": 3,
+      "promote_top_k": 0,
+      "metric": "win_rate",
+      "min_runs": 1
+    }
+  ]
+}

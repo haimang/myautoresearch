@@ -1006,7 +1006,7 @@ def train(args):
     resume_model_path = None
 
     if args.resume:
-        db_tmp = _tracker.init_db()
+        db_tmp = _tracker.init_db(args.db)
         old_run = _tracker.get_run(db_tmp, args.resume)
         if not old_run:
             print(f"Error: run '{args.resume}' not found in tracker.db")
@@ -1046,7 +1046,7 @@ def train(args):
         db_tmp.close()
 
     # Initialize tracker DB
-    db_conn = _tracker.init_db()
+    db_conn = _tracker.init_db(args.db)
     hw_info = _tracker.collect_hardware_info()
 
     hyperparams = {
@@ -2066,7 +2066,7 @@ def train(args):
         print()
         best_tag = None
         if num_checkpoints > 0:
-            ckpts = _tracker.init_db()
+            ckpts = _tracker.init_db(args.db)
             clist = _tracker.get_checkpoints(ckpts, run_id)
             ckpts.close()
             if clist:
@@ -2582,6 +2582,8 @@ def parse_args() -> argparse.Namespace:
                    help="Source checkpoint tag for --register-opponent")
     p.add_argument("--description", type=str, default=None,
                    help="Description for --register-opponent")
+    p.add_argument("--db", type=str, default=None,
+                   help="Path to tracker.db (default: output/tracker.db)")
     return p.parse_args()
 
 
@@ -2595,7 +2597,7 @@ def _handle_register_opponent(args: argparse.Namespace) -> None:
         print("Error: --register-opponent requires --from-run and --from-tag")
         sys.exit(1)
 
-    conn = _tracker.init_db()
+    conn = _tracker.init_db(args.db)
     run = _tracker.get_run(conn, args.from_run)
     if not run:
         print(f"Error: run '{args.from_run}' not found")

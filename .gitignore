@@ -5,7 +5,6 @@ __pycache__/
 
 # ── Generated output (training artifacts) ──
 output/
-tests/
 
 # Replay frame exports
 replay_frames/

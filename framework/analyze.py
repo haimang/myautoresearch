@@ -340,6 +340,89 @@ def cmd_campaign_summary(conn: sqlite3.Connection, campaign: str) -> None:
     print()
 
 
+def cmd_stage_summary(conn: sqlite3.Connection, campaign: str) -> None:
+    """Show stage-by-stage summary for a campaign."""
+    c = _resolve_campaign_or_exit(conn, campaign)
+    stages = conn.execute(
+        "SELECT * FROM campaign_stages WHERE campaign_id = ? ORDER BY stage",
+        (c["id"],),
+    ).fetchall()
+
+    print(f"Stage Summary: {c['name']} ({c['id'][:8]})")
+    print("=" * 72)
+    if not stages:
+        print("  (No stage records found.)")
+        return
+
+    for st in stages:
+        policy = _json.loads(st["policy_json"] or "{}")
+        budget = _json.loads(st["budget_json"] or "{}")
+        # Count runs linked to this stage
+        run_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM campaign_runs WHERE campaign_id = ? AND stage = ?",
+            (c["id"], st["stage"]),
+        ).fetchone()["n"]
+        # Count candidates (distinct candidate_key)
+        cand_count = conn.execute(
+            "SELECT COUNT(DISTINCT candidate_key) AS n FROM campaign_runs WHERE campaign_id = ? AND stage = ?",
+            (c["id"], st["stage"]),
+        ).fetchone()["n"]
+        # Count promotion decisions
+        promo_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM promotion_decisions WHERE campaign_id = ? AND from_stage = ?",
+            (c["id"], st["stage"]),
+        ).fetchone()["n"]
+        status_icon = "🔒" if st["status"] == "closed" else "🟢"
+        print(f"  {status_icon} Stage {st['stage']}: {st['status']}")
+        print(f"      budget={budget.get('time_budget', '?')}s  seed_target={st['seed_target']}")
+        print(f"      runs={run_count}  candidates={cand_count}  promotions={promo_count}")
+        if st["closed_at"]:
+            print(f"      closed_at={st['closed_at'][:19]}")
+    print()
+
+
+def cmd_promotion_log(conn: sqlite3.Connection, campaign: str) -> None:
+    """Show promotion decisions for a campaign."""
+    c = _resolve_campaign_or_exit(conn, campaign)
+    rows = conn.execute(
+        """SELECT * FROM promotion_decisions
+           WHERE campaign_id = ?
+           ORDER BY from_stage, decision_rank""",
+        (c["id"],),
+    ).fetchall()
+
+    print(f"Promotion Log: {c['name']} ({c['id'][:8]})")
+    print("=" * 72)
+    if not rows:
+        print("  (No promotion decisions recorded.)")
+        return
+
+    current_stage = None
+    for row in rows:
+        if row["from_stage"] != current_stage:
+            current_stage = row["from_stage"]
+            print(f"\n  Stage {current_stage} → {row['to_stage']}:")
+            print(f"  {'Rank':>6}  {'Decision':>10}  {'Candidate':>20}  {'Metric':>10}  {'Seeds':>6}  {'Reason'}")
+            print(f"  {'─' * 80}")
+        icon = "⬆" if row["decision"] == "promote" else ("⏸" if row["decision"] == "hold" else "⬇")
+        ck = row["candidate_key"][:18]
+        metrics = _json.loads(row["aggregated_metrics_json"] or "{}")
+        metric_val = metrics.get("mean_wr", metrics.get("mean_metric", "?"))
+        if isinstance(metric_val, (int, float)):
+            metric_str = f"{metric_val:>10.1%}"
+        else:
+            metric_str = f"{metric_val:>10}"
+        print(
+            f"  {row['decision_rank'] or '-':>6}  "
+            f"{icon} {row['decision']:<8}  "
+            f"{ck:>20}  "
+            f"{metric_str}  "
+            f"{row['seed_count'] or '-':>6}  "
+            f"{row['reason']}"
+        )
+    print()
+
+
 def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str, campaign: str | None = None,
                allow_drift: bool = False) -> None:
     """按标签前缀分组展示 sweep 结果。"""
@@ -696,11 +779,13 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
                campaign: str | None = None,
                allow_drift: bool = False,
                plot: bool = False,
-               output_path: str | None = None) -> None:
+               output_path: str | None = None,
+               stage: str | None = None) -> None:
     """对 completed runs 执行非支配排序，输出 Pareto 前沿。
 
     默认轴: maximize WR, minimize params 和 wall_time.
     支持 --eval-level 和 --sweep-tag 过滤，确保同 benchmark 条件比较。
+    支持 --stage 按 campaign stage 过滤。
     支持 --plot 生成 PNG 散点图。
     """
     maximize = maximize or ["wr"]
@@ -749,6 +834,12 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
     if sweep_tag is not None:
         where_clauses.append("sweep_tag LIKE ?")
         params_sql.append(sweep_tag + "%")
+    if stage is not None:
+        if campaign is None:
+            print("--stage requires --campaign")
+            return
+        where_clauses.append("cr.stage = ?")
+        params_sql.append(stage)
 
     where_str = " AND ".join(where_clauses)
     rows = conn.execute(
@@ -766,6 +857,8 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
             print(f"  (filter: sweep_tag={sweep_tag}*)")
         if campaign_row is not None:
             print(f"  (filter: campaign={campaign_row['name']})")
+        if stage is not None:
+            print(f"  (filter: stage={stage})")
         return
 
     # Auto eval_level grouping: warn if data crosses levels and no filter set
@@ -839,6 +932,8 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
             filter_info += f"  sweep_tag={sweep_tag}*"
         if campaign_row is not None:
             filter_info += f"  campaign={campaign_row['name']}"
+        if stage is not None:
+            filter_info += f"  stage={stage}"
         print(f"  Total runs analyzed: {len(points)}{filter_info}")
         print(f"  Front points: {len(front)}  |  Dominated: {len(dominated)}")
         print()
@@ -1632,6 +1727,10 @@ def main():
                        help="List campaign ledgers")
     group.add_argument("--campaign-summary", metavar="CAMPAIGN",
                        help="Show one campaign summary")
+    group.add_argument("--stage-summary", metavar="CAMPAIGN",
+                       help="Show stage-by-stage summary for a campaign (v20.2)")
+    group.add_argument("--promotion-log", metavar="CAMPAIGN",
+                       help="Show promotion decisions for a campaign (v20.2)")
     group.add_argument("--stagnation", metavar="RUN_ID",
                        help="Detect training stagnation (WR plateau) for a run")
     group.add_argument("--pareto", action="store_true",
@@ -1663,6 +1762,8 @@ def main():
                         help="Filter runs by sweep_tag prefix for Pareto analysis")
     parser.add_argument("--campaign", type=str, default=None,
                         help="Filter Pareto/matrix to a specific campaign")
+    parser.add_argument("--stage", type=str, default=None,
+                        help="Filter Pareto/matrix to a campaign stage (requires --campaign)")
     parser.add_argument("--allow-drift", action="store_true",
                         help="Allow protocol-drift runs inside campaign-scoped analyses")
     parser.add_argument("--output", type=str, default=None,
@@ -1691,6 +1792,10 @@ def main():
         cmd_list_campaigns(conn)
     elif args.campaign_summary:
         cmd_campaign_summary(conn, args.campaign_summary)
+    elif args.stage_summary:
+        cmd_stage_summary(conn, args.stage_summary)
+    elif args.promotion_log:
+        cmd_promotion_log(conn, args.promotion_log)
     elif args.stagnation:
         cmd_stagnation(conn, args.stagnation)
     elif args.pareto:
@@ -1700,7 +1805,8 @@ def main():
                    maximize=max_axes, minimize=min_axes,
                    eval_level=args.eval_level, sweep_tag=args.sweep_tag,
                    campaign=args.campaign, allow_drift=args.allow_drift,
-                   plot=args.plot, output_path=args.output)
+                   plot=args.plot, output_path=args.output,
+                   stage=args.stage)
     elif args.compare_by_steps:
         cmd_compare_by_steps(conn, args.compare_by_steps[0], args.compare_by_steps[1])
     elif args.promotion_chain:

@@ -19,9 +19,12 @@ from core.db import (
     get_or_create_campaign,
     init_db,
     link_run_to_campaign,
+    link_run_to_campaign_v20,
+    save_campaign_stage,
     save_search_space,
 )
 from search_space import describe_profile, load_profile, validate_selected_axes
+from stage_policy import load_stage_policy, get_stage_by_name
 
 
 def parse_args():
@@ -46,8 +49,8 @@ def parse_args():
                    help="逗号分隔的缓冲区大小 (e.g. 50000,100000)")
 
     # 固定参数，应用于每次运行
-    p.add_argument("--time-budget", type=int, required=True,
-                   help="每次运行的时间预算（秒）")
+    p.add_argument("--time-budget", type=int, default=None,
+                   help="每次运行的时间预算（秒）；若指定 --stage，则优先取 stage policy")
     p.add_argument("--seeds", type=str, default="42",
                    help="逗号分隔的随机种子 (默认: 42)")
     p.add_argument("--tag", type=str, default="sweep",
@@ -56,6 +59,10 @@ def parse_args():
                    help="本轮研究的 campaign 名称")
     p.add_argument("--search-space", type=str, default=None,
                    help="JSON search-space profile 路径（v20.1）")
+    p.add_argument("--stage-policy", type=str, default=None,
+                   help="JSON stage-policy 路径（v20.2）")
+    p.add_argument("--stage", type=str, default=None,
+                   help="当前 campaign stage: A / B / C / D（v20.2）")
 
     # 额外固定参数，透传至 train.py
     p.add_argument("--eval-level", type=int, default=None)
@@ -225,6 +232,8 @@ def run_one(cfg, args, idx, total):
            "--time-budget", str(args.time_budget),
            "--seed", str(seed),
            "--sweep-tag", tag]
+    if args.db:
+        cmd += ["--db", args.db]
 
     if "num_blocks" in cfg and cfg["num_blocks"] is not None:
         cmd += ["--num-blocks", str(cfg["num_blocks"])]
@@ -297,6 +306,8 @@ def main():
     if args.campaign and args.tag == "sweep":
         args.tag = args.campaign
 
+    stage_policy = None
+    stage_cfg = None
     try:
         profile = load_profile(args.search_space) if args.search_space else None
         configs = build_matrix(args)
@@ -314,10 +325,39 @@ def main():
         if profile is not None:
             _ensure_profile_protocol(profile, protocol)
 
+        # v20.2: stage policy
+        if args.stage_policy:
+            from framework.stage_policy import load_stage_policy, get_stage_by_name
+            stage_policy = load_stage_policy(args.stage_policy)
+            if args.stage:
+                stage_cfg = get_stage_by_name(stage_policy, args.stage)
+                if stage_cfg is None:
+                    raise ValueError(f"stage '{args.stage}' not found in policy")
+                # Override time_budget from stage policy
+                args.time_budget = stage_cfg["time_budget"]
+                print(f"[v20.2] Stage {args.stage} policy applied: budget={args.time_budget}s")
+            else:
+                print(f"[v20.2] Stage policy loaded; use --stage to select A/B/C/D")
+
+        # Validate time_budget is resolved
+        if args.time_budget is None:
+            raise ValueError("--time-budget is required when --stage is not specified")
+
         db_conn = init_db(args.db)
         campaign = None
         if args.campaign:
             campaign, _ = _ensure_campaign(db_conn, args, profile, protocol)
+            # v20.2: write campaign stage record
+            if stage_cfg:
+                save_campaign_stage(
+                    db_conn,
+                    campaign_id=campaign["id"],
+                    stage=args.stage,
+                    policy_json=json.dumps(stage_cfg, ensure_ascii=False, sort_keys=True),
+                    budget_json=json.dumps({"time_budget": stage_cfg["time_budget"]}, ensure_ascii=False, sort_keys=True),
+                    seed_target=stage_cfg["seed_count"],
+                    status="open",
+                )
     except ValueError as exc:
         print(f"Error: {exc}")
         sys.exit(1)
@@ -342,9 +382,14 @@ def main():
     print(f"标签前缀: {args.tag}")
     if campaign:
         print(f"Campaign: {campaign['name']} ({campaign['id'][:8]})")
+        if args.stage:
+            print(f"Stage: {args.stage}")
 
     if args.dry_run:
         _print_matrix_preview(configs, profile, args, protocol)
+        if stage_cfg:
+            print()
+            print(f"Stage policy: {stage_cfg['name']} | budget={stage_cfg['time_budget']}s | seeds={stage_cfg['seed_count']} | promote_top_k={stage_cfg['promote_top_k']}")
         return
 
     results = []
@@ -356,11 +401,11 @@ def main():
             run_id = find_run_by_sweep_tag(db_conn, tag)
             if run_id:
                 axis_values = {k: v for k, v in cfg.items() if k not in ("seed", "sweep_tag")}
-                link_run_to_campaign(
+                link_run_to_campaign_v20(
                     db_conn,
                     campaign_id=campaign["id"],
                     run_id=run_id,
-                    stage=None,
+                    stage=args.stage,
                     sweep_tag=tag,
                     seed=cfg["seed"],
                     axis_values=axis_values,
@@ -384,6 +429,8 @@ def main():
     print(f"\n查看结果: uv run python framework/analyze.py --matrix {args.tag}")
     if campaign:
         print(f"Campaign 汇总: uv run python framework/analyze.py --campaign-summary {campaign['name']}")
+        if args.stage:
+            print(f"Stage 汇总: uv run python framework/analyze.py --stage-summary {campaign['name']}")
 
     if n_ok > 0 and not args.no_auto_pareto:
         print(f"\n{'─'*60}")
@@ -398,6 +445,8 @@ def main():
         ]
         if campaign:
             pareto_cmd += ["--campaign", campaign["name"]]
+            if args.stage:
+                pareto_cmd += ["--stage", args.stage]
         else:
             pareto_cmd += ["--sweep-tag", args.tag]
         proc = subprocess.run(pareto_cmd, capture_output=False, text=True)

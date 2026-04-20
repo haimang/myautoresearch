@@ -342,6 +342,55 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
                  "ON campaign_runs(campaign_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_campaign_runs_run "
                  "ON campaign_runs(run_id)")
+
+    # v20.2: multi-fidelity promotion engine
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS campaign_stages (
+            id              TEXT PRIMARY KEY,
+            campaign_id     TEXT NOT NULL REFERENCES campaigns(id),
+            stage           TEXT NOT NULL,
+            policy_json     TEXT NOT NULL,
+            budget_json     TEXT NOT NULL,
+            seed_target     INTEGER NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'open',
+            created_at      TEXT NOT NULL,
+            closed_at       TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_campaign_stages_campaign "
+                 "ON campaign_stages(campaign_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_campaign_stages_unique "
+                 "ON campaign_stages(campaign_id, stage)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS promotion_decisions (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id             TEXT NOT NULL REFERENCES campaigns(id),
+            from_stage              TEXT NOT NULL,
+            to_stage                TEXT NOT NULL,
+            candidate_key           TEXT NOT NULL,
+            axis_values_json        TEXT NOT NULL,
+            aggregated_metrics_json TEXT NOT NULL,
+            seed_count              INTEGER NOT NULL,
+            decision                TEXT NOT NULL,
+            decision_rank           INTEGER,
+            reason                  TEXT NOT NULL,
+            created_at              TEXT NOT NULL,
+            UNIQUE(campaign_id, from_stage, to_stage, candidate_key)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_promotion_decisions_campaign "
+                 "ON promotion_decisions(campaign_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_promotion_decisions_stage "
+                 "ON promotion_decisions(from_stage, to_stage)")
+
+    # v20.2: candidate_key on campaign_runs for aggregation
+    for col, typ in [("candidate_key", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE campaign_runs ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+
     conn.commit()
     return conn
 
@@ -503,6 +552,15 @@ def finish_run(conn: sqlite3.Connection, run_id: str, summary: dict) -> None:
 
 def _stable_json(value: object) -> str:
     return _json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def get_search_space(conn: sqlite3.Connection, space_id: str) -> Optional[sqlite3.Row]:
+    """Return a search space by id, or None."""
+    row = conn.execute(
+        "SELECT * FROM search_spaces WHERE id = ?",
+        (space_id,),
+    ).fetchone()
+    return row
 
 
 def save_search_space(conn: sqlite3.Connection, profile: dict) -> str:
@@ -956,5 +1014,232 @@ def list_opponents(conn: sqlite3.Connection) -> list[dict]:
     """列出所有注册对手。"""
     rows = conn.execute(
         "SELECT * FROM opponents ORDER BY created_at",
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# v20.2: candidate key + stage ledger + promotion decisions
+# ---------------------------------------------------------------------------
+
+def _candidate_key(axis_values: dict) -> str:
+    """Stable candidate key from axis values (excluding seed)."""
+    filtered = {k: v for k, v in axis_values.items() if k != "seed"}
+    return _stable_json(filtered)
+
+
+def link_run_to_campaign_v20(
+    conn: sqlite3.Connection, *,
+    campaign_id: str,
+    run_id: str,
+    stage: Optional[str],
+    sweep_tag: Optional[str],
+    seed: Optional[int],
+    axis_values: dict,
+    status: str = "linked",
+) -> None:
+    """Attach a run to a campaign with candidate_key generation."""
+    candidate_key = _candidate_key(axis_values)
+    conn.execute(
+        """INSERT INTO campaign_runs
+           (campaign_id, run_id, stage, sweep_tag, seed, axis_values_json, candidate_key, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(campaign_id, run_id) DO UPDATE SET
+               stage = excluded.stage,
+               sweep_tag = excluded.sweep_tag,
+               seed = excluded.seed,
+               axis_values_json = excluded.axis_values_json,
+               candidate_key = excluded.candidate_key,
+               status = excluded.status""",
+        (
+            campaign_id,
+            run_id,
+            stage,
+            sweep_tag,
+            seed,
+            _stable_json(axis_values),
+            candidate_key,
+            status,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def save_campaign_stage(
+    conn: sqlite3.Connection, *,
+    campaign_id: str,
+    stage: str,
+    policy_json: str,
+    budget_json: str,
+    seed_target: int,
+    status: str = "open",
+) -> None:
+    """Open or update a campaign stage record."""
+    stage_id = f"{campaign_id}_{stage}"
+    conn.execute(
+        """INSERT INTO campaign_stages
+           (id, campaign_id, stage, policy_json, budget_json, seed_target, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               policy_json = excluded.policy_json,
+               budget_json = excluded.budget_json,
+               seed_target = excluded.seed_target,
+               status = excluded.status""",
+        (
+            stage_id,
+            campaign_id,
+            stage,
+            policy_json,
+            budget_json,
+            seed_target,
+            status,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def close_campaign_stage(conn: sqlite3.Connection,
+                         campaign_id: str, stage: str) -> None:
+    """Mark a campaign stage as closed."""
+    stage_id = f"{campaign_id}_{stage}"
+    conn.execute(
+        """UPDATE campaign_stages SET status = 'closed', closed_at = ?
+           WHERE id = ?""",
+        (datetime.now(timezone.utc).isoformat(), stage_id),
+    )
+    conn.commit()
+
+
+def get_campaign_stages(conn: sqlite3.Connection,
+                        campaign_id: str) -> list[dict]:
+    """Return all stages for a campaign, ordered by stage name."""
+    rows = conn.execute(
+        "SELECT * FROM campaign_stages WHERE campaign_id = ? ORDER BY stage",
+        (campaign_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_campaign_stage(conn: sqlite3.Connection,
+                       campaign_id: str, stage: str) -> Optional[dict]:
+    """Return a single campaign stage, or None."""
+    row = conn.execute(
+        "SELECT * FROM campaign_stages WHERE campaign_id = ? AND stage = ?",
+        (campaign_id, stage),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def save_promotion_decision(
+    conn: sqlite3.Connection, *,
+    campaign_id: str,
+    from_stage: str,
+    to_stage: str,
+    candidate_key: str,
+    axis_values: dict,
+    aggregated_metrics: dict,
+    seed_count: int,
+    decision: str,
+    decision_rank: Optional[int] = None,
+    reason: str = "",
+) -> None:
+    """Persist a promotion decision (promote / reject / hold)."""
+    conn.execute(
+        """INSERT INTO promotion_decisions
+           (campaign_id, from_stage, to_stage, candidate_key, axis_values_json,
+            aggregated_metrics_json, seed_count, decision, decision_rank, reason, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(campaign_id, from_stage, to_stage, candidate_key) DO UPDATE SET
+               axis_values_json = excluded.axis_values_json,
+               aggregated_metrics_json = excluded.aggregated_metrics_json,
+               seed_count = excluded.seed_count,
+               decision = excluded.decision,
+               decision_rank = excluded.decision_rank,
+               reason = excluded.reason""",
+        (
+            campaign_id,
+            from_stage,
+            to_stage,
+            candidate_key,
+            _stable_json(axis_values),
+            _stable_json(aggregated_metrics),
+            seed_count,
+            decision,
+            decision_rank,
+            reason,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def get_promotion_decisions(conn: sqlite3.Connection,
+                            campaign_id: str,
+                            from_stage: Optional[str] = None,
+                            to_stage: Optional[str] = None) -> list[dict]:
+    """Return promotion decisions for a campaign, optionally filtered by stage transition."""
+    sql = "SELECT * FROM promotion_decisions WHERE campaign_id = ?"
+    params: list = [campaign_id]
+    if from_stage is not None:
+        sql += " AND from_stage = ?"
+        params.append(from_stage)
+    if to_stage is not None:
+        sql += " AND to_stage = ?"
+        params.append(to_stage)
+    sql += " ORDER BY from_stage, decision_rank, created_at"
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_campaign_runs_by_stage(conn: sqlite3.Connection,
+                               campaign_id: str,
+                               stage: str) -> list[dict]:
+    """Return campaign_runs rows for a specific campaign + stage."""
+    rows = conn.execute(
+        """SELECT cr.*, r.status AS run_status, r.final_win_rate, r.wall_time_s,
+                  r.total_games, r.total_steps, r.num_params, r.final_loss
+           FROM campaign_runs cr
+           JOIN runs r ON r.id = cr.run_id
+           WHERE cr.campaign_id = ? AND cr.stage = ?""",
+        (campaign_id, stage),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def aggregate_candidates_by_stage(conn: sqlite3.Connection,
+                                  campaign_id: str,
+                                  stage: str) -> list[dict]:
+    """Aggregate campaign_runs by candidate_key for a given stage.
+
+    Returns one row per candidate with mean/std of key metrics.
+    """
+    rows = conn.execute(
+        """SELECT
+               cr.candidate_key,
+               cr.axis_values_json,
+               COUNT(*) AS run_count,
+               COUNT(DISTINCT cr.seed) AS seed_count,
+               AVG(r.final_win_rate) AS mean_wr,
+               MAX(r.final_win_rate) - MIN(r.final_win_rate) AS range_wr,
+               CASE WHEN COUNT(*) > 1
+                    THEN SQRT(((COUNT(*)*SUM(r.final_win_rate*r.final_win_rate) -
+                               SUM(r.final_win_rate)*SUM(r.final_win_rate)) /
+                               (COUNT(*)*(COUNT(*)-1))))
+                    ELSE 0.0
+               END AS std_wr,
+               AVG(r.wall_time_s) AS mean_wall_s,
+               SUM(r.total_games) AS games_total,
+               AVG(r.num_params) AS mean_params,
+               MIN(r.final_win_rate) AS min_wr,
+               MAX(r.final_win_rate) AS max_wr
+           FROM campaign_runs cr
+           JOIN runs r ON r.id = cr.run_id
+           WHERE cr.campaign_id = ? AND cr.stage = ?
+             AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')
+           GROUP BY cr.candidate_key
+           ORDER BY mean_wr DESC""",
+        (campaign_id, stage),
     ).fetchall()
     return [dict(r) for r in rows]
