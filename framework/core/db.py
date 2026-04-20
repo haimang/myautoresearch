@@ -391,6 +391,33 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
         except sqlite3.OperationalError:
             pass
 
+    # v20.3: continuation / trajectory explorer
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS run_branches (
+            id                  TEXT PRIMARY KEY,
+            campaign_id         TEXT NOT NULL REFERENCES campaigns(id),
+            parent_run_id       TEXT NOT NULL REFERENCES runs(id),
+            parent_checkpoint_id INTEGER REFERENCES checkpoints(id),
+            child_run_id        TEXT REFERENCES runs(id),
+            from_stage          TEXT NOT NULL,
+            branch_reason       TEXT NOT NULL,
+            branch_params_json  TEXT NOT NULL,
+            delta_json          TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'planned',
+            result_summary_json TEXT,
+            created_at          TEXT NOT NULL,
+            started_at          TEXT,
+            finished_at         TEXT,
+            UNIQUE(campaign_id, parent_run_id, parent_checkpoint_id, branch_reason, delta_json)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_branches_campaign "
+                 "ON run_branches(campaign_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_branches_parent "
+                 "ON run_branches(parent_run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_branches_child "
+                 "ON run_branches(child_run_id)")
+
     conn.commit()
     return conn
 
@@ -1243,3 +1270,167 @@ def aggregate_candidates_by_stage(conn: sqlite3.Connection,
         (campaign_id, stage),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# v20.3: run_branches / lineage helpers
+# ---------------------------------------------------------------------------
+
+def save_run_branch(
+    conn: sqlite3.Connection, *,
+    branch_id: str,
+    campaign_id: str,
+    parent_run_id: str,
+    parent_checkpoint_id: int | None,
+    from_stage: str,
+    branch_reason: str,
+    branch_params_json: str,
+    delta_json: str,
+    status: str = "planned",
+    result_summary_json: str = "{}",
+) -> None:
+    """Persist a planned branch record."""
+    conn.execute(
+        """INSERT INTO run_branches
+           (id, campaign_id, parent_run_id, parent_checkpoint_id, child_run_id,
+            from_stage, branch_reason, branch_params_json, delta_json,
+            status, result_summary_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id)
+           DO UPDATE SET
+               campaign_id = excluded.campaign_id,
+               parent_run_id = excluded.parent_run_id,
+               parent_checkpoint_id = excluded.parent_checkpoint_id,
+               child_run_id = excluded.child_run_id,
+               from_stage = excluded.from_stage,
+               branch_reason = excluded.branch_reason,
+               branch_params_json = excluded.branch_params_json,
+               delta_json = excluded.delta_json,
+               status = excluded.status,
+               result_summary_json = excluded.result_summary_json""",
+        (
+            branch_id,
+            campaign_id,
+            parent_run_id,
+            parent_checkpoint_id,
+            None,
+            from_stage,
+            branch_reason,
+            branch_params_json,
+            delta_json,
+            status,
+            result_summary_json,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def bind_branch_child_run(
+    conn: sqlite3.Connection, *,
+    branch_id: str,
+    child_run_id: str,
+    status: str = "running",
+) -> None:
+    """Link a child run to an existing branch and update status."""
+    conn.execute(
+        """UPDATE run_branches
+           SET child_run_id = ?, status = ?, started_at = ?
+           WHERE id = ?""",
+        (child_run_id, status, datetime.now(timezone.utc).isoformat(), branch_id),
+    )
+    conn.commit()
+
+
+def update_branch_status(
+    conn: sqlite3.Connection, *,
+    branch_id: str,
+    status: str,
+    result_summary_json: str | None = None,
+) -> None:
+    """Update branch status and optional result summary."""
+    if result_summary_json is not None:
+        conn.execute(
+            """UPDATE run_branches
+               SET status = ?, finished_at = ?, result_summary_json = ?
+               WHERE id = ?""",
+            (status, datetime.now(timezone.utc).isoformat(), result_summary_json, branch_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE run_branches
+               SET status = ?, finished_at = ?
+               WHERE id = ?""",
+            (status, datetime.now(timezone.utc).isoformat(), branch_id),
+        )
+    conn.commit()
+
+
+def list_branches_for_campaign(conn: sqlite3.Connection,
+                                campaign_id: str) -> list[dict]:
+    """Return all branches for a campaign, ordered by created_at."""
+    rows = conn.execute(
+        """SELECT rb.*,
+               p.sweep_tag AS parent_sweep_tag,
+               c.sweep_tag AS child_sweep_tag
+         FROM run_branches rb
+         LEFT JOIN runs p ON p.id = rb.parent_run_id
+         LEFT JOIN runs c ON c.id = rb.child_run_id
+         WHERE rb.campaign_id = ?
+         ORDER BY rb.created_at""",
+        (campaign_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_branches_for_checkpoint(conn: sqlite3.Connection,
+                                  checkpoint_id: int) -> list[dict]:
+    """Return all branches originating from a specific checkpoint."""
+    rows = conn.execute(
+        """SELECT rb.*,
+               p.sweep_tag AS parent_sweep_tag,
+               c.sweep_tag AS child_sweep_tag
+         FROM run_branches rb
+         LEFT JOIN runs p ON p.id = rb.parent_run_id
+         LEFT JOIN runs c ON c.id = rb.child_run_id
+         WHERE rb.parent_checkpoint_id = ?
+         ORDER BY rb.created_at""",
+        (checkpoint_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_branch_tree(conn: sqlite3.Connection,
+                    campaign_id: str) -> list[dict]:
+    """Return a flat list of all branches with parent/child context for tree building."""
+    rows = conn.execute(
+        """SELECT rb.id, rb.parent_run_id, rb.child_run_id,
+               rb.parent_checkpoint_id, rb.branch_reason, rb.delta_json,
+               rb.status, rb.result_summary_json,
+               p.sweep_tag AS parent_tag, p.final_win_rate AS parent_wr,
+               c.sweep_tag AS child_tag, c.final_win_rate AS child_wr,
+               c.wall_time_s AS child_wall_s, c.num_params AS child_params
+         FROM run_branches rb
+         LEFT JOIN runs p ON p.id = rb.parent_run_id
+         LEFT JOIN runs c ON c.id = rb.child_run_id
+         WHERE rb.campaign_id = ?
+         ORDER BY rb.created_at""",
+        (campaign_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_branch_by_id(conn: sqlite3.Connection,
+                     branch_id: str) -> dict | None:
+    """Return a single branch by id, or None."""
+    row = conn.execute(
+        """SELECT rb.*,
+               p.sweep_tag AS parent_sweep_tag,
+               c.sweep_tag AS child_sweep_tag
+         FROM run_branches rb
+         LEFT JOIN runs p ON p.id = rb.parent_run_id
+         LEFT JOIN runs c ON c.id = rb.child_run_id
+         WHERE rb.id = ?""",
+        (branch_id,),
+    ).fetchone()
+    return dict(row) if row else None
