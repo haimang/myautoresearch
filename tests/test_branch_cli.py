@@ -398,14 +398,14 @@ class TestBranchCLI(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "failed")
 
-    def test_branch_stage_policy_ref_mismatch_rejected(self):
-        """Branch policy stage_policy_ref must match campaign stage policy."""
+    def test_branch_stage_policy_ref_domain_mismatch_rejected(self):
+        """Branch policy stage_policy_ref domain must match campaign domain."""
         conn = init_db(self.db_path)
         c = get_or_create_campaign(
             conn, name="stage-mismatch-test", domain="gomoku", train_script="t.py",
             search_space_id=self.space_id, protocol={"eval_level": 0},
         )
-        # Seed parent run + checkpoint + stage C with mismatched policy name
+        # Seed parent run + checkpoint + stage C
         create_run(conn, "parent-run-2", {
             "sweep_tag": "parent2", "eval_level": 0, "learning_rate": 0.01,
             "num_res_blocks": 4, "num_filters": 32,
@@ -427,18 +427,35 @@ class TestBranchCLI(unittest.TestCase):
             conn,
             campaign_id=c["id"],
             stage="C",
-            policy_json='{"name": "other-promotion", "version": "2.0", "time_budget": 60}',
+            policy_json='{"time_budget": 60}',
             budget_json='{"time_budget": 60}',
             seed_target=1,
             status="closed",
         )
         conn.commit()
         conn.close()
+        # Create a branch policy with mismatched stage_policy_ref domain
+        bad_policy = str(Path(self.tmp.name) / "bad_stage_domain.json")
+        with open(bad_policy, "w") as f:
+            json.dump({
+                "domain": "gomoku",
+                "name": "test",
+                "version": "1.0",
+                "search_space_ref": {"domain": "gomoku", "name": "cold-start-core", "version": "1.0"},
+                "stage_policy_ref": {"domain": "chess", "name": "cold-start-promotion", "version": "1.0"},
+                "branch_reasons": {
+                    "lr_decay": {"description": "x", "allowed_deltas": {"learning_rate": {"type": "multiply"}}, "preserves_protocol": True},
+                    "mcts_upshift": {"description": "x", "allowed_deltas": {"mcts_simulations": {"type": "add"}}, "preserves_protocol": True},
+                    "eval_upgrade": {"description": "x", "allowed_deltas": {"eval_level": {"type": "add"}}, "preserves_protocol": False, "allowed_protocol_changes": ["eval_level"]},
+                    "seed_recheck": {"description": "x", "allowed_deltas": {"seed": {"type": "set"}}, "preserves_protocol": True},
+                    "buffer_or_spc_adjust": {"description": "x", "allowed_deltas": {"buffer_size": {"type": "multiply"}}, "preserves_protocol": True},
+                }
+            }, f)
         proc = self._run(
             str(BRANCH),
             "--db", self.db_path,
             "--campaign", "stage-mismatch-test",
-            "--branch-policy", self.policy_path,
+            "--branch-policy", bad_policy,
             "--parent-checkpoint", "ckpt_final2",
             "--reason", "lr_decay",
             "--plan",

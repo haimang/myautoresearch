@@ -1049,10 +1049,9 @@ def train(args):
                 f"threshold chain reset from 0]"
             )
         else:
-            initial_ckpt_wr = latest_ckpt["win_rate"]
-            _ckpt_note = ""
+            initial_ckpt_wr = ckpt["win_rate"]
         print(f"Resuming from run {resolved_id[:8]}  "
-              f"cycle={initial_cycle}  parent_wr={latest_ckpt['win_rate']:.1%}  "
+              f"cycle={initial_cycle}  parent_wr={ckpt['win_rate']:.1%}  "
               f"model={resume_model_path}{_ckpt_note}")
         db_tmp.close()
 

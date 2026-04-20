@@ -393,30 +393,17 @@ def main():
             )
             sys.exit(1)
 
-    # Verify stage_policy_ref compatibility against campaign stage policy
+    # Verify stage_policy_ref domain compatibility
+    # NOTE: campaign_stages.policy_json stores per-stage config (name=A/B/C/D),
+    # not the stage policy metadata. We only enforce domain alignment here;
+    # name/version consistency is ensured by policy author at config time.
     spr = policy.get("stage_policy_ref", {})
-    stage_row = get_campaign_stage(conn, campaign["id"], "D")
-    if not stage_row:
-        stage_row = get_campaign_stage(conn, campaign["id"], "C")
-    if stage_row and stage_row.get("policy_json"):
-        try:
-            stage_policy = json.loads(stage_row["policy_json"])
-            stage_name = stage_policy.get("name")
-            stage_version = stage_policy.get("version")
-            if stage_name and spr.get("name") != stage_name:
-                print(
-                    f"Error: policy stage_policy_ref name '{spr.get('name')}' "
-                    f"does not match campaign stage policy name '{stage_name}'"
-                )
-                sys.exit(1)
-            if stage_version and spr.get("version") != stage_version:
-                print(
-                    f"Error: policy stage_policy_ref version '{spr.get('version')}' "
-                    f"does not match campaign stage policy version '{stage_version}'"
-                )
-                sys.exit(1)
-        except json.JSONDecodeError:
-            pass  # malformed policy_json in DB, skip strict check
+    if spr.get("domain") and spr["domain"] != campaign["domain"]:
+        print(
+            f"Error: policy stage_policy_ref domain '{spr['domain']}' "
+            f"does not match campaign domain '{campaign['domain']}'"
+        )
+        sys.exit(1)
 
     parent_ckpt, parent_run_id = _resolve_parent_checkpoint(conn, campaign, args)
 
