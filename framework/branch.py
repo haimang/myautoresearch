@@ -146,9 +146,14 @@ def _build_branch_id(campaign_id: str, parent_run_id: str, reason: str, delta_js
     return f"br-{h}"
 
 
-def _build_child_tag(campaign_name: str, parent_tag: str, reason: str) -> str:
-    """Construct a sweep_tag for the child run."""
-    return f"{campaign_name}_branch_{reason}_{parent_tag}"
+def _build_child_tag(campaign_name: str, parent_tag: str, reason: str, delta_json: str) -> str:
+    """Construct a unique sweep_tag for the child run.
+
+    Includes a short hash of the delta JSON to disambiguate branches
+    with the same parent + reason but different delta values.
+    """
+    delta_hash = hashlib.sha256(delta_json.encode()).hexdigest()[:8]
+    return f"{campaign_name}_branch_{reason}_{delta_hash}_{parent_tag}"
 
 
 def _build_child_cmd(child_params: dict, parent_run_id: str, parent_ckpt_tag: str, tag: str,
@@ -244,7 +249,7 @@ def plan_branches(conn, campaign, policy, parent_ckpt, parent_run_id, args) -> l
             "parent_checkpoint_id": parent_ckpt["id"],
             "child_params": child_params,
             "delta_json": delta_json,
-            "tag": _build_child_tag(campaign["name"], parent_ckpt["tag"], reason),
+            "tag": _build_child_tag(campaign["name"], parent_ckpt["tag"], reason, delta_json),
         })
 
     return plans
@@ -337,9 +342,9 @@ def execute_branches(conn, campaign, policy, plans: list[dict], parent_ckpt: dic
             print(f"  {wr_line}")
         print(f"  完成，耗时 {elapsed:.0f}s")
 
-        # Find the newly created child run by sweep_tag
+        # Find the newly created child run by sweep_tag (most recent first)
         child_row = conn.execute(
-            "SELECT id FROM runs WHERE sweep_tag = ?",
+            "SELECT id FROM runs WHERE sweep_tag = ? ORDER BY started_at DESC LIMIT 1",
             (tag,),
         ).fetchone()
         if child_row:
