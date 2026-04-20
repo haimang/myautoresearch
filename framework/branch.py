@@ -27,10 +27,12 @@ from core.db import (
     find_checkpoint_by_tag,
     get_branch_by_id,
     get_campaign,
+    get_campaign_stage,
     get_campaign_stages,
     get_latest_checkpoint,
     get_search_space,
     init_db,
+    link_run_to_campaign,
     list_branches_for_campaign,
     save_run_branch,
     update_branch_status,
@@ -118,7 +120,7 @@ def _get_parent_params(conn, run_id: str) -> dict:
     row = conn.execute(
         """SELECT num_res_blocks, num_filters, learning_rate,
                    replay_buffer_size, train_steps_per_cycle,
-                   mcts_simulations, eval_level, time_budget
+                   mcts_simulations, eval_level, time_budget, seed
             FROM runs WHERE id = ?""",
         (run_id,),
     ).fetchone()
@@ -130,9 +132,10 @@ def _get_parent_params(conn, run_id: str) -> dict:
         "learning_rate": row["learning_rate"],
         "buffer_size": row["replay_buffer_size"],
         "steps_per_cycle": row["train_steps_per_cycle"],
-        "mcts_sims": row["mcts_simulations"],
+        "mcts_simulations": row["mcts_simulations"],
         "eval_level": row["eval_level"],
         "time_budget": row["time_budget"],
+        "seed": row["seed"],
     }
 
 
@@ -148,22 +151,25 @@ def _build_child_tag(campaign_name: str, parent_tag: str, reason: str) -> str:
     return f"{campaign_name}_branch_{reason}_{parent_tag}"
 
 
-def _build_child_cmd(child_params: dict, parent_run_id: str, tag: str,
+def _build_child_cmd(child_params: dict, parent_run_id: str, parent_ckpt_tag: str, tag: str,
                      args, train_script: str) -> list[str]:
     """Build the train.py command for a child continuation run."""
     cmd = [sys.executable, train_script,
            "--resume", parent_run_id,
+           "--resume-checkpoint-tag", parent_ckpt_tag,
            "--sweep-tag", tag,
            "--time-budget", str(args.time_budget)]
 
-    # Apply delta params
+    # Apply delta params (keys match branch_policy.json allowed_deltas names)
     param_map = {
         "num_blocks": "--num-blocks",
         "num_filters": "--num-filters",
         "learning_rate": "--learning-rate",
         "steps_per_cycle": "--steps-per-cycle",
         "buffer_size": "--buffer-size",
-        "mcts_sims": "--mcts-sims",
+        "mcts_simulations": "--mcts-sims",
+        "eval_level": "--eval-level",
+        "seed": "--seed",
     }
     for key, flag in param_map.items():
         if key in child_params and child_params[key] is not None:
@@ -209,13 +215,24 @@ def plan_branches(conn, campaign, policy, parent_ckpt, parent_run_id, args) -> l
             print(f"Error applying delta for '{reason}': {exc}")
             sys.exit(1)
 
-        # Protocol guard
+        # Protocol guard: check override AND final child_params against parent
         if not reason_preserves_protocol(policy, reason):
             allowed_changes = get_allowed_protocol_changes(policy, reason)
             for key in override:
                 if key in ("eval_level", "eval_opponent") and key not in allowed_changes:
                     print(f"Error: reason '{reason}' not allowed to change '{key}'")
                     sys.exit(1)
+        else:
+            # Reason claims protocol preservation — verify no protocol drift in final params
+            PROTOCOL_FIELDS = ("eval_level", "eval_opponent")
+            for key in PROTOCOL_FIELDS:
+                if key in child_params and key in parent_params:
+                    if child_params[key] != parent_params[key]:
+                        print(
+                            f"Error: reason '{reason}' declares preserves_protocol=true, "
+                            f"but delta would change '{key}' from {parent_params[key]} to {child_params[key]}"
+                        )
+                        sys.exit(1)
 
         delta_json = json.dumps(override if override else _infer_delta(parent_params, child_params), ensure_ascii=False, sort_keys=True)
         branch_id = _build_branch_id(campaign["id"], parent_run_id, reason, delta_json)
@@ -254,7 +271,7 @@ def print_plan(plans: list[dict], parent_tag: str):
     print()
 
 
-def execute_branches(conn, campaign, policy, plans: list[dict], args):
+def execute_branches(conn, campaign, policy, plans: list[dict], parent_ckpt: dict, args):
     """Launch child continuation runs and record them in the branch ledger."""
     print(f"\nExecuting {len(plans)} branches...")
     print("=" * 72)
@@ -287,7 +304,8 @@ def execute_branches(conn, campaign, policy, plans: list[dict], args):
             )
 
         # Build and run child command
-        cmd = _build_child_cmd(child_params, p["parent_run_id"], tag, args, args.train_script)
+        ckpt_tag = parent_ckpt["tag"] if parent_ckpt else ""
+        cmd = _build_child_cmd(child_params, p["parent_run_id"], ckpt_tag, tag, args, args.train_script)
         print(f"\n[{'='*60}")
         print(f"  {tag}")
         print(f"  reason={reason}  delta={p['delta_json']}")
@@ -334,6 +352,17 @@ def execute_branches(conn, campaign, policy, plans: list[dict], args):
                 result_summary_json=json.dumps({"elapsed_s": round(elapsed, 1)}),
             )
             print(f"  Linked child run: {child_run_id[:8]}")
+            # v20.3: also link child run into campaign_runs for unified campaign lineage
+            link_run_to_campaign(
+                conn,
+                campaign_id=campaign["id"],
+                run_id=child_run_id,
+                stage="D",
+                sweep_tag=tag,
+                seed=child_params.get("seed"),
+                axis_values={"branch_reason": reason, "parent_run_id": p["parent_run_id"]},
+                status="linked",
+            )
         else:
             update_branch_status(conn, branch_id=branch_id, status="completed")
 
@@ -363,6 +392,31 @@ def main():
                 f"does not match campaign search space ({space_row['name']} v{space_row['version']})"
             )
             sys.exit(1)
+
+    # Verify stage_policy_ref compatibility against campaign stage policy
+    spr = policy.get("stage_policy_ref", {})
+    stage_row = get_campaign_stage(conn, campaign["id"], "D")
+    if not stage_row:
+        stage_row = get_campaign_stage(conn, campaign["id"], "C")
+    if stage_row and stage_row.get("policy_json"):
+        try:
+            stage_policy = json.loads(stage_row["policy_json"])
+            stage_name = stage_policy.get("name")
+            stage_version = stage_policy.get("version")
+            if stage_name and spr.get("name") != stage_name:
+                print(
+                    f"Error: policy stage_policy_ref name '{spr.get('name')}' "
+                    f"does not match campaign stage policy name '{stage_name}'"
+                )
+                sys.exit(1)
+            if stage_version and spr.get("version") != stage_version:
+                print(
+                    f"Error: policy stage_policy_ref version '{spr.get('version')}' "
+                    f"does not match campaign stage policy version '{stage_version}'"
+                )
+                sys.exit(1)
+        except json.JSONDecodeError:
+            pass  # malformed policy_json in DB, skip strict check
 
     parent_ckpt, parent_run_id = _resolve_parent_checkpoint(conn, campaign, args)
 
@@ -400,7 +454,7 @@ def main():
         print(f"Persisted {len(plans)} planned branches.")
 
     if args.execute:
-        execute_branches(conn, campaign, policy, plans, args)
+        execute_branches(conn, campaign, policy, plans, parent_ckpt, args)
 
     conn.close()
 

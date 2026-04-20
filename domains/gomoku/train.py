@@ -1012,13 +1012,24 @@ def train(args):
             print(f"Error: run '{args.resume}' not found in tracker.db")
             sys.exit(1)
         resolved_id = old_run["id"]
-        latest_ckpt = _tracker.get_latest_checkpoint(db_tmp, resolved_id)
-        if not latest_ckpt:
+
+        # v20.3: support precise checkpoint branching via --resume-checkpoint-tag
+        if getattr(args, "resume_checkpoint_tag", None):
+            ckpt = _tracker.find_checkpoint_by_tag(db_tmp, args.resume_checkpoint_tag)
+            if not ckpt or ckpt["run_id"] != resolved_id:
+                print(f"Error: checkpoint '{args.resume_checkpoint_tag}' not found in run '{resolved_id[:8]}'")
+                sys.exit(1)
+            _ckpt_note = f" [from tag={args.resume_checkpoint_tag}]"
+        else:
+            ckpt = _tracker.get_latest_checkpoint(db_tmp, resolved_id)
+            _ckpt_note = ""
+
+        if not ckpt:
             print(f"Error: no checkpoint found for run '{resolved_id[:8]}'")
             sys.exit(1)
         resumed_from = resolved_id
-        resume_model_path = latest_ckpt["model_path"]
-        initial_cycle = latest_ckpt["cycle"]
+        resume_model_path = ckpt["model_path"]
+        initial_cycle = ckpt["cycle"]
 
         # v15 A1: cross-level resume must reset the checkpoint threshold chain.
         #
@@ -2556,6 +2567,8 @@ def parse_args() -> argparse.Namespace:
                    help="Fraction of games played vs train-opponent (default: 0.2)")
     p.add_argument("--resume", type=str, default=None,
                    help="UUID of a previous run to resume from its last checkpoint")
+    p.add_argument("--resume-checkpoint-tag", type=str, default=None,
+                   help="When --resume is used, resume from this specific checkpoint tag instead of the latest")
     # v15 F2: from-scratch training but start with an opponent's weights.
     # Used by v16's "S2 vs S2 from scratch" path — unlike --resume which
     # inherits cycle count and optimizer state, --initial-opponent only
