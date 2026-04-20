@@ -4,6 +4,7 @@
 import json
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,12 +39,16 @@ def main():
     db_path = DB_PATH
     conn = init_db(str(db_path))
 
+    # Use unique IDs so the script is idempotent / repeatable
+    smoke_id = uuid.uuid4().hex[:8]
+    campaign_name = f"v21-smoke-{smoke_id}"
+
     # 1. Setup campaign with search space
     profile = load_profile(str(PROFILE_PATH))
     space_id = save_search_space(conn, profile)
     campaign = get_or_create_campaign(
         conn,
-        name="v21-smoke",
+        name=campaign_name,
         domain="gomoku",
         train_script="t.py",
         search_space_id=space_id,
@@ -58,7 +63,7 @@ def main():
     ]
 
     for i, (axis, wr) in enumerate(configs):
-        rid = f"run-{i}"
+        rid = f"run-{smoke_id}-{i}"
         candidate_key = json.dumps(axis, sort_keys=True, separators=(",", ":"))
         create_run(conn, rid, {
             "sweep_tag": f"r{i}",
@@ -93,13 +98,13 @@ def main():
 
     conn.commit()
     conn.close()
-    print(f"[1/5] Campaign + {len(configs)} seed runs created in {db_path}")
+    print(f"[1/5] Campaign '{campaign_name}' + {len(configs)} seed runs created in {db_path}")
 
-    # 3. Generate recommendation batch via CLI (dry-run first, then persist)
+    # 3. Generate recommendation batch via CLI
     proc = subprocess.run(
         [sys.executable, str(ANALYZE),
          "--db", str(db_path),
-         "--recommend-next", "v21-smoke",
+         "--recommend-next", campaign_name,
          "--selector-policy", str(SELECTOR_POLICY),
          "--limit", "5"],
         capture_output=True, text=True, cwd=ROOT,
@@ -126,7 +131,7 @@ def main():
     print(f"[3/5] Top recommendation accepted: {top['id'][:24]} (type={top['candidate_type']})")
 
     # 5. Simulate execution: create a run
-    exec_run_id = f"run-exec-{top['id'][:8]}"
+    exec_run_id = f"run-exec-{smoke_id}-{top['id'][:8]}"
     axis_vals = json.loads(top.get("axis_values_json") or "{}")
     if not axis_vals and top.get("candidate_key"):
         try:
@@ -167,7 +172,7 @@ def main():
     proc = subprocess.run(
         [sys.executable, str(ANALYZE),
          "--db", str(db_path),
-         "--recommendation-outcomes", "v21-smoke"],
+         "--recommendation-outcomes", campaign_name],
         capture_output=True, text=True, cwd=ROOT,
     )
     print("\n--- CLI outcome report ---")
