@@ -1,0 +1,60 @@
+{
+  "domain": "gomoku",
+  "name": "cold-start-continuation",
+  "version": "1.0",
+  "description": "Branch policy for Gomoku cold-start continuation. Defines allowed reasons for forking child runs from a parent checkpoint, with parameter deltas and protocol constraints.",
+  "search_space_ref": {
+    "domain": "gomoku",
+    "name": "cold-start-core",
+    "version": "1.0"
+  },
+  "stage_policy_ref": {
+    "domain": "gomoku",
+    "name": "cold-start-promotion",
+    "version": "1.0"
+  },
+  "branch_reasons": {
+    "lr_decay": {
+      "description": "Reduce learning rate and continue training from parent checkpoint.",
+      "allowed_deltas": {
+        "learning_rate": {"type": "multiply", "default_factor": 0.1, "min_factor": 0.01, "max_factor": 0.5}
+      },
+      "preserves_protocol": true,
+      "example": "learning_rate *= 0.1"
+    },
+    "mcts_upshift": {
+      "description": "Increase MCTS search budget for stronger self-play / eval.",
+      "allowed_deltas": {
+        "mcts_simulations": {"type": "add", "default_delta": 200, "min_delta": 50, "max_delta": 1000}
+      },
+      "preserves_protocol": true,
+      "example": "mcts_simulations += 200"
+    },
+    "eval_upgrade": {
+      "description": "Keep training pipeline, but upgrade evaluation benchmark.",
+      "allowed_deltas": {
+        "eval_level": {"type": "add", "default_delta": 1, "min_delta": 1, "max_delta": 2}
+      },
+      "preserves_protocol": false,
+      "allowed_protocol_changes": ["eval_level", "eval_opponent"],
+      "example": "eval_level += 1"
+    },
+    "seed_recheck": {
+      "description": "Re-run from parent checkpoint with a different seed to verify stability.",
+      "allowed_deltas": {
+        "seed": {"type": "set", "default_value": null}
+      },
+      "preserves_protocol": true,
+      "example": "seed = new_value"
+    },
+    "buffer_or_spc_adjust": {
+      "description": "Adjust replay buffer size or steps-per-cycle to change training rhythm.",
+      "allowed_deltas": {
+        "buffer_size": {"type": "multiply", "default_factor": 2.0, "min_factor": 0.5, "max_factor": 4.0},
+        "steps_per_cycle": {"type": "multiply", "default_factor": 1.5, "min_factor": 0.5, "max_factor": 3.0}
+      },
+      "preserves_protocol": true,
+      "example": "buffer_size *= 2, steps_per_cycle *= 1.5"
+    }
+  }
+}
