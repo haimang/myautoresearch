@@ -418,6 +418,58 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_run_branches_child "
                  "ON run_branches(child_run_id)")
 
+    # v21: recommendation ledger
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recommendation_batches (
+            id                  TEXT PRIMARY KEY,
+            campaign_id         TEXT NOT NULL REFERENCES campaigns(id),
+            selector_name       TEXT NOT NULL,
+            selector_version    TEXT NOT NULL,
+            selector_hash       TEXT NOT NULL,
+            frontier_snapshot_id TEXT,
+            created_at          TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rec_batches_campaign "
+                 "ON recommendation_batches(campaign_id)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recommendations (
+            id                  TEXT PRIMARY KEY,
+            batch_id            TEXT NOT NULL REFERENCES recommendation_batches(id),
+            candidate_type      TEXT NOT NULL,
+            candidate_key       TEXT,
+            rank                INTEGER NOT NULL,
+            score_total         REAL NOT NULL,
+            score_breakdown_json TEXT NOT NULL,
+            rationale_json      TEXT NOT NULL,
+            axis_values_json    TEXT,
+            branch_reason       TEXT,
+            delta_json          TEXT,
+            status              TEXT NOT NULL DEFAULT 'planned',
+            created_at          TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_batch "
+                 "ON recommendations(batch_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_campaign "
+                 "ON recommendations(batch_id, candidate_type)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            recommendation_id   TEXT NOT NULL REFERENCES recommendations(id),
+            run_id              TEXT REFERENCES runs(id),
+            branch_id           TEXT REFERENCES run_branches(id),
+            observed_metrics_json TEXT NOT NULL,
+            frontier_delta_json TEXT,
+            outcome_label       TEXT NOT NULL,
+            evaluated_at        TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rec_outcomes_rec "
+                 "ON recommendation_outcomes(recommendation_id)")
+
     conn.commit()
     return conn
 
@@ -1432,5 +1484,167 @@ def get_branch_by_id(conn: sqlite3.Connection,
          LEFT JOIN runs c ON c.id = rb.child_run_id
          WHERE rb.id = ?""",
         (branch_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# v21: recommendation ledger helpers
+# ---------------------------------------------------------------------------
+
+def save_recommendation_batch(
+    conn: sqlite3.Connection, *,
+    batch_id: str,
+    campaign_id: str,
+    selector_name: str,
+    selector_version: str,
+    selector_hash: str,
+    frontier_snapshot_id: str | None = None,
+) -> None:
+    """Persist a recommendation batch."""
+    conn.execute(
+        """INSERT INTO recommendation_batches
+           (id, campaign_id, selector_name, selector_version, selector_hash, frontier_snapshot_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               campaign_id = excluded.campaign_id,
+               selector_name = excluded.selector_name,
+               selector_version = excluded.selector_version,
+               selector_hash = excluded.selector_hash,
+               frontier_snapshot_id = excluded.frontier_snapshot_id""",
+        (batch_id, campaign_id, selector_name, selector_version, selector_hash,
+         frontier_snapshot_id, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def save_recommendation(
+    conn: sqlite3.Connection, *,
+    recommendation_id: str,
+    batch_id: str,
+    candidate_type: str,
+    candidate_key: str | None,
+    rank: int,
+    score_total: float,
+    score_breakdown_json: str,
+    rationale_json: str,
+    axis_values_json: str | None = None,
+    branch_reason: str | None = None,
+    delta_json: str | None = None,
+    status: str = "planned",
+) -> None:
+    """Persist a single recommendation."""
+    conn.execute(
+        """INSERT INTO recommendations
+           (id, batch_id, candidate_type, candidate_key, rank, score_total,
+            score_breakdown_json, rationale_json, axis_values_json,
+            branch_reason, delta_json, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               batch_id = excluded.batch_id,
+               candidate_type = excluded.candidate_type,
+               candidate_key = excluded.candidate_key,
+               rank = excluded.rank,
+               score_total = excluded.score_total,
+               score_breakdown_json = excluded.score_breakdown_json,
+               rationale_json = excluded.rationale_json,
+               axis_values_json = excluded.axis_values_json,
+               branch_reason = excluded.branch_reason,
+               delta_json = excluded.delta_json,
+               status = excluded.status""",
+        (recommendation_id, batch_id, candidate_type, candidate_key, rank,
+         score_total, score_breakdown_json, rationale_json, axis_values_json,
+         branch_reason, delta_json, status, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def update_recommendation_status(
+    conn: sqlite3.Connection, *,
+    recommendation_id: str,
+    status: str,
+) -> None:
+    """Update recommendation status (planned / accepted / executed / rejected / invalidated)."""
+    conn.execute(
+        "UPDATE recommendations SET status = ? WHERE id = ?",
+        (status, recommendation_id),
+    )
+    conn.commit()
+
+
+def save_recommendation_outcome(
+    conn: sqlite3.Connection, *,
+    recommendation_id: str,
+    run_id: str | None = None,
+    branch_id: str | None = None,
+    observed_metrics_json: str = "{}",
+    frontier_delta_json: str | None = None,
+    outcome_label: str = "unknown",
+) -> None:
+    """Persist an outcome record for a recommendation."""
+    conn.execute(
+        """INSERT INTO recommendation_outcomes
+           (recommendation_id, run_id, branch_id, observed_metrics_json,
+            frontier_delta_json, outcome_label, evaluated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (recommendation_id, run_id, branch_id, observed_metrics_json,
+         frontier_delta_json, outcome_label, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def list_recommendation_batches(conn: sqlite3.Connection,
+                                 campaign_id: str) -> list[dict]:
+    """Return all recommendation batches for a campaign, newest first."""
+    rows = conn.execute(
+        "SELECT * FROM recommendation_batches WHERE campaign_id = ? ORDER BY created_at DESC",
+        (campaign_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_recommendations_for_batch(conn: sqlite3.Connection,
+                                    batch_id: str) -> list[dict]:
+    """Return all recommendations in a batch, ordered by rank."""
+    rows = conn.execute(
+        """SELECT r.*, b.campaign_id
+           FROM recommendations r
+           JOIN recommendation_batches b ON b.id = r.batch_id
+           WHERE r.batch_id = ?
+           ORDER BY r.rank""",
+        (batch_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_recommendation_outcomes(conn: sqlite3.Connection,
+                                  recommendation_id: str) -> list[dict]:
+    """Return all outcome records for a recommendation."""
+    rows = conn.execute(
+        "SELECT * FROM recommendation_outcomes WHERE recommendation_id = ? ORDER BY evaluated_at",
+        (recommendation_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_latest_recommendation_batch(conn: sqlite3.Connection,
+                                     campaign_id: str) -> dict | None:
+    """Return the most recent batch for a campaign, or None."""
+    row = conn.execute(
+        "SELECT * FROM recommendation_batches WHERE campaign_id = ? ORDER BY created_at DESC LIMIT 1",
+        (campaign_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_recommendation_by_id(conn: sqlite3.Connection,
+                              recommendation_id: str) -> dict | None:
+    """Return a single recommendation by id, or None."""
+    row = conn.execute(
+        """SELECT r.*, b.campaign_id
+           FROM recommendations r
+           JOIN recommendation_batches b ON b.id = r.batch_id
+           WHERE r.id = ?""",
+        (recommendation_id,),
     ).fetchone()
     return dict(row) if row else None
