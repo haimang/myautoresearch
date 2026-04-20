@@ -287,17 +287,23 @@ def recommend_for_campaign(conn, campaign, policy,
     Each dict has: candidate_type, candidate_key, score_total, score_breakdown,
     rationale, axis_values, and optional parent_run_id / branch_reason / delta_json.
     """
-    # Filter out candidate_keys already accepted or executed in prior batches
-    accepted_keys = set()
+    # Filter out recommendations already accepted or executed in prior batches.
+    # Identity is defined by (candidate_type, candidate_key, branch_reason, delta_json)
+    # to avoid cross-type suppression (e.g. seed_recheck vs continue_branch on same key).
     rows = conn.execute(
-        """SELECT DISTINCT r.candidate_key
+        """SELECT DISTINCT r.candidate_type, r.candidate_key, r.branch_reason, r.delta_json
            FROM recommendations r
            JOIN recommendation_batches b ON b.id = r.batch_id
-           WHERE b.campaign_id = ? AND r.status IN ('accepted','executed')
-             AND r.candidate_key IS NOT NULL""",
+           WHERE b.campaign_id = ? AND r.status IN ('accepted','executed')""",
         (campaign["id"],),
     ).fetchall()
-    accepted_keys = {row["candidate_key"] for row in rows}
+    accepted_identities = {
+        (r["candidate_type"], r["candidate_key"], r["branch_reason"], r["delta_json"])
+        for r in rows
+    }
+
+    def _identity(c: dict) -> tuple:
+        return (c["candidate_type"], c.get("candidate_key"), c.get("branch_reason"), c.get("delta_json"))
 
     candidates = []
 
@@ -305,12 +311,12 @@ def recommend_for_campaign(conn, campaign, policy,
         point_cands = generate_point_candidates(conn, campaign, policy)
         if candidate_type:
             point_cands = [c for c in point_cands if c["candidate_type"] == candidate_type]
-        candidates.extend(c for c in point_cands if c.get("candidate_key") not in accepted_keys)
+        candidates.extend(c for c in point_cands if _identity(c) not in accepted_identities)
     if candidate_type is None or candidate_type in ("continue_branch", "eval_upgrade"):
         branch_cands = generate_branch_candidates(conn, campaign, policy)
         if candidate_type:
             branch_cands = [c for c in branch_cands if c["candidate_type"] == candidate_type]
-        candidates.extend(c for c in branch_cands if c.get("candidate_key") not in accepted_keys)
+        candidates.extend(c for c in branch_cands if _identity(c) not in accepted_identities)
 
     if not candidates:
         return []

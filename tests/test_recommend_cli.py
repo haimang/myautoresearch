@@ -249,9 +249,11 @@ class TestRecommendCLI(unittest.TestCase):
         )
         conn = init_db(self.db_path)
         all_statuses = conn.execute(
-            """SELECT status, batch_id FROM recommendations
-               WHERE batch_id IN (SELECT id FROM recommendation_batches WHERE campaign_id = ?)
-               ORDER BY batch_id""",
+            """SELECT r.status, r.batch_id, b.created_at
+               FROM recommendations r
+               JOIN recommendation_batches b ON b.id = r.batch_id
+               WHERE b.campaign_id = ?
+               ORDER BY b.created_at""",
             (self.campaign["id"],),
         ).fetchall()
         conn.close()
@@ -259,7 +261,7 @@ class TestRecommendCLI(unittest.TestCase):
         statuses_by_batch = {}
         for s in all_statuses:
             statuses_by_batch.setdefault(s["batch_id"], []).append(s["status"])
-        # First batch should have invalidated statuses
+        # First batch (oldest by created_at) should have invalidated statuses
         first_batch = list(statuses_by_batch.keys())[0]
         self.assertIn("invalidated", statuses_by_batch[first_batch])
 

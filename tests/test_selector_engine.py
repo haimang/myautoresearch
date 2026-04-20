@@ -16,6 +16,9 @@ from core.db import (
     finish_run,
     get_or_create_campaign,
     init_db,
+    save_checkpoint,
+    save_recommendation,
+    save_recommendation_batch,
     save_campaign_stage,
     save_search_space,
 )
@@ -183,6 +186,94 @@ class TestSelectorEngine(unittest.TestCase):
         recs = recommend_for_campaign(conn, empty_campaign, self.policy)
         conn.close()
         self.assertEqual(recs, [])
+
+    def test_recommend_for_campaign_dedupes_by_full_identity(self):
+        conn = init_db(self.db_path)
+        campaign = get_or_create_campaign(
+            conn,
+            name="sel-dedupe-test",
+            domain="gomoku",
+            train_script="t.py",
+            search_space_id=self.space_id,
+            protocol={"eval_level": 0},
+        )
+        axis = {"lr": 0.005, "blocks": 10, "filters": 128}
+        candidate_key = json.dumps(axis, sort_keys=True, separators=(",", ":"))
+        run_id = "run-dedupe"
+        create_run(conn, run_id, {
+            "sweep_tag": "dedupe",
+            "eval_level": 0,
+            "learning_rate": axis["lr"],
+            "num_res_blocks": axis["blocks"],
+            "num_filters": axis["filters"],
+        }, is_benchmark=True)
+        finish_run(conn, run_id, {
+            "status": "completed",
+            "final_win_rate": 0.88,
+            "wall_time_s": 120.0,
+            "num_params": 200000,
+            "total_games": 500,
+        })
+        conn.execute(
+            """INSERT INTO campaign_runs
+               (campaign_id, run_id, stage, sweep_tag, seed, axis_values_json, status, created_at, candidate_key)
+               VALUES (?, ?, 'C', 'dedupe', 1, ?, 'linked', '2024-01-01', ?)""",
+            (campaign["id"], run_id, candidate_key, candidate_key),
+        )
+        save_checkpoint(conn, run_id, {
+            "tag": "final",
+            "cycle": 10,
+            "step": 100,
+            "loss": 0.5,
+            "win_rate": 0.88,
+            "eval_level": 0,
+            "eval_games": 100,
+            "model_path": "/tmp/model.npz",
+        })
+        conn.commit()
+
+        recs_before = recommend_for_campaign(conn, campaign, self.policy, limit=10)
+        accepted = next(r for r in recs_before if r["candidate_type"] == "seed_recheck")
+        save_recommendation_batch(
+            conn,
+            batch_id="batch-dedupe",
+            campaign_id=campaign["id"],
+            selector_name=self.policy["name"],
+            selector_version=self.policy["version"],
+            selector_hash="test-hash",
+        )
+        save_recommendation(
+            conn,
+            recommendation_id="rec-dedupe-seed",
+            batch_id="batch-dedupe",
+            candidate_type=accepted["candidate_type"],
+            candidate_key=accepted["candidate_key"],
+            rank=1,
+            score_total=accepted["score_total"],
+            score_breakdown_json="{}",
+            rationale_json="{}",
+            axis_values_json=json.dumps(accepted.get("axis_values", {}), sort_keys=True),
+            branch_reason=accepted.get("branch_reason"),
+            delta_json=accepted.get("delta_json"),
+            status="accepted",
+        )
+        conn.commit()
+
+        recs_after = recommend_for_campaign(conn, campaign, self.policy, limit=10)
+        conn.close()
+
+        self.assertNotIn(
+            ("seed_recheck", None),
+            {(r["candidate_type"], r.get("branch_reason")) for r in recs_after},
+        )
+        self.assertIn(
+            ("continue_branch", "lr_decay"),
+            {(r["candidate_type"], r.get("branch_reason")) for r in recs_after},
+        )
+        self.assertIn(
+            ("continue_branch", "seed_recheck"),
+            {(r["candidate_type"], r.get("branch_reason")) for r in recs_after},
+        )
 
 
 if __name__ == "__main__":
