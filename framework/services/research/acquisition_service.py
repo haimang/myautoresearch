@@ -1,13 +1,4 @@
-"""
-framework/acquisition.py — v21.1 candidate-pool acquisition reranker.
-
-在 selector 生成的 point/branch candidate pool 上叠加轻量的、可迁移的多目标 acquisition 层。
-这里刻意避免重型 raw-space BO；目标是：
-
-1. 复用已有 search/stage/branch discipline
-2. 对合法候选池做 portable reranking
-3. 为 replay / cross-domain handoff 提供稳定证据
-"""
+"""Candidate-pool acquisition reranking and replay helpers."""
 
 from __future__ import annotations
 
@@ -39,14 +30,8 @@ def _candidate_frontier_bonus(candidate: dict, signals: dict, weight: float) -> 
     return 0.0
 
 
-def rerank_candidates(
-    candidates: list[dict],
-    policy: dict,
-) -> tuple[list[dict], dict]:
-    """Apply a lightweight acquisition reranker to selector-scored candidates.
-
-    Returns (reranked_candidates, surrogate_summary).
-    """
+def rerank_candidates(candidates: list[dict], policy: dict) -> tuple[list[dict], dict]:
+    """Apply a lightweight acquisition reranker to selector-scored candidates."""
     if not candidates:
         summary = {
             "candidate_count": 0,
@@ -100,9 +85,7 @@ def rerank_candidates(
         }
 
         rationale = dict(candidate.get("rationale", {}))
-        rationale["acquisition_summary"] = (
-            f"{policy['name']} scored {candidate['candidate_type']} at {acquisition_score:.3f}"
-        )
+        rationale["acquisition_summary"] = f"{policy['name']} scored {candidate['candidate_type']} at {acquisition_score:.3f}"
         rationale["posterior_sigma"] = posterior_sigma
 
         reranked.append({
@@ -131,22 +114,14 @@ def rerank_candidates(
             "mean_wall_s": "float",
             "candidate_type_bonus": "float",
         },
-        "top_candidate_types": [r["candidate_type"] for r in reranked[:3]],
-        "top_scores": [r["acquisition_score"] for r in reranked[:3]],
-        "policy": {
-            "name": policy["name"],
-            "version": policy["version"],
-        },
+        "top_candidate_types": [row["candidate_type"] for row in reranked[:3]],
+        "top_scores": [row["acquisition_score"] for row in reranked[:3]],
+        "policy": {"name": policy["name"], "version": policy["version"]},
     }
     return reranked, summary
 
 
-def replay_recommendation_history(
-    rows: list[dict],
-    *,
-    top_k: int,
-    positive_outcomes: list[str],
-) -> dict:
+def replay_recommendation_history(rows: list[dict], *, top_k: int, positive_outcomes: list[str]) -> dict:
     """Compare selector vs acquisition ranking on historical labeled recommendations."""
     positive = set(positive_outcomes)
     grouped: dict[str, list[dict]] = {}
@@ -158,31 +133,31 @@ def replay_recommendation_history(
     acquisition_hits = 0
 
     for batch_rows in grouped.values():
-        labeled = [r for r in batch_rows if r.get("outcome_label")]
+        labeled = [row for row in batch_rows if row.get("outcome_label")]
         if not labeled:
             continue
         evaluated_batches += 1
 
         selector_ranked = sorted(
             batch_rows,
-            key=lambda r: (
-                float(r.get("selector_score_total") if r.get("selector_score_total") is not None else r.get("score_total", 0.0)),
-                -int(r.get("rank") or 0),
+            key=lambda row: (
+                float(row.get("selector_score_total") if row.get("selector_score_total") is not None else row.get("score_total", 0.0)),
+                -int(row.get("rank") or 0),
             ),
             reverse=True,
         )
         acquisition_ranked = sorted(
             batch_rows,
-            key=lambda r: (
-                float(r.get("acquisition_score") if r.get("acquisition_score") is not None else r.get("score_total", 0.0)),
-                -int(r.get("rank") or 0),
+            key=lambda row: (
+                float(row.get("acquisition_score") if row.get("acquisition_score") is not None else row.get("score_total", 0.0)),
+                -int(row.get("rank") or 0),
             ),
             reverse=True,
         )
 
-        if any((row.get("outcome_label") in positive) for row in selector_ranked[:top_k]):
+        if any(row.get("outcome_label") in positive for row in selector_ranked[:top_k]):
             selector_hits += 1
-        if any((row.get("outcome_label") in positive) for row in acquisition_ranked[:top_k]):
+        if any(row.get("outcome_label") in positive for row in acquisition_ranked[:top_k]):
             acquisition_hits += 1
 
     def _rate(hits: int) -> float:
@@ -200,13 +175,10 @@ def replay_recommendation_history(
     }
 
 
-def snapshot_payload(policy: dict, summary: dict) -> dict:
+def snapshot_payload(policy: dict, summary: dict) -> dict[str, Any]:
     """Build a compact persisted payload for surrogate_snapshots.summary_json."""
     return {
-        "policy": {
-            "name": policy["name"],
-            "version": policy["version"],
-        },
+        "policy": {"name": policy["name"], "version": policy["version"]},
         "summary": summary,
         "objectives": policy["objectives"],
     }
