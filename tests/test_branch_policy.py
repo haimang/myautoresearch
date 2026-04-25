@@ -7,10 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from branch_policy import (
+from framework.policies.branch_policy import (
     apply_delta,
     describe_branch_policy,
     get_reason_config,

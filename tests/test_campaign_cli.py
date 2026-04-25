@@ -6,15 +6,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import create_run, finish_run, get_or_create_campaign, init_db, link_run_to_campaign, save_search_space
-from search_space import load_profile
+from framework.core.db import create_run, finish_run, get_or_create_campaign, init_db, link_run_to_campaign, save_search_space
+from framework.profiles.search_space import load_profile
 
 
-SWEEP = ROOT / "framework" / "sweep.py"
-ANALYZE = ROOT / "framework" / "analyze.py"
+INDEX = ROOT / "framework" / "index.py"
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
 
@@ -104,7 +103,7 @@ class TestCampaignCLI(unittest.TestCase):
 
     def test_sweep_dry_run_prints_profile_and_campaign(self):
         proc = self._run(
-            str(SWEEP),
+            str(INDEX), "sweep",
             "--db", self.db_path,
             "--train-script", "domains/gomoku/train.py",
             "--campaign", "gomoku-smoke",
@@ -123,7 +122,7 @@ class TestCampaignCLI(unittest.TestCase):
     def test_same_protocol_campaign_can_reuse_name(self):
         self._create_campaign_with_runs()
         proc = self._run(
-            str(SWEEP),
+            str(INDEX), "sweep",
             "--db", self.db_path,
             "--train-script", "domains/gomoku/train.py",
             "--campaign", "gomoku-smoke",
@@ -140,7 +139,7 @@ class TestCampaignCLI(unittest.TestCase):
     def test_different_protocol_campaign_is_rejected(self):
         self._create_campaign_with_runs()
         proc = self._run(
-            str(SWEEP),
+            str(INDEX), "sweep",
             "--db", self.db_path,
             "--train-script", "domains/gomoku/train.py",
             "--campaign", "gomoku-smoke",
@@ -157,13 +156,13 @@ class TestCampaignCLI(unittest.TestCase):
 
     def test_list_campaigns_outputs_campaign_row(self):
         self._create_campaign_with_runs()
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--list-campaigns")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--list-campaigns")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("gomoku-smoke", proc.stdout)
 
     def test_campaign_summary_outputs_protocol_and_run_count(self):
         self._create_campaign_with_runs()
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--campaign-summary", "gomoku-smoke")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--campaign-summary", "gomoku-smoke")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Campaign Summary: gomoku-smoke", proc.stdout)
         self.assertIn("Runs:          1", proc.stdout)
@@ -172,19 +171,19 @@ class TestCampaignCLI(unittest.TestCase):
     def test_pareto_campaign_filters_outside_runs(self):
         self._create_campaign_with_runs()
         self._create_run("run-outside", "outside_sd42", 0.99, eval_level=0)
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--pareto", "--campaign", "gomoku-smoke")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--pareto", "--campaign", "gomoku-smoke")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("run-a", proc.stdout)
         self.assertNotIn("run-outsid", proc.stdout)
 
     def test_pareto_campaign_rejects_protocol_drift_by_default(self):
         self._create_campaign_with_runs(include_drift=True)
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--pareto", "--campaign", "gomoku-smoke")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--pareto", "--campaign", "gomoku-smoke")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("refusing Pareto output", proc.stdout)
 
     def test_campaign_summary_missing_campaign_is_friendly(self):
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--campaign-summary", "missing-campaign")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--campaign-summary", "missing-campaign")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("Campaign not found", proc.stdout)
 

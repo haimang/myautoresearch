@@ -7,10 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     finish_run,
     get_or_create_campaign,
@@ -18,9 +18,9 @@ from core.db import (
     save_run_branch,
     save_search_space,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
-ANALYZE = ROOT / "framework" / "analyze.py"
+INDEX = ROOT / "framework" / "index.py"
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
 
@@ -90,21 +90,21 @@ class TestTrajectoryReport(unittest.TestCase):
         )
 
     def test_branch_tree_shows_parent_child(self):
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--branch-tree", "traj-test")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--branch-tree", "traj-test")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Branch Tree: traj-test", proc.stdout)
         self.assertIn("parent", proc.stdout)
         self.assertIn("lr_decay", proc.stdout)
 
     def test_trajectory_report_shows_reason_and_delta(self):
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--trajectory-report", "traj-test")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--trajectory-report", "traj-test")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Trajectory Report: traj-test", proc.stdout)
         self.assertIn("lr_decay", proc.stdout)
         self.assertIn("learning_rate", proc.stdout)
 
     def test_compare_parent_child_shows_metrics(self):
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--compare-parent-child", "br-traj-1")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--compare-parent-child", "br-traj-1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Parent-Child Compare", proc.stdout)
         self.assertIn("WR", proc.stdout)
@@ -118,16 +118,16 @@ class TestTrajectoryReport(unittest.TestCase):
             search_space_id=self.space_id, protocol={},
         )
         conn.close()
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--branch-tree", "empty-traj")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--branch-tree", "empty-traj")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("No branches recorded", proc.stdout)
 
     def test_trajectory_report_missing_campaign_friendly(self):
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--trajectory-report", "nonexistent")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--trajectory-report", "nonexistent")
         self.assertNotEqual(proc.returncode, 0)
 
     def test_compare_parent_child_missing_branch_friendly(self):
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--compare-parent-child", "br-missing")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--compare-parent-child", "br-missing")
         self.assertEqual(proc.returncode, 0)  # analyze prints friendly msg, doesn't crash
         self.assertIn("not found", proc.stdout.lower())
 
@@ -159,7 +159,7 @@ class TestTrajectoryReport(unittest.TestCase):
         )
         conn.commit()
         conn.close()
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--branch-tree", "traj-test")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--branch-tree", "traj-test")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("mcts_upshift", proc.stdout)
         self.assertIn("child2", proc.stdout)
@@ -192,7 +192,7 @@ class TestTrajectoryReport(unittest.TestCase):
         )
         conn.commit()
         conn.close()
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--trajectory-report", "traj-test")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--trajectory-report", "traj-test")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("mcts_upshift", proc.stdout)
         # Should show ΔWR for both children

@@ -8,10 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from stage_policy import (
+from framework.policies.stage_policy import (
     aggregate_stage_metrics,
     describe_stage_policy,
     get_next_stage,
@@ -66,7 +66,7 @@ class TestValidateMetricWhitelist(unittest.TestCase):
             )
 
     def test_aggregate_stage_metrics_rejects_bad_col(self):
-        from core.db import init_db
+        from framework.core.db import init_db
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
         try:

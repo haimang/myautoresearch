@@ -9,10 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import create_run, finish_run, init_db, save_run_metrics
+from framework.core.db import create_run, finish_run, init_db, save_run_metrics
 
 
 class TestRunMetricsPareto(unittest.TestCase):
@@ -43,7 +43,7 @@ class TestRunMetricsPareto(unittest.TestCase):
             proc = subprocess.run(
                 [
                     sys.executable,
-                    str(ROOT / "framework" / "analyze.py"),
+                    str(ROOT / "framework" / "index.py"), "analyze",
                     "--db", db_path,
                     "--pareto",
                     "--metric-source", "run_metrics",

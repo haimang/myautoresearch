@@ -8,10 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     finish_run,
     get_or_create_campaign,
@@ -22,8 +22,8 @@ from core.db import (
     save_campaign_stage,
     save_search_space,
 )
-from search_space import load_profile
-from selector import (
+from framework.profiles.search_space import load_profile
+from framework.services.research.selector_service import (
     generate_point_candidates,
     generate_branch_candidates,
     recommend_for_campaign,
@@ -31,7 +31,7 @@ from selector import (
     _is_dominated,
     build_recommendation_id,
 )
-from selector_policy import load_selector_policy
+from framework.policies.selector_policy import load_selector_policy
 
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 SELECTOR_POLICY_PATH = ROOT / "domains" / "gomoku" / "selector_policy.json"
@@ -336,7 +336,7 @@ class TestNewPointBoundsAndAxisValues(unittest.TestCase):
 
     def test_stage_d_axis_values_contain_hyperparams(self):
         """T-6: campaign_runs for Stage D must contain actual hyperparams, not branch metadata."""
-        from core.db import link_run_to_campaign_v20
+        from framework.core.db import link_run_to_campaign_v20
 
         # Simulate what execute_branches now does: store child hyperparam axis_values
         child_params = {

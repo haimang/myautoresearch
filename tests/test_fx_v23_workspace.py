@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SWEEP = ROOT / "framework" / "sweep.py"
+INDEX = ROOT / "framework" / "index.py"
 BO = ROOT / "domains" / "fx_spot" / "bayesian_refine.py"
 
 
@@ -18,7 +18,7 @@ class TestFxV23Workspace(unittest.TestCase):
             proc = subprocess.run(
                 [
                     sys.executable,
-                    str(SWEEP),
+                    str(INDEX), "sweep",
                     "--train-script", str(ROOT / "domains" / "fx_spot" / "train.py"),
                     "--search-space", str(ROOT / "domains" / "fx_spot" / "search_space.json"),
                     "--objective-profile", str(ROOT / "domains" / "fx_spot" / "objective_profile.json"),

@@ -5,10 +5,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     find_run_by_sweep_tag,
     get_campaign,
@@ -17,7 +17,7 @@ from core.db import (
     link_run_to_campaign,
     save_search_space,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
 
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"

@@ -9,10 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     finish_run,
     get_or_create_campaign,
@@ -22,9 +22,9 @@ from core.db import (
     save_recommendation_outcome,
     save_search_space,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
-ANALYZE = ROOT / "framework" / "analyze.py"
+INDEX = ROOT / "framework" / "index.py"
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
 
@@ -106,7 +106,7 @@ class TestRecommendationReport(unittest.TestCase):
 
     def test_recommendation_log_shows_top_ranked(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-log", "rec-report-test",
         )
@@ -117,7 +117,7 @@ class TestRecommendationReport(unittest.TestCase):
 
     def test_recommendation_outcomes_shows_metrics(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-outcomes", "rec-report-test",
         )
@@ -127,7 +127,7 @@ class TestRecommendationReport(unittest.TestCase):
 
     def test_recommendation_log_missing_campaign_friendly(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-log", "nonexistent",
         )
@@ -136,7 +136,7 @@ class TestRecommendationReport(unittest.TestCase):
 
     def test_recommendation_outcomes_missing_campaign_friendly(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-outcomes", "nonexistent",
         )
@@ -162,7 +162,7 @@ class TestRecommendationReport(unittest.TestCase):
         conn.commit()
         conn.close()
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-log", "rec-report-test",
         )
@@ -171,7 +171,7 @@ class TestRecommendationReport(unittest.TestCase):
 
     def test_recommendation_log_json_has_batch_struct(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-log", "rec-report-test",
             "--format", "json",
@@ -184,7 +184,7 @@ class TestRecommendationReport(unittest.TestCase):
 
     def test_recommendation_outcomes_json_has_outcomes(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-outcomes", "rec-report-test",
             "--format", "json",
@@ -196,7 +196,7 @@ class TestRecommendationReport(unittest.TestCase):
 
     def test_recommendation_log_shows_status_counts(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-log", "rec-report-test",
         )

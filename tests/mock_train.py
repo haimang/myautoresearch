@@ -7,13 +7,12 @@ import sys
 import tempfile
 import uuid
 
-# Find framework
+# Find project root
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FRAMEWORK = os.path.join(ROOT, "framework")
-if FRAMEWORK not in sys.path:
-    sys.path.insert(0, FRAMEWORK)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-from core.db import create_run, finish_run, init_db
+from framework.core.db import create_run, finish_run, init_db
 
 
 def parse_args():

@@ -9,15 +9,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 FX_SPOT = ROOT / "domains" / "fx_spot"
 if str(FX_SPOT) not in sys.path:
     sys.path.insert(0, str(FX_SPOT))
 
-from core.db import get_or_create_campaign, init_db, save_objective_profile, save_search_space
-from objective_profile import load_objective_profile
-from search_space import load_profile
+from framework.core.db import get_or_create_campaign, init_db, save_objective_profile, save_search_space
+from framework.profiles.objective_profile import load_objective_profile
+from framework.profiles.search_space import load_profile
 
 
 class TestFxSpotDomain(unittest.TestCase):

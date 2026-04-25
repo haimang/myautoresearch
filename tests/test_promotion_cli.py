@@ -9,10 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     finish_run,
     get_or_create_campaign,
@@ -22,9 +22,9 @@ from core.db import (
     save_promotion_decision,
     save_search_space,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
-ANALYZE = ROOT / "framework" / "analyze.py"
+INDEX = ROOT / "framework" / "index.py"
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
 
@@ -138,7 +138,7 @@ class TestPromotionCLI(unittest.TestCase):
 
     def test_stage_summary_shows_stages(self):
         self._create_campaign_with_stages()
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--stage-summary", "gomoku-stage")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--stage-summary", "gomoku-stage")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Stage Summary: gomoku-stage", proc.stdout)
         self.assertIn("Stage A:", proc.stdout)
@@ -148,14 +148,14 @@ class TestPromotionCLI(unittest.TestCase):
 
     def test_promotion_log_shows_decisions(self):
         self._create_campaign_with_stages()
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--promotion-log", "gomoku-stage")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--promotion-log", "gomoku-stage")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Promotion Log: gomoku-stage", proc.stdout)
         self.assertIn("promote", proc.stdout)
         self.assertIn("top-1 in stage A", proc.stdout)
 
     def test_stage_summary_missing_campaign_is_friendly(self):
-        proc = self._run(str(ANALYZE), "--db", self.db_path, "--stage-summary", "nonexistent")
+        proc = self._run(str(INDEX), "analyze", "--db", self.db_path, "--stage-summary", "nonexistent")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("not found", proc.stdout.lower())
 
@@ -188,7 +188,7 @@ class TestPromoteCLI(unittest.TestCase):
                     {"name": "D", "time_budget": 1800, "seed_count": 3, "promote_top_k": 0, "metric": "win_rate", "min_runs": 1},
                 ]
             }, f)
-        self.promote = ROOT / "framework" / "promote.py"
+        self.promote = ROOT / "framework" / "index.py"
 
     def tearDown(self):
         self.conn.close()
@@ -261,7 +261,7 @@ class TestPromoteCLI(unittest.TestCase):
     def test_promote_plan_outputs_decisions(self):
         self._create_campaign_with_runs()
         proc = self._run(
-            str(self.promote),
+            str(self.promote), "promote",
             "--db", self.db_path,
             "--campaign", "promote-test",
             "--stage-policy", self.policy_path,
@@ -291,7 +291,7 @@ class TestPromoteCLI(unittest.TestCase):
                 ]
             }, f)
         proc = self._run(
-            str(self.promote),
+            str(self.promote), "promote",
             "--db", self.db_path,
             "--campaign", "promote-test",
             "--stage-policy", bad_policy,
@@ -319,7 +319,7 @@ class TestPromoteCLI(unittest.TestCase):
                 ]
             }, f)
         proc = self._run(
-            str(self.promote),
+            str(self.promote), "promote",
             "--db", self.db_path,
             "--campaign", "promote-test",
             "--stage-policy", bad_policy,
@@ -333,7 +333,7 @@ class TestPromoteCLI(unittest.TestCase):
     def test_promote_execute_stage_d_blocked(self):
         self._create_campaign_with_runs()
         proc = self._run(
-            str(self.promote),
+            str(self.promote), "promote",
             "--db", self.db_path,
             "--campaign", "promote-test",
             "--stage-policy", self.policy_path,

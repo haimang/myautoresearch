@@ -9,10 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     get_or_create_campaign,
     init_db,
     save_recommendation,
@@ -21,9 +21,9 @@ from core.db import (
     save_search_space,
     save_surrogate_snapshot,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
-ANALYZE = ROOT / "framework" / "analyze.py"
+INDEX = ROOT / "framework" / "index.py"
 REPLAY = ROOT / "scripts" / "v21_1_replay_benchmark.py"
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
@@ -129,7 +129,7 @@ class TestAcquisitionReport(unittest.TestCase):
 
     def test_acquisition_summary_cli(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--acquisition-summary", "acq-report-test",
         )

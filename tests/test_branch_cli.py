@@ -9,10 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     finish_run,
     get_branch_by_id,
@@ -21,9 +21,9 @@ from core.db import (
     save_campaign_stage,
     save_search_space,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
-BRANCH = ROOT / "framework" / "branch.py"
+INDEX = ROOT / "framework" / "index.py"
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
 
@@ -125,7 +125,7 @@ class TestBranchCLI(unittest.TestCase):
 
     def test_branch_plan_dry_run_shows_branches(self):
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -142,7 +142,7 @@ class TestBranchCLI(unittest.TestCase):
 
     def test_branch_plan_persists_branches(self):
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -177,7 +177,7 @@ class TestBranchCLI(unittest.TestCase):
                 }
             }, f)
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", bad_policy,
@@ -206,7 +206,7 @@ class TestBranchCLI(unittest.TestCase):
                 }
             }, f)
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", bad_policy,
@@ -219,7 +219,7 @@ class TestBranchCLI(unittest.TestCase):
 
     def test_branch_plan_invalid_reason_rejected(self):
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -232,7 +232,7 @@ class TestBranchCLI(unittest.TestCase):
 
     def test_branch_plan_invalid_delta_rejected(self):
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -246,7 +246,7 @@ class TestBranchCLI(unittest.TestCase):
 
     def test_branch_plan_missing_checkpoint_friendly(self):
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -260,7 +260,7 @@ class TestBranchCLI(unittest.TestCase):
     def test_branch_plan_duplicate_not_duplicated(self):
         # First plan
         self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -270,7 +270,7 @@ class TestBranchCLI(unittest.TestCase):
         )
         # Second plan — same params
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -293,7 +293,7 @@ class TestBranchCLI(unittest.TestCase):
         )
         conn.close()
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "empty-branch",
             "--branch-policy", self.policy_path,
@@ -307,7 +307,7 @@ class TestBranchCLI(unittest.TestCase):
         """Execute with mock train script: child run created, linked to branch and campaign."""
         mock_train = str(ROOT / "tests" / "mock_train.py")
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -361,7 +361,7 @@ class TestBranchCLI(unittest.TestCase):
                 }
             }, f)
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", bad_policy,
@@ -378,7 +378,7 @@ class TestBranchCLI(unittest.TestCase):
         with open(fail_script, "w") as f:
             f.write("raise SystemExit(1)\n")
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "branch-cli-test",
             "--branch-policy", self.policy_path,
@@ -452,7 +452,7 @@ class TestBranchCLI(unittest.TestCase):
                 }
             }, f)
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--campaign", "stage-mismatch-test",
             "--branch-policy", bad_policy,

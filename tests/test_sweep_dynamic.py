@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SWEEP = ROOT / "framework" / "sweep.py"
+INDEX = ROOT / "framework" / "index.py"
 
 
 class TestDynamicSweep(unittest.TestCase):
@@ -28,9 +28,9 @@ class TestDynamicSweep(unittest.TestCase):
                     from pathlib import Path
                     ROOT = Path(r"{ROOT}")
                     FRAMEWORK = ROOT / "framework"
-                    if str(FRAMEWORK) not in sys.path:
-                        sys.path.insert(0, str(FRAMEWORK))
-                    from core.db import create_run, finish_run, init_db
+                    if str(ROOT) not in sys.path:
+                        sys.path.insert(0, str(ROOT))
+                    from framework.core.db import create_run, finish_run, init_db
 
                     p = argparse.ArgumentParser()
                     p.add_argument("--db", required=True)
@@ -55,7 +55,7 @@ class TestDynamicSweep(unittest.TestCase):
             proc = subprocess.run(
                 [
                     sys.executable,
-                    str(SWEEP),
+                    str(INDEX), "sweep",
                     "--db", str(db_path),
                     "--train-script", str(fake_train),
                     "--time-budget", "1",

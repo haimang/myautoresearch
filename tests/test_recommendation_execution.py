@@ -10,10 +10,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     finish_run,
     get_or_create_campaign,
@@ -23,10 +23,9 @@ from core.db import (
     save_recommendation_batch,
     save_search_space,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
-SWEEP = ROOT / "framework" / "sweep.py"
-BRANCH = ROOT / "framework" / "branch.py"
+INDEX = ROOT / "framework" / "index.py"
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
 
@@ -43,9 +42,9 @@ class TestRecommendationExecution(unittest.TestCase):
                 from pathlib import Path
                 ROOT = Path(r"{ROOT}")
                 FRAMEWORK = ROOT / "framework"
-                if str(FRAMEWORK) not in sys.path:
-                    sys.path.insert(0, str(FRAMEWORK))
-                from core.db import create_run, finish_run, init_db
+                if str(ROOT) not in sys.path:
+                    sys.path.insert(0, str(ROOT))
+                from framework.core.db import create_run, finish_run, init_db
 
                 p = argparse.ArgumentParser()
                 p.add_argument("--db", required=True)
@@ -194,7 +193,7 @@ class TestRecommendationExecution(unittest.TestCase):
 
     def test_sweep_executes_accepted_point_recommendation(self):
         proc = self._run(
-            str(SWEEP),
+            str(INDEX), "sweep",
             "--db", self.db_path,
             "--execute-recommendation", "rec-point",
         )
@@ -214,7 +213,7 @@ class TestRecommendationExecution(unittest.TestCase):
 
     def test_branch_executes_accepted_branch_recommendation(self):
         proc = self._run(
-            str(BRANCH),
+            str(INDEX), "branch",
             "--db", self.db_path,
             "--execute-recommendation", "rec-branch",
         )

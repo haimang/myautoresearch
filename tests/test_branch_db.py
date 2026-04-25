@@ -7,10 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     bind_branch_child_run,
     create_run,
     finish_run,
@@ -25,7 +25,7 @@ from core.db import (
     save_search_space,
     update_branch_status,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
 
 class TestBranchDB(unittest.TestCase):

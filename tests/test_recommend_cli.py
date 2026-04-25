@@ -9,10 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     finish_run,
     get_or_create_campaign,
@@ -20,9 +20,9 @@ from core.db import (
     save_campaign_stage,
     save_search_space,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
-ANALYZE = ROOT / "framework" / "analyze.py"
+INDEX = ROOT / "framework" / "index.py"
 SELECTOR_POLICY = ROOT / "domains" / "gomoku" / "selector_policy.json"
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
@@ -71,7 +71,7 @@ class TestRecommendCLI(unittest.TestCase):
 
     def test_recommend_next_prints_list(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
@@ -83,7 +83,7 @@ class TestRecommendCLI(unittest.TestCase):
 
     def test_recommend_next_json_format(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
@@ -95,7 +95,7 @@ class TestRecommendCLI(unittest.TestCase):
 
     def test_recommend_next_persists_batch(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
@@ -112,13 +112,13 @@ class TestRecommendCLI(unittest.TestCase):
     def test_recommendation_log_shows_batches(self):
         # First generate a batch
         self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
         )
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-log", "rec-cli-test",
         )
@@ -128,13 +128,13 @@ class TestRecommendCLI(unittest.TestCase):
 
     def test_recommendation_log_json_format(self):
         self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
         )
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-log", "rec-cli-test",
             "--format", "json",
@@ -145,7 +145,7 @@ class TestRecommendCLI(unittest.TestCase):
 
     def test_recommendation_outcomes_empty_friendly(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommendation-outcomes", "rec-cli-test",
         )
@@ -158,7 +158,7 @@ class TestRecommendCLI(unittest.TestCase):
         with open(bad_policy, "w") as f:
             json.dump({"domain": "chess"}, f)
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", bad_policy,
@@ -167,7 +167,7 @@ class TestRecommendCLI(unittest.TestCase):
 
     def test_recommend_next_missing_campaign_friendly(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "nonexistent",
             "--selector-policy", str(SELECTOR_POLICY),
@@ -177,7 +177,7 @@ class TestRecommendCLI(unittest.TestCase):
 
     def test_recommend_next_limit_respected(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
@@ -190,7 +190,7 @@ class TestRecommendCLI(unittest.TestCase):
 
     def test_recommend_next_candidate_type_filter(self):
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
@@ -216,7 +216,7 @@ class TestRecommendCLI(unittest.TestCase):
         conn.commit()
         conn.close()
         proc = self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
@@ -226,7 +226,7 @@ class TestRecommendCLI(unittest.TestCase):
     def test_recommend_next_stale_invalidated(self):
         # First batch
         self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),
@@ -242,7 +242,7 @@ class TestRecommendCLI(unittest.TestCase):
 
         # Second batch should invalidate old planned recommendations
         self._run(
-            str(ANALYZE),
+            str(INDEX), "analyze",
             "--db", self.db_path,
             "--recommend-next", "rec-cli-test",
             "--selector-policy", str(SELECTOR_POLICY),

@@ -8,10 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from acquisition_policy import describe_acquisition_policy, load_acquisition_policy, validate_acquisition_policy
+from framework.policies.acquisition_policy import describe_acquisition_policy, load_acquisition_policy, validate_acquisition_policy
 
 POLICY_PATH = ROOT / "domains" / "gomoku" / "acquisition_policy.json"
 
