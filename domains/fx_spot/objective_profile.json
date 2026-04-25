@@ -1,0 +1,40 @@
+{
+  "domain": "fx_spot",
+  "name": "liquidity-first-spot",
+  "version": "1.0",
+  "description": "Liquidity-first spot FX route objectives for current quote-window autoresearch.",
+  "hard_constraints": [
+    {
+      "metric": "liquidity_floor_ok",
+      "op": "ge",
+      "value": 1.0
+    }
+  ],
+  "maximize": [
+    "liquidity_headroom_ratio",
+    "preservation_ratio",
+    "spot_uplift_bps",
+    "quote_validity_remaining_s"
+  ],
+  "minimize": [
+    "embedded_spread_bps",
+    "route_leg_count",
+    "settlement_lag_s",
+    "locked_funds_ratio"
+  ],
+  "display": {
+    "liquidity_floor_ok": {"label": "Liquidity Floor OK", "format": "integer"},
+    "liquidity_headroom_ratio": {"label": "Liquidity Headroom", "format": "ratio"},
+    "preservation_ratio": {"label": "Preservation Ratio", "format": "ratio"},
+    "spot_uplift_bps": {"label": "Spot Uplift", "format": "bps"},
+    "quote_validity_remaining_s": {"label": "Quote Validity Remaining", "format": "seconds"},
+    "embedded_spread_bps": {"label": "Embedded Spread", "format": "bps"},
+    "route_leg_count": {"label": "Route Legs", "format": "integer"},
+    "settlement_lag_s": {"label": "Settlement Lag", "format": "seconds"},
+    "locked_funds_ratio": {"label": "Locked Funds", "format": "ratio"}
+  },
+  "knee": {
+    "method": "utopia_distance"
+  }
+}
+

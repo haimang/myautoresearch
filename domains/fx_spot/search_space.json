@@ -1,0 +1,91 @@
+{
+  "domain": "fx_spot",
+  "name": "spot-route-surface",
+  "version": "1.0",
+  "description": "Current quote-window route search space for import/export portfolio spot FX exploration.",
+  "protocol": {
+    "eval_level": null,
+    "eval_opponent": null,
+    "is_benchmark": false
+  },
+  "axes": {
+    "treasury_scenario": {
+      "type": "categorical",
+      "values": [
+        "cn_exporter_core",
+        "usd_importer_mix",
+        "global_diversified",
+        "asia_procurement_hub"
+      ],
+      "scale": "linear",
+      "role": "strategy",
+      "allow_continuation": false,
+      "description": "Treasury portfolio / liquidity-floor scenario used to materialize realistic holdings."
+    },
+    "sell_currency": {
+      "type": "categorical",
+      "values": ["CNY", "USD", "EUR", "JPY", "HKD", "SGD", "GBP", "AUD", "MXN"],
+      "scale": "linear",
+      "role": "strategy",
+      "allow_continuation": false,
+      "description": "Currency to convert from available surplus above the liquidity floor."
+    },
+    "buy_currency": {
+      "type": "categorical",
+      "values": ["CNY", "USD"],
+      "scale": "linear",
+      "role": "strategy",
+      "allow_continuation": false,
+      "description": "Currency to receive in the mocked spot route."
+    },
+    "route_template": {
+      "type": "categorical",
+      "values": ["direct", "via_usd", "via_eur", "via_hkd", "via_sgd"],
+      "scale": "linear",
+      "role": "strategy",
+      "allow_continuation": false,
+      "description": "Direct conversion or one intermediate bridge leg."
+    },
+    "rebalance_fraction": {
+      "type": "float",
+      "values": [0.15, 0.25, 0.4, 0.6, 0.75],
+      "scale": "linear",
+      "role": "execution",
+      "allow_continuation": false,
+      "description": "Fraction of sell-currency surplus to convert."
+    },
+    "max_legs": {
+      "type": "int",
+      "values": [2],
+      "scale": "linear",
+      "role": "risk",
+      "allow_continuation": false,
+      "description": "Maximum allowed route length."
+    },
+    "provider": {
+      "type": "categorical",
+      "values": ["mock"],
+      "scale": "linear",
+      "role": "provider",
+      "allow_continuation": false,
+      "description": "Quote provider adapter."
+    },
+    "quote_scenario": {
+      "type": "categorical",
+      "values": [
+        "base",
+        "wide_spread",
+        "short_validity",
+        "cn_exporter",
+        "asia_hub",
+        "usd_liquidity",
+        "europe_corridor",
+        "latam_volatility"
+      ],
+      "scale": "linear",
+      "role": "provider",
+      "allow_continuation": false,
+      "description": "Deterministic local quote-surface scenario for mock tests."
+    }
+  }
+}

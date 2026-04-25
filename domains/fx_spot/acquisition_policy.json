@@ -1,0 +1,33 @@
+{
+  "domain": "fx_spot",
+  "name": "spot-route-acquisition",
+  "version": "1.0",
+  "description": "Candidate-pool reranker for spot FX route exploration over generic objective signals.",
+  "selector_policy_ref": {"domain": "fx_spot", "name": "spot-route-selector", "version": "1.0"},
+  "objectives": {
+    "maximize": ["liquidity_headroom_ratio", "preservation_ratio", "spot_uplift_bps"],
+    "minimize": ["embedded_spread_bps", "route_leg_count", "locked_funds_ratio"]
+  },
+  "weights": {
+    "predicted_wr": 1.0,
+    "uncertainty": 0.25,
+    "params_penalty": 0.15,
+    "wall_penalty": 0.1,
+    "frontier_bonus": 0.15
+  },
+  "priors": {
+    "base_sigma": 0.03,
+    "min_sigma": 0.005,
+    "seed_shortage_bonus": 0.05,
+    "target_seed_count": 2
+  },
+  "candidate_type_bonus": {
+    "new_point": 0.05,
+    "seed_recheck": 0.02
+  },
+  "replay": {
+    "top_k": 3,
+    "positive_outcomes": ["new_front", "near_front"]
+  }
+}
+

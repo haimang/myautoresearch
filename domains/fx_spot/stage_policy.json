@@ -1,0 +1,44 @@
+{
+  "domain": "fx_spot",
+  "name": "single-window",
+  "version": "1.0",
+  "search_space_ref": {"domain": "fx_spot", "name": "spot-route-surface", "version": "1.0"},
+  "stages": [
+    {
+      "name": "A",
+      "time_budget": 1,
+      "seed_count": 1,
+      "promote_top_k": 3,
+      "metric": "final_win_rate",
+      "min_runs": 1,
+      "description": "One quote-window pass for mocked spot route candidates."
+    },
+    {
+      "name": "B",
+      "time_budget": 1,
+      "seed_count": 1,
+      "promote_top_k": 2,
+      "metric": "final_win_rate",
+      "min_runs": 1,
+      "description": "Repeat top quote-window candidates."
+    },
+    {
+      "name": "C",
+      "time_budget": 1,
+      "seed_count": 1,
+      "promote_top_k": 1,
+      "metric": "final_win_rate",
+      "min_runs": 1,
+      "description": "Narrow to the current mocked frontier."
+    },
+    {
+      "name": "D",
+      "time_budget": null,
+      "seed_count": 1,
+      "promote_top_k": 0,
+      "metric": "final_win_rate",
+      "min_runs": 1,
+      "description": "Handoff boundary; no automatic live execution."
+    }
+  ]
+}

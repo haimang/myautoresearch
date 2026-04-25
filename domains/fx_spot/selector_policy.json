@@ -1,0 +1,32 @@
+{
+  "domain": "fx_spot",
+  "name": "spot-route-selector",
+  "version": "1.0",
+  "search_space_ref": {"domain": "fx_spot", "name": "spot-route-surface", "version": "1.0"},
+  "stage_policy_ref": {"domain": "fx_spot", "name": "single-window", "version": "1.0"},
+  "branch_policy_ref": {"domain": "fx_spot", "name": "no-branch", "version": "1.0"},
+  "candidate_kinds": {
+    "new_point": {
+      "description": "Neighbour route candidate from generic run_metrics frontier.",
+      "max_per_batch": 4,
+      "default_budget_s": 1
+    },
+    "seed_recheck": {
+      "description": "Repeat a frontier route candidate under the same quote scenario.",
+      "max_per_batch": 2,
+      "default_budget_s": 1
+    }
+  },
+  "score_weights": {
+    "frontier_gap": 1.0,
+    "uncertainty": 0.4,
+    "cost_penalty": 0.2,
+    "dominance_penalty": 0.7
+  },
+  "limits": {
+    "default_batch_size": 5,
+    "min_runs_for_variance": 2,
+    "max_wr_std_for_confident": 0.02
+  }
+}
+
