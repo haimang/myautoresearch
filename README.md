@@ -37,10 +37,19 @@
 ```
 myautoresearch/
 ├── framework/                      ═══ 框架层（domain-agnostic）═══
-│   ├── analyze.py                  只读分析：报告 / Pareto / 晋升链 / 开局分解
-│   ├── sweep.py                    超参矩阵 sweep
+│   ├── analyze.py                  只读分析：报告 / Pareto / campaign / stage / trajectory / recommendation
+│   ├── sweep.py                    超参矩阵 sweep / campaign-aware point execution
+│   ├── promote.py                  multi-fidelity promotion planner / executor
+│   ├── branch.py                   continuation / trajectory planner / executor
+│   ├── selector.py                 next-point / next-branch recommendation
+│   ├── acquisition.py              v21.1 candidate-pool acquisition reranker
+│   ├── search_space.py             search-space profile loader / validator
+│   ├── stage_policy.py             stage policy loader / validator
+│   ├── branch_policy.py            branch policy loader / validator
+│   ├── selector_policy.py          selector policy loader / validator
+│   ├── acquisition_policy.py       acquisition policy loader / validator
 │   └── core/
-│       ├── db.py                   tracker.db schema + CRUD + 晋升门禁 can_promote()
+│       ├── db.py                   tracker.db schema + migrations + campaign / trajectory / recommendation / acquisition ledger
 │       ├── tui.py                  ASCII sparkline / progress bar
 │       ├── mcts.py                 通用 MCTS 算法（Python 参考实现）
 │       ├── mcts_c.c                C 原生 MCTS 树操作（v14 落地）
@@ -52,6 +61,11 @@ myautoresearch/
 │       ├── train.py                训练入口（agent 修改的主目标文件）
 │       ├── game.py                 棋盘引擎 (Board, BatchBoards, Renderer)
 │       ├── prepare.py              minimax 对手 L0-L3 + evaluate_win_rate
+│       ├── search_space.json       v20.1 search-space profile
+│       ├── stage_policy.json       v20.2 multi-fidelity stage policy
+│       ├── branch_policy.json      v20.3 continuation / branch policy
+│       ├── selector_policy.json    v21 recommendation policy
+│       ├── acquisition_policy.json v21.1 acquisition policy
 │       ├── minimax_c.c             C 原生 minimax + pattern scorer (v15)
 │       ├── minimax_native.py       minimax_c 的 ctypes wrapper
 │       ├── play.py                 CLI 人机对弈 (pygame)
@@ -74,9 +88,12 @@ myautoresearch/
 **框架与 domain 的契约** 是两个东西：
 
 1. **tracker.db schema**（数据协议）：framework 只读 domain 写入的几个标准列（`final_win_rate`、`wall_time_s`、`total_games`、`total_steps`、`num_params`），其余 domain 自定义列被 framework 透明展示，但 framework 不解读。
-2. **CLI subprocess 协议**：`sweep.py` 通过 `python domains/<name>/train.py --time-budget N --tag X` 启动 domain。退出码 0 = 成功。
+2. **CLI subprocess 协议**：`sweep.py` / `branch.py` 通过 `python domains/<name>/train.py --time-budget N --sweep-tag X ...` 启动 domain。退出码 0 = 成功。
 
 这两个协议合在一起就是 "如何接入新 domain"。详见下文 [Domain 接入指南](#domain-接入指南)。
+
+而在 v20 之后，这个契约又向上扩了一层：  
+除了训练脚本本身，domain 还需要提供自己的 `search_space / stage_policy / branch_policy / selector_policy / acquisition_policy`，框架才知道**什么点可比、什么点该晋升、什么 continuation 合法、什么 recommendation 值得执行**。
 
 ---
 
@@ -106,6 +123,9 @@ myautoresearch/
 - 真理优先：domain truth（如 Gomoku 的 WR）永远高于任何 Pareto 解释
 - agent 主体：所有新层只能增强 agent 的感知和行动，不能替代 agent 做决策
 - 人类不过早接管：人类在最后选 Pareto 点，但不指挥研究循环
+
+> 今天的代码已经在这 5 层之上，继续长出了 **campaign / promotion / trajectory / recommendation / acquisition** 这条执行骨架。  
+> 它们不是在替代原叙事，而是在把这个叙事真正做成一个可运行的研究系统。
 
 ---
 
@@ -179,11 +199,11 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
 
 ---
 
-## 当前阶段（v15）的核心能力
+## 当前阶段（v21.1）的核心能力
 
-下面是 v15 落地后 agent 和 domain 都可以依赖的能力：
+下面按“Gomoku domain 能力”和“framework research loop 能力”分开写。前者仍然建立在 v14-v15 的训练体系上，后者已经推进到 v21.1。
 
-### 训练时
+### Gomoku 训练侧（v14-v15 奠定的基础）
 
 - **Native C MCTS**（v14）：800 sims × 16 boards 的批量树搜索在 C 里完成，比 Python 快 10-20×
 - **Native C minimax**（v15）：L1/L2/L3 对手都在 C 里跑，L2 单次 minimax 从 ~2200ms → ~50ms（**~40× 加速**），L3 从不可用 → 可用
@@ -193,7 +213,7 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
 - **policy / value loss 拆分**（v14）：训练时 P-loss 和 V-loss 单独入库，诊断"模型在学什么"
 - **MLX allocator 周期性 clear_cache**（v14.1）：训练循环 RAM 不再涨到 115 GB
 
-### 训练完成后
+### Gomoku 训练完成后
 
 - **晋升门禁** `can_promote()`（v15 E1）：4 条判据（WR 阈值 / unique_openings ≥ 16 / avg_length ∈ [12,60] / 最近 5 个 smoothed WR 稳定）一致通过才能被晋升
 - **Auto-promote**（v15 E5）：`--auto-promote-to S2` 训练结束时自动注册，含 `prev_alias` 晋升链
@@ -201,13 +221,46 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
 - **Per-opening WR 分解**（v15 E3）：可以查看模型在哪条开局上输了
 - **TUI health row**（v15 E4）：5 个健康指标实时显示（learning / diverse / plateau / value / collapse）
 
-### Reporting
+### Gomoku reporting
 
 - **`--pareto`**：成本 vs WR 的非支配前沿（v14 已有）
 - **`--promotion-chain`**：S0 → S1 → S2 → ... 的对手进化链可视化（v15）
 - **`--opening-breakdown`**：单个 run 所有 checkpoint 的 per-opening WR 表（v15）
 - **`--report`**：完整中文实验报告（v14 已有）
 - **`--stability`** / **`--stagnation`** / **`--matrix`** / **`--frontier`** / **`--lineage`** / **`--compare`** / **`--compare-by-steps`**
+
+### Framework research loop（v20 → v21.1）
+
+- **Campaign / search-space governance**（v20.1）
+  - `search_spaces` / `campaigns` / `campaign_runs`
+  - protocol drift guard
+  - `analyze.py --campaign-summary`
+
+- **Multi-fidelity promotion**（v20.2）
+  - `campaign_stages` / `promotion_decisions`
+  - `promote.py`
+  - `stage_policy.py`
+  - `analyze.py --stage-summary / --promotion-log`
+
+- **Continuation / trajectory**（v20.3）
+  - `run_branches`
+  - `branch.py`
+  - `branch_policy.py`
+  - `analyze.py --branch-tree / --trajectory-report / --compare-parent-child`
+
+- **Recommendation / selector**（v21）
+  - `selector.py`
+  - `selector_policy.py`
+  - `recommendation_batches` / `recommendations` / `recommendation_outcomes`
+  - `analyze.py --recommend-next / --recommendation-log / --recommendation-outcomes`
+
+- **Acquisition / execution closure**（v21.1）
+  - `acquisition.py`
+  - `acquisition_policy.py`
+  - `surrogate_snapshots`
+  - accepted recommendation 可直接由 `sweep.py` / `branch.py` 执行
+  - `analyze.py --acquisition-summary`
+  - `scripts/v21_1_replay_benchmark.py`
 
 ---
 
@@ -260,9 +313,19 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
 | `--stability RUN_ID` | 训练稳定性报告 |
 | `--stagnation RUN_ID` | 停滞检测 |
 | `--matrix TAG_PREFIX` | sweep 结果矩阵 |
+| `--campaign-summary CAMPAIGN` | campaign 汇总 |
+| `--stage-summary CAMPAIGN` | stage 汇总 |
+| `--promotion-log CAMPAIGN` | promotion 决策日志 |
+| `--branch-tree CAMPAIGN` | continuation / branch 树 |
+| `--trajectory-report CAMPAIGN` | trajectory 汇总报告 |
+| `--compare-parent-child BRANCH_ID` | 某条 branch 的 parent/child 对比 |
 | `--opponents` | 列出所有注册对手 |
 | `--promotion-chain` | **v15 E7** — S0 → S1 → S2 ... 晋升链 |
 | `--opening-breakdown RUN_ID` | **v15 E3** — per-opening WR 分解 |
+| `--recommend-next CAMPAIGN` | 生成下一步 recommendation |
+| `--recommendation-log CAMPAIGN` | recommendation 历史 |
+| `--recommendation-outcomes CAMPAIGN` | recommendation 执行结果 |
+| `--acquisition-summary CAMPAIGN` | v21.1 acquisition lineage 汇总 |
 | `--report` | 完整实验报告（中文 markdown） |
 
 ---
@@ -273,17 +336,26 @@ myautoresearch 框架对一个新 domain 的最小要求：
 
 1. **目录结构**：`domains/<name>/`
 2. **入口脚本** `domains/<name>/train.py`：
-   - 接受 `--time-budget`、`--seed`、`--tag` 等标准参数
+   - 接受 `--time-budget`、`--seed`、`--sweep-tag` 等标准参数
    - 跑完后写入 `tracker.db`：至少 `runs.final_win_rate`（domain 真理）、`runs.wall_time_s`、`runs.total_games`、`runs.total_steps`、`runs.num_params`
    - 退出码 0 = 成功
-3. **(可选)** 评估模块 `domains/<name>/prepare.py`：定义对手 / 评估函数
-4. **(可选)** 注册自定义列：domain 可以往 `runs` 表写自己的列（框架不会解读，但 analyze 会展示）
+3. **policy 文件**：
+   - `search_space.json`
+   - `stage_policy.json`
+   - `branch_policy.json`
+   - `selector_policy.json`
+   - `acquisition_policy.json`
+4. **(可选)** 评估模块 `domains/<name>/prepare.py`：定义对手 / 评估函数
+5. **(可选)** 注册自定义列：domain 可以往 `runs` 表写自己的列（框架不会解读，但 analyze 会展示）
 
 接入完成后，**framework 层自动复用**：
 
 - `sweep.py` 可以 sweep 你的超参矩阵
+- `promote.py` 可以做多阶段晋升
+- `branch.py` 可以做 continuation / trajectory
 - `analyze.py --pareto` 可以画你的成本 vs 真理前沿
-- `analyze.py --report` 可以生成你的实验报告
+- `analyze.py --recommend-next` 可以生成 recommendation
+- `analyze.py --acquisition-summary` 可以追踪 acquisition evidence
 - tracker.db 自动追踪所有数据
 
 参考实现：`domains/gomoku/`（约 4000 行，含 game engine + minimax + train loop + replay + web UI）。
@@ -294,14 +366,14 @@ myautoresearch 框架对一个新 domain 的最小要求：
 
 | 版本 | 主题 | 关键产出 |
 |------|------|---------|
-| v11 | 稳定基线 | 6×64 model + pure policy MCTS-free baseline |
-| v12 | MCTS 验证 | 第一次 MCTS 训练，vs L0 99%+ |
-| v13 | 对手晋升尝试 | vs L1 失败（50 sims 不够），分析根因 |
-| v14 | C 原生 MCTS + 评估协议修复 | 800 sims 可用；mcts_10 第一份真实 100% vs L1 |
-| v14.1 | 资源利用率修复 | MAX_BATCH_PATHS 256→2048 + mx.clear_cache |
-| **v15** | **异步 eval + minimax C 化 + 晋升门禁 + README 翻新** | **(本版本)** L2/L3 可承受、训练 wall-clock 效率 95%+ |
-| v16（计划）| S vs S 自我对弈 | 基于 v15 的 S2，跑 "S2 vs S2 从 S2 权重起步" 训练 |
-| v17+ | Board 操作 C 化 / Pareto 可视化升级 / 多 domain 接入 | TBD |
+| v11-v15 | Gomoku 训练基座 | MCTS / minimax / async eval / promotion gate / reporting |
+| **v20** | Point frontier observation | Pareto / frontier snapshot / sweep auto-pareto |
+| **v20.1** | Search-space schema + campaign ledger | `search_spaces` / `campaigns` / `campaign_runs` |
+| **v20.2** | Multi-fidelity promotion | `campaign_stages` / `promotion_decisions` / `promote.py` |
+| **v20.3** | Continuation / trajectory | `run_branches` / `branch.py` / trajectory report |
+| **v21** | Selector / recommendation | next-point / next-branch recommendation ledger |
+| **v21.1** | Acquisition / execution closure | accepted recommendation execution / surrogate snapshots / replay benchmark |
+| v22（下一阶段） | 新 domain research loop | 把 v21.1 骨架迁移到与 Gomoku 完全不同的 domain |
 
 每个版本的细节在 `updates/v{N}-update.md`（计划）和 `updates/v{N}-findings.md`（实测）。
 
