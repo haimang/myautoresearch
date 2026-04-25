@@ -8,7 +8,6 @@ import itertools
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -22,19 +21,14 @@ if _FRAMEWORK_DIR not in sys.path:
 from core.db import (
     DB_PATH,
     find_run_by_sweep_tag,
-    get_campaign,
     get_or_create_campaign,
-    get_campaign_stages,
-    get_recommendation_by_id,
     init_db,
     link_run_to_campaign,
     link_run_to_campaign_v20,
-    save_recommendation_outcome,
     save_campaign_stage,
     save_objective_profile,
     save_experiment_run,
     save_search_space,
-    update_recommendation_status,
 )
 from objective_profile import load_objective_profile
 from search_space import describe_profile, load_profile, validate_selected_axes
@@ -47,6 +41,13 @@ from services.execution.matrix import (
     parse_csv as service_parse_csv,
     stable_candidate_key as service_stable_candidate_key,
 )
+from services.execution.recommendation_execution import (
+    execute_point_recommendation as service_execute_point_recommendation,
+)
+from services.execution.sweep_runner import (
+    print_matrix_preview as service_print_matrix_preview,
+    run_one as service_run_one,
+)
 from services.execution.workspace import (
     derive_protocol as service_derive_protocol,
     ensure_campaign as service_ensure_campaign,
@@ -55,7 +56,6 @@ from services.execution.workspace import (
     maybe_setup_run_workspace as service_maybe_setup_run_workspace,
 )
 from stage_policy import load_stage_policy, get_stage_by_name
-from selector_policy import load_selector_policy, get_candidate_kind_config
 
 
 def parse_args():
@@ -173,262 +173,19 @@ def _ensure_campaign(conn, args, profile: dict | None, protocol: dict, objective
 
 
 def run_one(cfg, args, idx, total, campaign=None):
-    """执行单个训练配置。返回 (tag, 是否成功, 耗时)。"""
-    tag = cfg["sweep_tag"]
-    seed = cfg["seed"]
-
-    cmd = [sys.executable, args.train_script,
-           "--time-budget", str(args.time_budget),
-           "--seed", str(seed),
-           "--sweep-tag", tag]
-    if args.db:
-        cmd += ["--db", args.db]
-    if campaign and campaign.get("objective_profile_id"):
-        cmd += ["--campaign-id", campaign["id"]]
-    if getattr(args, "run_id", None):
-        cmd += ["--run-id", args.run_id]
-    if getattr(args, "_artifact_root", None):
-        cmd += ["--artifact-root", args._artifact_root]
-
-    if "num_blocks" in cfg and cfg["num_blocks"] is not None:
-        cmd += ["--num-blocks", str(cfg["num_blocks"])]
-    if "num_filters" in cfg and cfg["num_filters"] is not None:
-        cmd += ["--num-filters", str(cfg["num_filters"])]
-    if "learning_rate" in cfg and cfg["learning_rate"] is not None:
-        cmd += ["--learning-rate", str(cfg["learning_rate"])]
-    if "steps_per_cycle" in cfg and cfg["steps_per_cycle"] is not None:
-        cmd += ["--steps-per-cycle", str(cfg["steps_per_cycle"])]
-    if "buffer_size" in cfg and cfg["buffer_size"] is not None:
-        cmd += ["--buffer-size", str(cfg["buffer_size"])]
-    if cfg.get("__candidate_payload") is not None:
-        cmd += ["--candidate-json", json.dumps(cfg["__candidate_payload"], ensure_ascii=False, sort_keys=True)]
-
-    if args.eval_level is not None:
-        cmd += ["--eval-level", str(args.eval_level)]
-    if args.eval_opponent:
-        cmd += ["--eval-opponent", args.eval_opponent]
-    if args.parallel_games:
-        cmd += ["--parallel-games", str(args.parallel_games)]
-    if args.target_win_rate:
-        cmd += ["--target-win-rate", str(args.target_win_rate)]
-
-    axis_desc = "  ".join(f"{k}={v}" for k, v in cfg.items() if not k.startswith("__") and k not in ("seed", "sweep_tag"))
-    print(f"\n{'='*60}")
-    print(f"[{idx}/{total}] {tag}")
-    print(f"  {axis_desc}  seed={seed}")
-    print(f"{'='*60}")
-
-    t0 = time.time()
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    elapsed = time.time() - t0
-
-    if proc.returncode != 0:
-        print(f"  失败 (退出码 {proc.returncode})")
-        if proc.stderr:
-            lines = proc.stderr.strip().split("\n")
-            for line in lines[-5:]:
-                print(f"  {line}")
-        return tag, False, elapsed
-
-    wr_line = ""
-    for line in proc.stdout.splitlines():
-        if "Win rate:" in line or "win_rate" in line.lower():
-            wr_line = line.strip()
-    if wr_line:
-        print(f"  {wr_line}")
-    print(f"  完成，耗时 {elapsed:.0f}s")
-
-    return tag, True, elapsed
+    return service_run_one(cfg, args, idx, total, campaign=campaign)
 
 
 def _print_matrix_preview(configs, profile: dict | None, args, protocol: dict):
-    if profile is not None:
-        print(describe_profile(profile))
-        print()
-    if args.campaign:
-        print(f"Campaign: {args.campaign}")
-        print(f"Protocol: {json.dumps(protocol, ensure_ascii=False, sort_keys=True)}")
-        print()
-    print(f"{'Tag':<55} {'Params'}")
-    print("-" * 96)
-    for c in configs:
-        axis_desc = "  ".join(f"{k}={v}" for k, v in c.items() if not k.startswith("__") and k not in ("seed", "sweep_tag"))
-        print(f"{c['sweep_tag']:<55} {axis_desc}")
-
-
-def _infer_recommendation_stage(conn, campaign_id: str) -> str | None:
-    stages = get_campaign_stages(conn, campaign_id)
-    if stages:
-        open_stages = [s for s in stages if s.get("status") == "open"]
-        source = open_stages if open_stages else stages
-        source = sorted(source, key=lambda s: s["stage"], reverse=True)
-        return source[0]["stage"]
-    row = conn.execute(
-        "SELECT stage FROM campaign_runs WHERE campaign_id = ? AND stage IS NOT NULL ORDER BY stage DESC LIMIT 1",
-        (campaign_id,),
-    ).fetchone()
-    return row["stage"] if row else None
-
-
-def _next_seed_for_candidate(conn, campaign_id: str, candidate_key: str | None) -> int:
-    if not candidate_key:
-        return 1
-    rows = conn.execute(
-        """SELECT DISTINCT seed FROM campaign_runs
-           WHERE campaign_id = ? AND candidate_key = ? AND seed IS NOT NULL
-           ORDER BY seed""",
-        (campaign_id, candidate_key),
-    ).fetchall()
-    used = {r["seed"] for r in rows if r["seed"] is not None}
-    seed = 1
-    while seed in used:
-        seed += 1
-    return seed
-
-
-def _default_budget_for_recommendation(campaign: dict, candidate_type: str) -> int:
-    selector_path = os.path.join(_PROJECT_ROOT, "domains", campaign["domain"], "selector_policy.json")
-    if os.path.isfile(selector_path):
-        policy = load_selector_policy(selector_path)
-        cfg = get_candidate_kind_config(policy, candidate_type)
-        if cfg and cfg.get("default_budget_s"):
-            return int(cfg["default_budget_s"])
-    return 60
-
-
-def _build_frontier_delta(conn, campaign_id: str, previous_best_wr: float | None, run_id: str) -> tuple[str, str, str]:
-    row = conn.execute(
-        """SELECT final_win_rate, wall_time_s, num_params, total_games, status
-           FROM runs WHERE id = ?""",
-        (run_id,),
-    ).fetchone()
-    observed = {
-        "final_win_rate": row["final_win_rate"],
-        "wall_time_s": row["wall_time_s"],
-        "num_params": row["num_params"],
-        "total_games": row["total_games"],
-        "status": row["status"],
-    }
-    latest_best = conn.execute(
-        """SELECT MAX(r.final_win_rate) AS best_wr
-           FROM campaign_runs cr
-           JOIN runs r ON r.id = cr.run_id
-           WHERE cr.campaign_id = ?
-             AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')""",
-        (campaign_id,),
-    ).fetchone()
-    new_best_wr = latest_best["best_wr"] if latest_best else None
-    old_best_wr = previous_best_wr or 0.0
-    current_wr = observed["final_win_rate"] or 0.0
-    if current_wr > old_best_wr:
-        outcome_label = "new_front"
-    elif current_wr >= max(0.0, old_best_wr - 0.02):
-        outcome_label = "near_front"
-    else:
-        outcome_label = "no_gain"
-    frontier_delta = {
-        "old_best_wr": old_best_wr,
-        "new_best_wr": new_best_wr,
-        "delta": round((new_best_wr or 0.0) - old_best_wr, 6),
-    }
-    return json.dumps(observed, ensure_ascii=False, sort_keys=True), json.dumps(frontier_delta, ensure_ascii=False, sort_keys=True), outcome_label
+    service_print_matrix_preview(configs, profile, args, protocol)
 
 
 def _execute_point_recommendation(args) -> None:
     conn = init_db(args.db)
-    rec = get_recommendation_by_id(conn, args.execute_recommendation)
-    if not rec:
-        print(f"Recommendation not found: {args.execute_recommendation}")
+    try:
+        service_execute_point_recommendation(conn, args, project_root=_PROJECT_ROOT)
+    finally:
         conn.close()
-        sys.exit(1)
-    if rec["status"] != "accepted":
-        print(f"Recommendation {rec['id']} status is '{rec['status']}', expected 'accepted'")
-        conn.close()
-        sys.exit(1)
-    if rec["candidate_type"] not in ("new_point", "seed_recheck"):
-        print(f"Recommendation {rec['id']} is '{rec['candidate_type']}', use branch.py for branch execution")
-        conn.close()
-        sys.exit(1)
-
-    campaign_row = get_campaign(conn, rec["campaign_id"])
-    if not campaign_row:
-        print(f"Campaign not found for recommendation {rec['id']}")
-        conn.close()
-        sys.exit(1)
-    campaign = dict(campaign_row)
-
-    if not args.train_script:
-        args.train_script = campaign["train_script"]
-    if not args.train_script:
-        print("Error: train_script is required for recommendation execution")
-        conn.close()
-        sys.exit(1)
-
-    args.time_budget = args.time_budget or _default_budget_for_recommendation(campaign, rec["candidate_type"])
-    stage = args.stage or _infer_recommendation_stage(conn, campaign["id"])
-
-    axis_values = json.loads(rec.get("axis_values_json") or "{}")
-    if not axis_values and rec.get("candidate_key"):
-        try:
-            axis_values = json.loads(rec["candidate_key"])
-        except json.JSONDecodeError:
-            axis_values = {}
-
-    seed = _next_seed_for_candidate(conn, campaign["id"], rec.get("candidate_key"))
-    tag = f"{campaign['name']}_rec_{rec['id'][:8]}_sd{seed}"
-    cfg = {
-        **axis_values,
-        "seed": seed,
-        "sweep_tag": tag,
-    }
-    if campaign.get("objective_profile_id"):
-        cfg["__candidate_payload"] = axis_values
-        cfg["__candidate_key"] = _stable_candidate_key(axis_values)
-
-    previous_best = conn.execute(
-        """SELECT MAX(r.final_win_rate) AS best_wr
-           FROM campaign_runs cr
-           JOIN runs r ON r.id = cr.run_id
-           WHERE cr.campaign_id = ?
-             AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')""",
-        (campaign["id"],),
-    ).fetchone()
-    previous_best_wr = previous_best["best_wr"] if previous_best else None
-
-    _, ok, _ = run_one(cfg, args, 1, 1, campaign=campaign)
-    run_id = find_run_by_sweep_tag(conn, tag)
-    if run_id:
-        axis_identity = {k: v for k, v in cfg.items() if k not in ("seed", "sweep_tag")}
-        link_run_to_campaign_v20(
-            conn,
-            campaign_id=campaign["id"],
-            run_id=run_id,
-            stage=stage,
-            sweep_tag=tag,
-            seed=seed,
-            axis_values=axis_identity,
-            status="linked" if ok else "failed",
-        )
-
-    if ok and run_id:
-        update_recommendation_status(conn, recommendation_id=rec["id"], status="executed")
-        observed_json, frontier_delta_json, outcome_label = _build_frontier_delta(
-            conn, campaign["id"], previous_best_wr, run_id
-        )
-        save_recommendation_outcome(
-            conn,
-            recommendation_id=rec["id"],
-            run_id=run_id,
-            observed_metrics_json=observed_json,
-            frontier_delta_json=frontier_delta_json,
-            outcome_label=outcome_label,
-        )
-        print(f"Recommendation executed: {rec['id']} -> run {run_id[:8]} ({outcome_label})")
-    else:
-        print(f"Recommendation execution failed: {rec['id']}")
-
-    conn.close()
 
 
 def main():
