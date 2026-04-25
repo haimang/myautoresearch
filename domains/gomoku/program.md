@@ -14,10 +14,12 @@ You are the research director. The codebase is your laboratory.
 ```
 mag-gomoku/
 ├── framework/               # ═══ autoresearch framework (domain-agnostic) ═══
-│   ├── tracker.py           # SQLite experiment tracking                [READ-ONLY]
-│   ├── analyze.py           # Query tracker.db + experiment reports     [READ-ONLY]
-│   ├── sweep.py             # Batch hyperparameter sweep                [READ-ONLY]
-│   └── tui.py               # Terminal UI helpers (sparklines, panels)  [READ-ONLY]
+│   ├── index.py             # Unified CLI entrypoint                    [READ-ONLY]
+│   ├── core/                # DB, TUI, shared runtime helpers          [READ-ONLY]
+│   ├── facade/              # CLI facades                              [READ-ONLY]
+│   ├── services/            # Frontier/reporting/research services     [READ-ONLY]
+│   ├── policies/            # Stage/branch/selector/acquisition policy [READ-ONLY]
+│   └── profiles/            # Search-space/objective profiles          [READ-ONLY]
 ├── domains/
 │   └── gomoku/              # ═══ Gomoku execution domain ═══
 │       ├── game.py          # Board engine, renderer, batch self-play   [READ-ONLY]
@@ -54,27 +56,27 @@ These are read-only commands you can invoke at any time:
 
 | Command | Purpose | When to use |
 |---------|---------|-------------|
-| `analyze.py --report` | Full experiment report (markdown) | **START HERE** each iteration |
-| `analyze.py --report --format json` | Structured report for parsing | When you need precise numbers |
-| `analyze.py --compare RUN_A RUN_B` | Side-by-side run comparison | After an experiment |
-| `analyze.py --stability RUN_ID` | Detailed stability metrics | To diagnose training issues |
-| `analyze.py --frontier` | Win-rate progression frontier | To see historical progress |
-| `analyze.py --runs` | List all runs | Overview of experiment history |
-| `sweep.py --dry-run ...` | Preview sweep configurations | Before delegating local search |
-| `sweep.py ...` | Run batch hyperparameter search | When you want systematic exploration |
-| `analyze.py --matrix TAG` | View sweep results | After a sweep completes |
+| `index.py analyze --report` | Full experiment report (markdown) | **START HERE** each iteration |
+| `index.py analyze --report --format json` | Structured report for parsing | When you need precise numbers |
+| `index.py analyze --compare RUN_A RUN_B` | Side-by-side run comparison | After an experiment |
+| `index.py analyze --stability RUN_ID` | Detailed stability metrics | To diagnose training issues |
+| `index.py analyze --frontier` | Win-rate progression frontier | To see historical progress |
+| `index.py analyze --runs` | List all runs | Overview of experiment history |
+| `index.py sweep --dry-run ...` | Preview sweep configurations | Before delegating local search |
+| `index.py sweep ...` | Run batch hyperparameter search | When you want systematic exploration |
+| `index.py analyze --matrix TAG` | View sweep results | After a sweep completes |
 
-### Using sweep.py (optional local search tool)
+### Using `index.py sweep` (optional local search tool)
 
-When you have a hypothesis that requires systematic exploration of a narrow parameter range, you can delegate to sweep.py:
+When you have a hypothesis that requires systematic exploration of a narrow parameter range, you can delegate to `index.py sweep`:
 
 ```bash
 # Example: test 3 learning rates × 2 seeds
-uv run python framework/sweep.py --learning-rate 3e-4,5e-4,7e-4 --seeds 42,137 \
+uv run python framework/index.py sweep --learning-rate 3e-4,5e-4,7e-4 --seeds 42,137 \
   --time-budget 120 --tag lr_search
 
 # View results
-uv run python framework/analyze.py --matrix lr_search
+uv run python framework/index.py analyze --matrix lr_search
 ```
 
 This is a tool for you to use, not a replacement for your judgment. You decide the search space; sweep executes it.
@@ -86,7 +88,7 @@ This is a tool for you to use, not a replacement for your judgment. You decide t
    - `domains/gomoku/prepare.py` — minimax opponents, `evaluate_win_rate()` harness
    - `domains/gomoku/train.py` — the file you edit: model architecture, self-play, training loop, hyperparameters
 2. Install dependencies: `uv sync`
-3. Read the current experiment report: `uv run python framework/analyze.py --report --format json`
+3. Read the current experiment report: `uv run python framework/index.py analyze --report --format json`
 4. Begin the experiment loop.
 
 ## Experimentation
@@ -181,13 +183,13 @@ Tracker:    output/tracker.db
 
 LOOP FOREVER:
 
-1. **Read experiment report**: `uv run python src/analyze.py --report --format json`
+1. **Read experiment report**: `uv run python framework/index.py analyze --report --format json`
 2. **Analyze the report** — identify patterns in signals, win-rate frontier, stability
 3. **Form a hypothesis** based on the signals and data
-4. **Modify `src/train.py`** to test the hypothesis
-5. `git add src/train.py && git commit -m "experiment: <description>"`
-6. **Run**: `uv run python src/train.py --time-budget 300`
-7. **Read new report**: `uv run python src/analyze.py --report --format json`
+4. **Modify `domains/gomoku/train.py`** to test the hypothesis
+5. `git add domains/gomoku/train.py && git commit -m "experiment: <description>"`
+6. **Run**: `uv run python domains/gomoku/train.py --time-budget 300`
+7. **Read new report**: `uv run python framework/index.py analyze --report --format json`
 8. **Compare**: If win_rate improved → keep. If worse → `git reset --hard <previous kept commit>`
 9. **Check stage promotion**: if win_rate exceeds threshold, update `--eval-level` in next run
 10. GOTO 1

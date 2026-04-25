@@ -18,21 +18,20 @@ import time as _time
 import uuid
 
 # ── path setup for decoupled project structure ──
-# Domain dir (_THIS_DIR) MUST come before framework/ in sys.path so that
+# Domain dir (_THIS_DIR) MUST come before project root in sys.path so that
 # `from prepare import OPPONENTS` resolves to domains/gomoku/prepare.py
-# (with C minimax backend), NOT framework/prepare.py (pure-Python fallback).
+# (with C minimax backend), NOT framework template shims.
 # Python auto-adds the script dir to sys.path[0], but a subsequent insert(0)
-# for framework/ would push it to [1].  We add framework/ at index 1 to keep
+# for the project root would push it to [1]. We add the project root at index 1 to keep
 # the domain dir at [0].
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
-_fw_path = os.path.join(_PROJECT_ROOT, "framework")
-if _fw_path not in sys.path:
+if _PROJECT_ROOT not in sys.path:
     # Insert AFTER _THIS_DIR so domain prepare.py takes priority
     _idx = sys.path.index(_THIS_DIR) + 1 if _THIS_DIR in sys.path else 0
-    sys.path.insert(_idx, _fw_path)
+    sys.path.insert(_idx, _PROJECT_ROOT)
 os.chdir(_PROJECT_ROOT)  # ensure output/ paths resolve correctly
 
 import mlx.core as mx
@@ -41,12 +40,12 @@ import mlx.optimizers as optim
 import numpy as np
 
 from game import BatchBoards, BOARD_SIZE, BLACK, WHITE, EMPTY
-from core.tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, sparkline4 as _sparkline4_fn, progress_bar as _progress_bar_fn
-from core.mcts import MCTSNode, mcts_search as _mcts_search_generic, mcts_search_batched as _mcts_search_batched, mcts_search_multi_root as _mcts_search_multi_root
+from framework.core.tui import sparkline as _sparkline_fn, sparkline2 as _sparkline2_fn, sparkline3 as _sparkline3_fn, sparkline4 as _sparkline4_fn, progress_bar as _progress_bar_fn
+from framework.core.mcts import MCTSNode, mcts_search as _mcts_search_generic, mcts_search_batched as _mcts_search_batched, mcts_search_multi_root as _mcts_search_multi_root
 
 # Try native C MCTS — 10-20x faster tree operations
 try:
-    from core.mcts_native import mcts_search_multi_root_native as _mcts_native, is_available as _mcts_native_available
+    from framework.core.mcts_native import mcts_search_multi_root_native as _mcts_native, is_available as _mcts_native_available
     _USE_NATIVE_MCTS = _mcts_native_available()
 except ImportError:
     _USE_NATIVE_MCTS = False
@@ -931,7 +930,7 @@ def compute_loss_split(model, batch_boards, batch_policies, batch_values):
 
 def train(args):
     """Main training function with checkpoint tracking and text TUI."""
-    import core.db as _tracker
+    import framework.core.db as _tracker
 
     run_id = str(uuid.uuid4())
     run_id_short = run_id[:8]
@@ -2069,7 +2068,7 @@ def train(args):
     print(f"Checkpoints:{num_checkpoints}")
     print(f"Wall time:  {total_elapsed:.1f}s")
     print(f"Output:     {output_dir}/")
-    print(f"Tracker:    output/tracker.db")
+    print(f"Tracker:    {args.db}")
 
     # Promotion hints
     if final_wr is not None and final_wr >= 0.65:
@@ -2422,7 +2421,7 @@ def _do_checkpoint(model, db_conn, run_id, run_id_short, cycle,
                    opponent_model=None, eval_opponent_alias=None,
                    num_openings: int = 0):
     """Save checkpoint, run full eval (NN or subprocess minimax), record to DB."""
-    import core.db as _tracker
+    import framework.core.db as _tracker
 
     # Tag uses the crossed threshold (not raw probe WR)
     wr_pct = int((threshold if threshold is not None else win_rate) * 100)
@@ -2601,7 +2600,7 @@ def parse_args() -> argparse.Namespace:
 
 def _handle_register_opponent(args: argparse.Namespace) -> None:
     """Register a checkpoint model as a named opponent, then exit."""
-    import core.db as _tracker
+    import framework.core.db as _tracker
     import shutil
 
     alias = args.register_opponent

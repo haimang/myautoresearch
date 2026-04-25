@@ -10,7 +10,7 @@ import uuid
 
 import numpy as np
 
-from core.db import (
+from framework.core.db import (
     collect_hardware_info,
     create_run,
     finish_run,

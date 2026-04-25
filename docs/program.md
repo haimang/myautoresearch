@@ -11,12 +11,13 @@ Train a **<<<DOMAIN>>>** AI using the autoresearch experiment loop on Apple Sili
 ```
 project/
 ├── framework/               # ═══ autoresearch framework (domain-agnostic) ═══
-│   ├── tracker.py           # SQLite experiment tracking                [READ-ONLY]
-│   ├── analyze.py           # Query tracker.db + experiment reports     [READ-ONLY]
-│   ├── sweep.py             # Batch hyperparameter sweep                [READ-ONLY]
-│   ├── tui.py               # Terminal UI helpers (sparklines, panels)  [READ-ONLY]
-│   ├── train.py             # Training template (root copy)             [TEMPLATE]
-│   └── prepare.py           # Evaluation template (root copy)           [TEMPLATE]
+│   ├── index.py             # Unified CLI entrypoint                    [READ-ONLY]
+│   ├── core/                # DB, TUI, shared runtime helpers          [READ-ONLY]
+│   ├── facade/              # CLI facades                              [READ-ONLY]
+│   ├── services/            # Frontier/reporting/research services     [READ-ONLY]
+│   ├── policies/            # Stage/branch/selector/acquisition policy [READ-ONLY]
+│   ├── profiles/            # Search-space/objective profiles          [READ-ONLY]
+│   └── templates/           # Domain templates                         [READ-ONLY]
 ├── domains/
 │   └── <<<domain>>>/        # ═══ domain execution ═══
 │       ├── program.md       # Domain-specific agent instructions
@@ -43,22 +44,22 @@ project/
    - `domains/<<<domain>>>/prepare.py` — opponents, `evaluate_win_rate()` harness
    - `domains/<<<domain>>>/train.py` — the file you edit: architecture, self-play, training loop
 2. **Install dependencies**: `uv sync`
-3. **Read the current experiment report**: `uv run python framework/analyze.py --report --format json`
+3. **Read the current experiment report**: `uv run python framework/index.py analyze --report --format json`
 4. **Begin the experiment loop.**
 
 ## Available tools
 
 | Command | Purpose | When to use |
 |---------|---------|-------------|
-| `analyze.py --report` | Full experiment report (markdown) | **START HERE** each iteration |
-| `analyze.py --report --format json` | Structured report for parsing | When you need precise numbers |
-| `analyze.py --compare RUN_A RUN_B` | Side-by-side run comparison | After an experiment |
-| `analyze.py --stability RUN_ID` | Detailed stability metrics | To diagnose training issues |
-| `analyze.py --frontier` | Win-rate progression frontier | To see historical progress |
-| `analyze.py --runs` | List all runs | Overview of experiment history |
-| `sweep.py --dry-run ...` | Preview sweep configurations | Before systematic search |
-| `sweep.py ...` | Run batch hyperparameter search | Explore a parameter range |
-| `analyze.py --matrix TAG` | View sweep results | After a sweep completes |
+| `index.py analyze --report` | Full experiment report (markdown) | **START HERE** each iteration |
+| `index.py analyze --report --format json` | Structured report for parsing | When you need precise numbers |
+| `index.py analyze --compare RUN_A RUN_B` | Side-by-side run comparison | After an experiment |
+| `index.py analyze --stability RUN_ID` | Detailed stability metrics | To diagnose training issues |
+| `index.py analyze --frontier` | Win-rate progression frontier | To see historical progress |
+| `index.py analyze --runs` | List all runs | Overview of experiment history |
+| `index.py sweep --dry-run ...` | Preview sweep configurations | Before systematic search |
+| `index.py sweep ...` | Run batch hyperparameter search | Explore a parameter range |
+| `index.py analyze --matrix TAG` | View sweep results | After a sweep completes |
 
 ## Experimentation
 
@@ -113,12 +114,12 @@ All experiment data is stored in `output/tracker.db` (SQLite). Key tables:
 
 ```
 LOOP:
-  1. Read report: analyze.py --report --format json
+  1. Read report: index.py analyze --report --format json
   2. Form hypothesis from signals + data
   3. Edit domains/<<<domain>>>/train.py
   4. Commit: git add domains/<<<domain>>>/train.py && git commit -m "experiment: <description>"
   5. Run: uv run python domains/<<<domain>>>/train.py --time-budget 300
-  6. Check results: analyze.py --report
+  6. Check results: index.py analyze --report
   7. If improved: commit results, continue
   8. If same/worse: git reset, try different hypothesis
   9. Check for stage promotion (threshold exceeded → harder opponent)

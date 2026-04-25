@@ -15,12 +15,11 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
-_fw_path = os.path.join(_PROJECT_ROOT, "framework")
-if _fw_path not in sys.path:
-    sys.path.insert(1, _fw_path)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(1, _PROJECT_ROOT)
 os.chdir(_PROJECT_ROOT)
 
-from core.db import (  # noqa: E402
+from framework.core.db import (  # noqa: E402
     DB_PATH,
     collect_hardware_info,
     create_run,

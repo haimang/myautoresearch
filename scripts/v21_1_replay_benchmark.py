@@ -11,12 +11,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from acquisition import replay_recommendation_history
-from acquisition_policy import load_acquisition_policy
-from core.db import DB_PATH, get_campaign, init_db
+from framework.services.research.acquisition_service import replay_recommendation_history
+from framework.policies.acquisition_policy import load_acquisition_policy
+from framework.core.db import DB_PATH, get_campaign, init_db
 
 
 def parse_args():

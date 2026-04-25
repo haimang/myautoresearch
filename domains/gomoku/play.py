@@ -24,11 +24,10 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
-_fw_path = os.path.join(_PROJECT_ROOT, "framework")
-if _fw_path not in sys.path:
+if _PROJECT_ROOT not in sys.path:
     # Insert AFTER domain dir so domains/gomoku/prepare.py takes priority
     _idx = sys.path.index(_THIS_DIR) + 1 if _THIS_DIR in sys.path else 0
-    sys.path.insert(_idx, _fw_path)
+    sys.path.insert(_idx, _PROJECT_ROOT)
 
 import numpy as np
 
@@ -38,7 +37,7 @@ from game import (
 )
 from play_service import load_nn_player, load_registered_opponent, resolve_checkpoint
 from prepare import OPPONENTS
-import core.db as tracker
+import framework.core.db as tracker
 
 
 def print_checkpoints():

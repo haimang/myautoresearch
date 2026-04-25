@@ -16,8 +16,8 @@ _DOMAIN_DIR = _THIS_DIR.parent                       # domains/gomoku/
 _PROJECT_ROOT = _DOMAIN_DIR.parent.parent             # mag-gomoku/
 if str(_DOMAIN_DIR) not in sys.path:
     sys.path.insert(0, str(_DOMAIN_DIR))
-if str(_PROJECT_ROOT / "framework") not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT / "framework"))
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(1, str(_PROJECT_ROOT))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware

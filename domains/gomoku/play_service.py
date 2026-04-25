@@ -12,17 +12,16 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
-_fw_path = os.path.join(_PROJECT_ROOT, "framework")
-if _fw_path not in sys.path:
+if _PROJECT_ROOT not in sys.path:
     # Insert AFTER domain dir so domains/gomoku/prepare.py takes priority
     _idx = sys.path.index(_THIS_DIR) + 1 if _THIS_DIR in sys.path else 0
-    sys.path.insert(_idx, _fw_path)
+    sys.path.insert(_idx, _PROJECT_ROOT)
 
 import numpy as np
 
 from game import BOARD_SIZE, Board
 from prepare import OPPONENTS
-import core.db as tracker
+import framework.core.db as tracker
 
 
 PlayerFn = Callable[[Board], tuple[int, int]]
@@ -85,7 +84,7 @@ def load_nn_player(checkpoint_path: str, mcts_sims: int = 0,
     model = _load_cached_model(checkpoint_path, num_blocks, num_filters)
 
     if mcts_sims > 0:
-        from core.mcts import mcts_search_batched
+        from framework.core.mcts import mcts_search_batched
 
         def _evaluate_batch(states):
             encodings = np.stack([s.encode() for s in states])

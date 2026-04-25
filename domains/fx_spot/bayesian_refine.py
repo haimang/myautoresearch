@@ -15,9 +15,8 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
-_fw_path = os.path.join(_PROJECT_ROOT, "framework")
-if _fw_path not in sys.path:
-    sys.path.insert(1, _fw_path)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(1, _PROJECT_ROOT)
 os.chdir(_PROJECT_ROOT)
 
 from bayes_adapter import (  # noqa: E402
@@ -33,19 +32,19 @@ from bayes_adapter import (  # noqa: E402
     save_observation,
     utility_from_result,
 )
-from core.db import (  # noqa: E402
+from framework.core.db import (  # noqa: E402
     get_or_create_campaign,
     init_db,
     save_experiment_run,
     save_objective_profile,
     save_search_space,
 )
-from objective_profile import load_objective_profile  # noqa: E402
-from pareto_plot import plot_pareto_artifacts  # noqa: E402
-from search_space import load_profile  # noqa: E402
-from services.bayes.benchmark import summarize_frontier  # noqa: E402
-from services.bayes.loop import run_strategy  # noqa: E402
-from services.frontier.pareto import compute_knee_point, pareto_front  # noqa: E402
+from framework.profiles.objective_profile import load_objective_profile  # noqa: E402
+from framework.services.frontier.plotting import plot_pareto_artifacts  # noqa: E402
+from framework.profiles.search_space import load_profile  # noqa: E402
+from framework.services.bayes.benchmark import summarize_frontier  # noqa: E402
+from framework.services.bayes.loop import run_strategy  # noqa: E402
+from framework.services.frontier.pareto import compute_knee_point, pareto_front  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

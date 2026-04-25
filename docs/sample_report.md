@@ -1,6 +1,6 @@
 # MAG-Gomoku 实验报告（人类可读版）
 
-> 生成命令: `uv run python src/analyze.py --report`
+> 生成命令: `uv run python framework/index.py analyze --report`
 > 时间戳: 2026-04-11T10:05:32
 
 ---

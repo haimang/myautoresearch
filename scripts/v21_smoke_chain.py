@@ -9,10 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
-if str(FRAMEWORK) not in sys.path:
-    sys.path.insert(0, str(FRAMEWORK))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from core.db import (
+from framework.core.db import (
     create_run,
     finish_run,
     get_or_create_campaign,
@@ -25,11 +25,11 @@ from core.db import (
     get_latest_recommendation_batch,
     list_recommendations_for_batch,
 )
-from search_space import load_profile
+from framework.profiles.search_space import load_profile
 
 PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 SELECTOR_POLICY = ROOT / "domains" / "gomoku" / "selector_policy.json"
-ANALYZE = ROOT / "framework" / "analyze.py"
+INDEX = ROOT / "framework" / "index.py"
 
 DB_PATH = ROOT / "output" / "v21_smoke.db"
 
@@ -102,7 +102,7 @@ def main():
 
     # 3. Generate recommendation batch via CLI
     proc = subprocess.run(
-        [sys.executable, str(ANALYZE),
+        [sys.executable, str(INDEX), "analyze",
          "--db", str(db_path),
          "--recommend-next", campaign_name,
          "--selector-policy", str(SELECTOR_POLICY),
@@ -170,7 +170,7 @@ def main():
     # 7. Verify via CLI
     conn.close()
     proc = subprocess.run(
-        [sys.executable, str(ANALYZE),
+        [sys.executable, str(INDEX), "analyze",
          "--db", str(db_path),
          "--recommendation-outcomes", campaign_name],
         capture_output=True, text=True, cwd=ROOT,
