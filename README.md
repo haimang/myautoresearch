@@ -37,25 +37,19 @@
 ```
 myautoresearch/
 ├── framework/                      ═══ 框架层（domain-agnostic）═══
-│   ├── analyze.py                  只读分析：报告 / Pareto / campaign / stage / trajectory / recommendation
-│   ├── sweep.py                    超参矩阵 sweep / campaign-aware point execution
-│   ├── promote.py                  multi-fidelity promotion planner / executor
-│   ├── branch.py                   continuation / trajectory planner / executor
-│   ├── selector.py                 next-point / next-branch recommendation
-│   ├── acquisition.py              v21.1 candidate-pool acquisition reranker
-│   ├── search_space.py             search-space profile loader / validator
-│   ├── objective_profile.py        v22 domain-generic objective profile loader / validator
-│   ├── stage_policy.py             stage policy loader / validator
-│   ├── branch_policy.py            branch policy loader / validator
-│   ├── selector_policy.py          selector policy loader / validator
-│   ├── acquisition_policy.py       acquisition policy loader / validator
-│   └── core/
-│       ├── db.py                   tracker.db schema + migrations + campaign / trajectory / recommendation / acquisition / run_metrics ledger
-│       ├── tui.py                  ASCII sparkline / progress bar
-│       ├── mcts.py                 通用 MCTS 算法（Python 参考实现）
-│       ├── mcts_c.c                C 原生 MCTS 树操作（v14 落地）
-│       ├── mcts_native.py          mcts_c 的 ctypes wrapper
-│       └── build_native.sh         一行编译脚本
+│   ├── index.py                    统一 CLI 入口（analyze / sweep / promote / branch）
+│   ├── core/
+│   │   ├── db.py                   tracker.db schema + migrations + campaign / trajectory / recommendation / acquisition / run_metrics ledger
+│   │   ├── tui.py                  ASCII sparkline / progress bar
+│   │   ├── mcts.py                 通用 MCTS 算法（Python 参考实现）
+│   │   ├── mcts_c.c                C 原生 MCTS 树操作（v14 落地）
+│   │   ├── mcts_native.py          mcts_c 的 ctypes wrapper
+│   │   └── build_native.sh         一行编译脚本
+│   ├── facade/                     CLI facade / 参数解析
+│   ├── services/                   frontier / reporting / research / execution / bayes
+│   ├── policies/                   stage / branch / selector / acquisition policy
+│   ├── profiles/                   search-space / objective-profile loader
+│   └── templates/                  domain train / prepare template
 │
 ├── domains/                        ═══ 可替换的 domain 层 ═══
 │   ├── gomoku/                     —— 五子棋 domain ——
@@ -97,7 +91,7 @@ myautoresearch/
 **框架与 domain 的契约** 是两个东西：
 
 1. **tracker.db schema**（数据协议）：Gomoku legacy 仍写 `final_win_rate / wall_time_s / total_games / total_steps / num_params`；v22 之后的新 domain 优先写 `run_metrics`，并用 `objective_profiles` 声明目标、约束、显示格式和 knee point 规则。
-2. **CLI subprocess 协议**：`sweep.py` / `branch.py` 通过 `python domains/<name>/train.py --time-budget N --sweep-tag X ...` 启动 domain；v22 的 generic domain 还可以接收 `--candidate-json`。退出码 0 = 成功。
+2. **CLI subprocess 协议**：`framework/index.py sweep` / `framework/index.py branch` 通过 `python domains/<name>/train.py --time-budget N --sweep-tag X ...` 启动 domain；v22 的 generic domain 还可以接收 `--candidate-json`。退出码 0 = 成功。
 
 这两个协议合在一起就是 "如何接入新 domain"。详见下文 [Domain 接入指南](#domain-接入指南)。
 
@@ -115,13 +109,13 @@ myautoresearch/
 │  Autoresearch Layer    高层判断：读报告、提假设、修代码、决策保留/回退 │
 ├─────────────────────────────────────────────────────────────┤
 │  Local Exploration     局部探索：sweep / 多 seed / 阈值扫描 │
-│        (sweep.py)                                            │
+│   (index.py sweep)                                           │
 ├─────────────────────────────────────────────────────────────┤
 │  Benchmark Layer       标准化真理：固定预算 / 固定对手 / 固定评估  │
-│  (train.py + db.py)                                          │
+│  (domain train.py + db.py)                                   │
 ├─────────────────────────────────────────────────────────────┤
 │  Pareto Layer          Trade-off 组织：成本轴 vs 真理轴的非支配前沿 │
-│  (analyze.py --pareto)                                       │
+│  (index.py analyze --pareto)                                 │
 ├─────────────────────────────────────────────────────────────┤
 │  Human Decision Layer  人类选点：在 Pareto 边界上做最终决定        │
 └─────────────────────────────────────────────────────────────┘
@@ -176,12 +170,12 @@ uv run python domains/gomoku/train.py \
 ### 2. 阅读训练报告
 
 ```bash
-uv run python framework/analyze.py --runs                 # 列出所有 run
-uv run python framework/analyze.py --report               # 实验报告（中文）
-uv run python framework/analyze.py --pareto               # Pareto 前沿
-uv run python framework/analyze.py --promotion-chain      # v15 新增
-uv run python framework/analyze.py --opening-breakdown <run_uuid>  # v15 新增
-uv run python framework/analyze.py --stability <run_uuid>
+uv run python framework/index.py analyze --runs                 # 列出所有 run
+uv run python framework/index.py analyze --report               # 实验报告（中文）
+uv run python framework/index.py analyze --pareto               # Pareto 前沿
+uv run python framework/index.py analyze --promotion-chain      # v15 新增
+uv run python framework/index.py analyze --opening-breakdown <run_uuid>  # v15 新增
+uv run python framework/index.py analyze --stability <run_uuid>
 ```
 
 ### 3. 浏览器对弈
@@ -243,40 +237,40 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
 - **Campaign / search-space governance**（v20.1）
   - `search_spaces` / `campaigns` / `campaign_runs`
   - protocol drift guard
-  - `analyze.py --campaign-summary`
+  - `index.py analyze --campaign-summary`
 
 - **Multi-fidelity promotion**（v20.2）
   - `campaign_stages` / `promotion_decisions`
-  - `promote.py`
-  - `stage_policy.py`
-  - `analyze.py --stage-summary / --promotion-log`
+  - `index.py promote`
+  - `framework.policies.stage_policy`
+  - `index.py analyze --stage-summary / --promotion-log`
 
 - **Continuation / trajectory**（v20.3）
   - `run_branches`
-  - `branch.py`
-  - `branch_policy.py`
-  - `analyze.py --branch-tree / --trajectory-report / --compare-parent-child`
+  - `index.py branch`
+  - `framework.policies.branch_policy`
+  - `index.py analyze --branch-tree / --trajectory-report / --compare-parent-child`
 
 - **Recommendation / selector**（v21）
-  - `selector.py`
-  - `selector_policy.py`
+  - `framework.services.research.selector_service`
+  - `framework.policies.selector_policy`
   - `recommendation_batches` / `recommendations` / `recommendation_outcomes`
-  - `analyze.py --recommend-next / --recommendation-log / --recommendation-outcomes`
+  - `index.py analyze --recommend-next / --recommendation-log / --recommendation-outcomes`
 
 - **Acquisition / execution closure**（v21.1）
-  - `acquisition.py`
-  - `acquisition_policy.py`
+  - `framework.services.research.acquisition_service`
+  - `framework.policies.acquisition_policy`
   - `surrogate_snapshots`
-  - accepted recommendation 可直接由 `sweep.py` / `branch.py` 执行
-  - `analyze.py --acquisition-summary`
+  - accepted recommendation 可直接由 `framework/index.py sweep` / `framework/index.py branch` 执行
+  - `index.py analyze --acquisition-summary`
   - `scripts/v21_1_replay_benchmark.py`
 
 - **Multi-domain metric / objective layer**（v22）
   - `objective_profiles` / `run_metrics`
   - campaign 可绑定 objective profile
-  - `analyze.py --pareto --metric-source run_metrics --objective-profile ...`
+  - `index.py analyze --pareto --metric-source run_metrics --objective-profile ...`
   - generic Pareto 支持 hard constraints、infeasible 分组和 knee point
-  - `pareto_plot.py` 支持 profile-driven axis label / formatter / knee marker
+  - `framework.services.frontier.plotting` 支持 profile-driven axis label / formatter / knee marker
 
 - **Spot FX mock domain**（v22）
   - `domains/fx_spot/`
@@ -322,7 +316,7 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
 | `--register-opponent ALIAS --from-run UUID --from-tag TAG` | 手动注册对手 |
 | `--seed N` | 随机种子 |
 
-### `framework/analyze.py`
+### `framework/index.py analyze`
 
 | 子命令 | 说明 |
 |--------|------|
@@ -375,12 +369,12 @@ myautoresearch 框架对一个新 domain 的最小要求：
 
 接入完成后，**framework 层自动复用**：
 
-- `sweep.py` 可以 sweep 你的超参矩阵或 dynamic JSON candidate
-- `promote.py` 可以做多阶段晋升
-- `branch.py` 可以做 continuation / trajectory
-- `analyze.py --pareto` 可以画你的成本 vs 真理前沿，或按 objective profile 读取 `run_metrics`
-- `analyze.py --recommend-next` 可以生成 recommendation
-- `analyze.py --acquisition-summary` 可以追踪 acquisition evidence
+- `index.py sweep` 可以 sweep 你的超参矩阵或 dynamic JSON candidate
+- `index.py promote` 可以做多阶段晋升
+- `index.py branch` 可以做 continuation / trajectory
+- `index.py analyze --pareto` 可以画你的成本 vs 真理前沿，或按 objective profile 读取 `run_metrics`
+- `index.py analyze --recommend-next` 可以生成 recommendation
+- `index.py analyze --acquisition-summary` 可以追踪 acquisition evidence
 - tracker.db 自动追踪所有数据
 
 参考实现：`domains/gomoku/`（完整训练 domain，含 game engine + minimax + train loop + replay + web UI）与 `domains/fx_spot/`（轻量 mock domain，展示 v22 generic metrics / objective profile / quote evidence）。
@@ -394,8 +388,8 @@ myautoresearch 框架对一个新 domain 的最小要求：
 | v11-v15 | Gomoku 训练基座 | MCTS / minimax / async eval / promotion gate / reporting |
 | **v20** | Point frontier observation | Pareto / frontier snapshot / sweep auto-pareto |
 | **v20.1** | Search-space schema + campaign ledger | `search_spaces` / `campaigns` / `campaign_runs` |
-| **v20.2** | Multi-fidelity promotion | `campaign_stages` / `promotion_decisions` / `promote.py` |
-| **v20.3** | Continuation / trajectory | `run_branches` / `branch.py` / trajectory report |
+| **v20.2** | Multi-fidelity promotion | `campaign_stages` / `promotion_decisions` / `index.py promote` |
+| **v20.3** | Continuation / trajectory | `run_branches` / `index.py branch` / trajectory report |
 | **v21** | Selector / recommendation | next-point / next-branch recommendation ledger |
 | **v21.1** | Acquisition / execution closure | accepted recommendation execution / surrogate snapshots / replay benchmark |
 | **v22** | Multi-domain / spot FX quote-surface | `run_metrics` / `objective_profiles` / dynamic candidate / `fx_spot` mock domain |
