@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
 if str(FRAMEWORK) not in sys.path:
     sys.path.insert(0, str(FRAMEWORK))
+FX_SPOT = ROOT / "domains" / "fx_spot"
+if str(FX_SPOT) not in sys.path:
+    sys.path.insert(0, str(FX_SPOT))
 
 from core.db import get_or_create_campaign, init_db, save_objective_profile, save_search_space
 from objective_profile import load_objective_profile
@@ -67,7 +70,11 @@ class TestFxSpotDomain(unittest.TestCase):
             legs = conn.execute("SELECT COUNT(*) AS n FROM fx_route_legs WHERE run_id = ?", (run["id"],)).fetchone()
             conn.close()
             self.assertEqual(run["status"], "completed")
-            self.assertEqual(len(metrics), 9)
+            metric_names = {m["metric_name"] for m in metrics}
+            self.assertIn("liquidity_breach_count", metric_names)
+            self.assertIn("effective_leg_count", metric_names)
+            self.assertIn("breach_margin_ratio", metric_names)
+            self.assertGreaterEqual(len(metrics), 15)
             self.assertEqual(windows["n"], 1)
             self.assertEqual(quotes["n"], 1)
             self.assertEqual(legs["n"], 1)
@@ -121,6 +128,48 @@ class TestFxSpotDomain(unittest.TestCase):
             self.assertEqual(window["anchor_currency"], "USD")
             self.assertIn("HKD", json.loads(window["portfolio_snapshot_json"]))
             self.assertEqual(quotes["n"], 2)
+
+    def test_floor_probe_can_create_infeasible_constraint_evidence(self):
+        from mock_provider import MockQuoteProvider
+        from portfolio import clone_floors, clone_portfolio
+        from route_eval import evaluate_route
+        from treasury_scenarios import apply_treasury_scenario
+
+        candidate = apply_treasury_scenario({
+            "treasury_scenario": "cn_exporter_core",
+            "sell_currency": "USD",
+            "buy_currency": "CNY",
+            "route_template": "direct",
+            "rebalance_fraction": 0.5,
+            "sell_amount_mode": "floor_probe",
+            "floor_buffer_target": -0.05,
+            "max_legs": 2,
+            "quote_scenario": "constraint_stress",
+        })
+        result = evaluate_route(
+            candidate=candidate,
+            portfolio=clone_portfolio(candidate["portfolio"]),
+            floors=clone_floors(candidate["liquidity_floors"]),
+            anchor_currency=candidate["anchor_currency"],
+            provider=MockQuoteProvider(scenario="constraint_stress"),
+        )
+        self.assertEqual(result["metrics"]["liquidity_floor_ok"], 0.0)
+        self.assertGreater(result["metrics"]["liquidity_breach_count"], 0.0)
+        self.assertIn("liquidity_floor_breach", result["breach_reasons"])
+
+    def test_degenerate_bridge_can_be_rejected(self):
+        from quote_graph import route_for_candidate
+
+        with self.assertRaises(ValueError):
+            route_for_candidate(
+                {
+                    "sell_currency": "USD",
+                    "buy_currency": "CNY",
+                    "route_template": "via_usd",
+                    "reject_degenerate_bridge": True,
+                },
+                anchor_currency="CNY",
+            )
 
 
 if __name__ == "__main__":
