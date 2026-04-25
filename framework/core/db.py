@@ -340,6 +340,25 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE campaigns ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    # v23: filesystem-level experiment run/workspace identity. This is distinct
+    # from runs.id, which remains the per-candidate execution id.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS experiment_runs (
+            id                   TEXT PRIMARY KEY,
+            domain               TEXT NOT NULL,
+            created_at           TEXT NOT NULL,
+            objective_profile_id TEXT,
+            output_root          TEXT NOT NULL,
+            manifest_json        TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_experiment_runs_domain "
+                 "ON experiment_runs(domain)")
+    for col, typ in [("experiment_run_id", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE campaigns ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS campaign_runs (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -570,9 +589,15 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
         ("constraints_json", "TEXT"),
         ("knee_run_id", "TEXT"),
         ("knee_rationale_json", "TEXT"),
+        ("artifact_dir", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE frontier_snapshots ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+    for col, typ in [("artifact_dir", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
 
@@ -766,6 +791,12 @@ def create_run(conn: sqlite3.Connection, run_id: str,
             hyperparams.get("seed"),
         ),
     )
+    artifact_dir = hyperparams.get("artifact_dir") or output_dir
+    if artifact_dir:
+        try:
+            conn.execute("UPDATE runs SET artifact_dir = ? WHERE id = ?", (artifact_dir, run_id))
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
@@ -883,6 +914,35 @@ def get_objective_profile(conn: sqlite3.Connection, profile_id: str) -> Optional
         (profile_id,),
     ).fetchone()
     return row
+
+
+def save_experiment_run(
+    conn: sqlite3.Connection, *,
+    run_id: str,
+    domain: str,
+    output_root: str,
+    manifest: dict,
+    objective_profile_id: Optional[str] = None,
+) -> None:
+    """Persist a filesystem-level experiment workspace identity."""
+    conn.execute(
+        """INSERT INTO experiment_runs
+           (id, domain, created_at, objective_profile_id, output_root, manifest_json)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               objective_profile_id = excluded.objective_profile_id,
+               output_root = excluded.output_root,
+               manifest_json = excluded.manifest_json""",
+        (
+            run_id,
+            domain,
+            datetime.now(timezone.utc).isoformat(),
+            objective_profile_id,
+            output_root,
+            _stable_json(manifest),
+        ),
+    )
+    conn.commit()
 
 
 def get_campaign(conn: sqlite3.Connection, campaign: str) -> Optional[sqlite3.Row]:

@@ -1590,19 +1590,21 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
             for p in front:
                 print("  " + "  ".join(f"{str(round(p.get(c), 6)) if isinstance(p.get(c), float) else str(p.get(c, '-')):>18}" for c in cols))
         if plot:
-            from pareto_plot import plot_pareto
+            from pareto_plot import plot_pareto_artifacts
             y_axis = maximize[0] if maximize else None
             x_axis = minimize[0] if minimize else None
             if y_axis and x_axis:
-                path = plot_pareto(
+                artifacts = plot_pareto_artifacts(
                     front, dominated,
                     x_key=x_axis, y_key=y_axis,
                     label_key="label",
                     output_path=output_path or "output/pareto_front.png",
                     axis_meta=_objective_axis_meta(profile),
                     knee_point=knee,
+                    metrics=maximize + minimize,
                 )
-                print(f"  📊 Plot saved: {path}")
+                print(f"  📊 Plot saved: {artifacts['overview']}")
+                print(f"  📄 Front table: {artifacts['front_csv']}")
         return
 
     select_sql = """SELECT id, num_res_blocks, num_filters, num_params,

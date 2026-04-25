@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
@@ -28,6 +29,7 @@ from core.db import (
     save_recommendation_outcome,
     save_campaign_stage,
     save_objective_profile,
+    save_experiment_run,
     save_search_space,
     update_recommendation_status,
 )
@@ -75,6 +77,10 @@ def parse_args():
                     help="JSON search-space profile 路径（v20.1）")
     p.add_argument("--objective-profile", type=str, default=None,
                    help="JSON objective profile path for domain-generic metrics (v22)")
+    p.add_argument("--run-id", type=str, default=None,
+                   help="Filesystem-level experiment run id for run-scoped artifacts (v23)")
+    p.add_argument("--output-root", type=str, default="output",
+                   help="Root directory for run-scoped artifacts (default: output)")
     p.add_argument("--stage-policy", type=str, default=None,
                    help="JSON stage-policy 路径（v20.2）")
     p.add_argument("--stage", type=str, default=None,
@@ -266,6 +272,51 @@ def build_matrix(args, profile: dict | None = None):
     return configs
 
 
+def _filter_fx_degenerate_routes(configs: list[dict], profile: dict | None) -> list[dict]:
+    if not profile or profile.get("domain") != "fx_spot":
+        return configs
+    out = []
+    for cfg in configs:
+        template = cfg.get("route_template")
+        if isinstance(template, str) and template.startswith("via_"):
+            bridge = template[4:].upper()
+            sell = str(cfg.get("sell_currency", "")).upper()
+            buy = str(cfg.get("buy_currency", "")).upper()
+            if bridge in (sell, buy):
+                continue
+        out.append(cfg)
+    return out
+
+
+def _maybe_setup_run_workspace(args, profile: dict | None, objective_profile: dict | None) -> dict | None:
+    """Create a v23 run-scoped workspace for fx_spot sweeps."""
+    if not profile or profile.get("domain") != "fx_spot":
+        return None
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("fx-%Y%m%d-%H%M%S")
+    workspace = os.path.join(args.output_root, "fx_spot", run_id)
+    os.makedirs(workspace, exist_ok=True)
+    os.makedirs(os.path.join(workspace, "logs"), exist_ok=True)
+    os.makedirs(os.path.join(workspace, "campaigns"), exist_ok=True)
+    if args.db == DB_PATH:
+        args.db = os.path.join(workspace, "tracker.db")
+    manifest = {
+        "fx_run_id": run_id,
+        "domain": "fx_spot",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "campaign": args.campaign,
+        "search_space": args.search_space,
+        "objective_profile": args.objective_profile,
+        "search_space_hash": profile.get("profile_hash"),
+        "objective_profile_hash": (objective_profile or {}).get("profile_hash"),
+        "db": args.db,
+    }
+    with open(os.path.join(workspace, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False, sort_keys=True)
+    args.run_id = run_id
+    args._artifact_root = workspace
+    return manifest
+
+
 def _derive_protocol(args, profile: dict | None) -> dict:
     profile_protocol = (profile or {}).get("protocol", {})
     eval_level = args.eval_level if args.eval_level is not None else profile_protocol.get("eval_level")
@@ -311,6 +362,13 @@ def _ensure_campaign(conn, args, profile: dict | None, protocol: dict, objective
         protocol=protocol,
         objective_profile_id=objective_profile_id,
     )
+    if getattr(args, "run_id", None):
+        conn.execute(
+            "UPDATE campaigns SET experiment_run_id = ? WHERE id = ?",
+            (args.run_id, campaign["id"]),
+        )
+        conn.commit()
+        campaign = dict(get_campaign(conn, campaign["id"]))
     return campaign, search_space_id
 
 
@@ -327,6 +385,10 @@ def run_one(cfg, args, idx, total, campaign=None):
         cmd += ["--db", args.db]
     if campaign and campaign.get("objective_profile_id"):
         cmd += ["--campaign-id", campaign["id"]]
+    if getattr(args, "run_id", None):
+        cmd += ["--run-id", args.run_id]
+    if getattr(args, "_artifact_root", None):
+        cmd += ["--artifact-root", args._artifact_root]
 
     if "num_blocks" in cfg and cfg["num_blocks"] is not None:
         cmd += ["--num-blocks", str(cfg["num_blocks"])]
@@ -593,6 +655,7 @@ def main():
                 f"objective profile domain '{objective_profile['domain']}' != search-space domain '{profile['domain']}'"
             )
         configs = build_matrix(args, profile)
+        configs = _filter_fx_degenerate_routes(configs, profile)
 
         selected_axes = {}
         for key in ("num_blocks", "num_filters", "learning_rate", "steps_per_cycle", "buffer_size"):
@@ -628,6 +691,7 @@ def main():
         if args.time_budget is None:
             raise ValueError("--time-budget is required when --stage is not specified")
 
+        workspace_manifest = _maybe_setup_run_workspace(args, profile, objective_profile)
         db_conn = init_db(args.db)
         campaign = None
         if args.campaign:
@@ -643,6 +707,15 @@ def main():
                     seed_target=stage_cfg["seed_count"],
                     status="open",
                 )
+        if workspace_manifest and args.run_id:
+            save_experiment_run(
+                db_conn,
+                run_id=args.run_id,
+                domain=profile["domain"],
+                output_root=getattr(args, "_artifact_root"),
+                manifest=workspace_manifest,
+                objective_profile_id=campaign.get("objective_profile_id") if campaign else None,
+            )
     except ValueError as exc:
         print(f"Error: {exc}")
         sys.exit(1)
@@ -722,7 +795,12 @@ def main():
         print("自动 Pareto 分析...")
         print(f"{'─'*60}\n")
         plot_key = campaign["name"] if campaign else args.tag
-        pareto_plot_path = f"output/pareto_{plot_key}.png"
+        if getattr(args, "_artifact_root", None) and campaign:
+            pareto_dir = os.path.join(args._artifact_root, "campaigns", campaign["name"], "pareto")
+            os.makedirs(pareto_dir, exist_ok=True)
+            pareto_plot_path = os.path.join(pareto_dir, "overview.png")
+        else:
+            pareto_plot_path = f"output/pareto_{plot_key}.png"
         pareto_cmd = [
             sys.executable, os.path.join(os.path.dirname(__file__), "analyze.py"),
             "--pareto", "--plot", "--output", pareto_plot_path,
