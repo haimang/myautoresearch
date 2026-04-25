@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from core.db import get_latest_checkpoint, get_objective_profile, get_search_space
+from framework.core.db import get_latest_checkpoint, get_objective_profile, get_search_space
 
 
 def stable_json(obj: dict) -> str:

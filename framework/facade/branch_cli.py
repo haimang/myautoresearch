@@ -14,9 +14,9 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _FRAMEWORK_DIR not in sys.path:
     sys.path.insert(0, _FRAMEWORK_DIR)
 
-from branch_policy import load_branch_policy
-from core.db import DB_PATH, get_branch_by_id, get_search_space, init_db, save_run_branch
-from services.research.branch_service import (
+from framework.policies.branch_policy import load_branch_policy
+from framework.core.db import DB_PATH, get_branch_by_id, get_search_space, init_db, save_run_branch
+from framework.services.research.branch_service import (
     execute_branch_recommendation,
     execute_branches,
     plan_branches,

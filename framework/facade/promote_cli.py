@@ -13,9 +13,9 @@ _FRAMEWORK_DIR = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
 if _FRAMEWORK_DIR not in sys.path:
     sys.path.insert(0, _FRAMEWORK_DIR)
 
-from core.db import DB_PATH, get_campaign_stages, get_search_space, init_db, save_campaign_stage
-from stage_policy import load_stage_policy, next_stage_name
-from services.research.promotion_service import execute_promotion, plan_promotion, print_plan, resolve_campaign
+from framework.core.db import DB_PATH, get_campaign_stages, get_search_space, init_db, save_campaign_stage
+from framework.policies.stage_policy import load_stage_policy, next_stage_name
+from framework.services.research.promotion_service import execute_promotion, plan_promotion, print_plan, resolve_campaign
 
 
 def parse_args():

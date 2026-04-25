@@ -202,7 +202,7 @@ def format_report_md(data: dict) -> str:
     lines = []
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     lines.append("# 实验报告")
-    lines.append(f"\n> 生成命令: `uv run python framework/analyze.py --report`")
+    lines.append(f"\n> 生成命令: `uv run python framework/index.py analyze --report`")
     lines.append(f"> 时间戳: {ts}")
     recent = data["recent"]
     lines.append("\n## 1. 近期训练运行")
@@ -340,7 +340,7 @@ def format_report_json(data: dict) -> str:
         }
     report = {
         "report_version": "1.0",
-        "generated_by": "framework/analyze.py --report --format json",
+        "generated_by": "framework/index.py analyze --report --format json",
         "timestamp": ts,
         "stage": data["stage"],
         "recent_runs": recent_runs,

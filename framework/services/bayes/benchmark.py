@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from services.frontier.pareto import compute_knee_point, pareto_front
+from framework.services.frontier.pareto import compute_knee_point, pareto_front
 
 
 def summarize_frontier(

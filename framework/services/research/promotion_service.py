@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from core.db import (
+from framework.core.db import (
     aggregate_candidates_by_stage,
     close_campaign_stage,
     find_run_by_sweep_tag,

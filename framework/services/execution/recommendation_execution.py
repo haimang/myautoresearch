@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 
-from core.db import (
+from framework.core.db import (
     find_run_by_sweep_tag,
     get_campaign,
     get_campaign_stages,
@@ -14,9 +14,9 @@ from core.db import (
     save_recommendation_outcome,
     update_recommendation_status,
 )
-from selector_policy import get_candidate_kind_config, load_selector_policy
-from services.execution.matrix import stable_candidate_key
-from services.research.outcome_service import build_frontier_delta
+from framework.policies.selector_policy import get_candidate_kind_config, load_selector_policy
+from framework.services.execution.matrix import stable_candidate_key
+from framework.services.research.outcome_service import build_frontier_delta
 
 from .sweep_runner import run_one
 

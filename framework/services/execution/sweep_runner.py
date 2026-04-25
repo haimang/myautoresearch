@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from search_space import describe_profile
+from framework.profiles.search_space import describe_profile
 
 
 def run_one(cfg, args, idx, total, campaign=None):

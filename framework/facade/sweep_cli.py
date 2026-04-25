@@ -18,7 +18,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _FRAMEWORK_DIR not in sys.path:
     sys.path.insert(0, _FRAMEWORK_DIR)
 
-from core.db import (
+from framework.core.db import (
     DB_PATH,
     find_run_by_sweep_tag,
     get_or_create_campaign,
@@ -30,9 +30,9 @@ from core.db import (
     save_experiment_run,
     save_search_space,
 )
-from objective_profile import load_objective_profile
-from search_space import describe_profile, load_profile, validate_selected_axes
-from services.execution.matrix import (
+from framework.profiles.objective_profile import load_objective_profile
+from framework.profiles.search_space import describe_profile, load_profile, validate_selected_axes
+from framework.services.execution.matrix import (
     build_matrix as service_build_matrix,
     get_completed_campaign_tags as service_get_completed_campaign_tags,
     get_completed_tags as service_get_completed_tags,
@@ -41,21 +41,21 @@ from services.execution.matrix import (
     parse_csv as service_parse_csv,
     stable_candidate_key as service_stable_candidate_key,
 )
-from services.execution.recommendation_execution import (
+from framework.services.execution.recommendation_execution import (
     execute_point_recommendation as service_execute_point_recommendation,
 )
-from services.execution.sweep_runner import (
+from framework.services.execution.sweep_runner import (
     print_matrix_preview as service_print_matrix_preview,
     run_one as service_run_one,
 )
-from services.execution.workspace import (
+from framework.services.execution.workspace import (
     derive_protocol as service_derive_protocol,
     ensure_campaign as service_ensure_campaign,
     ensure_profile_protocol as service_ensure_profile_protocol,
     filter_fx_degenerate_routes as service_filter_fx_degenerate_routes,
     maybe_setup_run_workspace as service_maybe_setup_run_workspace,
 )
-from stage_policy import load_stage_policy, get_stage_by_name
+from framework.policies.stage_policy import load_stage_policy, get_stage_by_name
 
 
 def parse_args():
@@ -341,11 +341,11 @@ def main():
             if not ok:
                 print(f"  {tag}")
 
-    print(f"\n查看结果: uv run python framework/analyze.py --matrix {args.tag}")
+    print(f"\n查看结果: uv run python framework/index.py analyze --matrix {args.tag}")
     if campaign:
-        print(f"Campaign 汇总: uv run python framework/analyze.py --campaign-summary {campaign['name']}")
+        print(f"Campaign 汇总: uv run python framework/index.py analyze --campaign-summary {campaign['name']}")
         if args.stage:
-            print(f"Stage 汇总: uv run python framework/analyze.py --stage-summary {campaign['name']}")
+            print(f"Stage 汇总: uv run python framework/index.py analyze --stage-summary {campaign['name']}")
 
     if n_ok > 0 and not args.no_auto_pareto:
         print(f"\n{'─'*60}")

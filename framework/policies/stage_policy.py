@@ -16,7 +16,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from core.db import (
+from framework.core.db import (
     get_campaign_stages,
     get_campaign_stage,
     close_campaign_stage,

@@ -4,12 +4,12 @@
 查询 SQLite 追踪数据库，报告训练运行、检查点、对手和胜率进展。
 
 用法:
-    uv run python framework/analyze.py --runs
-    uv run python framework/analyze.py --best
-    uv run python framework/analyze.py --frontier
-    uv run python framework/analyze.py --compare RUN_A RUN_B
-    uv run python framework/analyze.py --report
-    uv run python framework/analyze.py --report --format json
+    uv run python framework/index.py analyze --runs
+    uv run python framework/index.py analyze --best
+    uv run python framework/index.py analyze --frontier
+    uv run python framework/index.py analyze --compare RUN_A RUN_B
+    uv run python framework/index.py analyze --report
+    uv run python framework/index.py analyze --report --format json
 """
 
 import argparse
@@ -20,10 +20,10 @@ import sqlite3
 import sys
 import uuid
 
-from core.db import DB_PATH, get_campaign, init_db
-from services.frontier.pareto import compute_knee_point as service_compute_knee_point, pareto_front as service_pareto_front
-from services.frontier.snapshots import save_frontier_snapshot as service_save_frontier_snapshot
-from services.reporting.experiment_report import (
+from framework.core.db import DB_PATH, get_campaign, init_db
+from framework.services.frontier.pareto import compute_knee_point as service_compute_knee_point, pareto_front as service_pareto_front
+from framework.services.frontier.snapshots import save_frontier_snapshot as service_save_frontier_snapshot
+from framework.services.reporting.experiment_report import (
     format_report_json as service_format_report_json,
     format_report_md as service_format_report_md,
     gather_report_data as service_gather_report_data,
@@ -644,11 +644,11 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
                        limit: int = 5,
                        fmt: str = "md") -> None:
     """Generate and display recommendations for a campaign."""
-    from selector_policy import load_selector_policy, policy_hash
-    from selector import recommend_for_campaign, build_recommendation_id
-    from acquisition_policy import load_acquisition_policy, policy_hash as acquisition_policy_hash
-    from acquisition import rerank_candidates, snapshot_payload
-    from core.db import (
+    from framework.policies.selector_policy import load_selector_policy, policy_hash
+    from framework.services.research.selector_service import recommend_for_campaign, build_recommendation_id
+    from framework.policies.acquisition_policy import load_acquisition_policy, policy_hash as acquisition_policy_hash
+    from framework.services.research.acquisition_service import rerank_candidates, snapshot_payload
+    from framework.core.db import (
         get_campaign,
         save_recommendation_batch,
         save_recommendation,
@@ -830,7 +830,7 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
 
 def cmd_recommendation_log(conn: sqlite3.Connection, campaign: str, fmt: str = "md") -> None:
     """Show recommendation history for a campaign."""
-    from core.db import get_campaign, list_recommendation_batches, list_recommendations_for_batch
+    from framework.core.db import get_campaign, list_recommendation_batches, list_recommendations_for_batch
 
     c = get_campaign(conn, campaign)
     if not c:
@@ -881,7 +881,7 @@ def cmd_recommendation_log(conn: sqlite3.Connection, campaign: str, fmt: str = "
 
 def cmd_recommendation_outcomes(conn: sqlite3.Connection, campaign: str, fmt: str = "md") -> None:
     """Show recommendation outcome summary for a campaign."""
-    from core.db import (
+    from framework.core.db import (
         get_campaign,
         list_recommendation_batches,
         list_recommendations_for_batch,
@@ -939,7 +939,7 @@ def cmd_recommendation_outcomes(conn: sqlite3.Connection, campaign: str, fmt: st
 
 def cmd_acquisition_summary(conn: sqlite3.Connection, campaign: str, fmt: str = "md") -> None:
     """Show v21.1 acquisition lineage for recommendation batches."""
-    from core.db import (
+    from framework.core.db import (
         get_campaign,
         list_recommendation_batches,
         list_recommendations_for_batch,
@@ -1304,7 +1304,7 @@ def _load_objective_profile_for_pareto(
     """Resolve an objective profile from a path, id, or campaign binding."""
     if profile_ref:
         if os.path.isfile(profile_ref):
-            from objective_profile import load_objective_profile
+            from framework.profiles.objective_profile import load_objective_profile
             profile = load_objective_profile(profile_ref)
             return profile, None
         row = conn.execute(
@@ -1522,7 +1522,7 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
             for p in front:
                 print("  " + "  ".join(f"{str(round(p.get(c), 6)) if isinstance(p.get(c), float) else str(p.get(c, '-')):>18}" for c in cols))
         if plot:
-            from pareto_plot import plot_pareto_artifacts
+            from framework.services.frontier.plotting import plot_pareto_artifacts
             y_axis = maximize[0] if maximize else None
             x_axis = minimize[0] if minimize else None
             if y_axis and x_axis:
@@ -1706,7 +1706,7 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
 
     # --- Plot if requested ---
     if plot:
-        from pareto_plot import plot_pareto
+        from framework.services.frontier.plotting import plot_pareto
         # Determine x/y axes for plot: y = first maximize, x = first minimize
         y_axis = maximize[0] if maximize else "wr"
         x_axis = minimize[0] if minimize else "params"

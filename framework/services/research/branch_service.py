@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-from branch_policy import (
+from framework.policies.branch_policy import (
     apply_delta,
     get_allowed_protocol_changes,
     get_reason_config,
@@ -17,7 +17,7 @@ from branch_policy import (
     reason_preserves_protocol,
     validate_delta,
 )
-from core.db import (
+from framework.core.db import (
     bind_branch_child_run,
     get_branch_by_id,
     get_campaign,

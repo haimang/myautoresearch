@@ -5,7 +5,7 @@
 支持任意 x/y 轴字段、可选的点大小映射、自动标注。
 
 用法（被 analyze.py --pareto --plot 调用）:
-    from pareto_plot import plot_pareto
+    from framework.services.frontier.plotting import plot_pareto
     path = plot_pareto(front, dominated, x_key="params", y_key="wr")
 """
 
