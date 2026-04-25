@@ -17,7 +17,7 @@
 
 整个 loop 是有数据库支撑、可追溯的研究循环。框架本身是 domain-agnostic 的——它不知道五子棋是什么，只知道 `(成本轴, 真理指标)` 这样的抽象结构。
 
-当前唯一在跑的 domain 是 **`domains/gomoku/`**：一个 15×15 五子棋的 AlphaZero 风格训练系统，用作框架能力的实证。未来会加入其他 domain（webhook 数据系统优化、外汇头寸策略等），它们都通过相同的协议挂载到框架上。
+当前有两个 domain：**`domains/gomoku/`** 是第一个实证域，一个 15×15 五子棋的 AlphaZero 风格训练系统；**`domains/fx_spot/`** 是 v22 新增的第二个 domain，用 mock quote provider 演绎当前报价窗口内的外汇头寸 route / quote-surface 搜索。未来其他 domain 也通过相同协议挂载到框架上。
 
 ---
 
@@ -44,12 +44,13 @@ myautoresearch/
 │   ├── selector.py                 next-point / next-branch recommendation
 │   ├── acquisition.py              v21.1 candidate-pool acquisition reranker
 │   ├── search_space.py             search-space profile loader / validator
+│   ├── objective_profile.py        v22 domain-generic objective profile loader / validator
 │   ├── stage_policy.py             stage policy loader / validator
 │   ├── branch_policy.py            branch policy loader / validator
 │   ├── selector_policy.py          selector policy loader / validator
 │   ├── acquisition_policy.py       acquisition policy loader / validator
 │   └── core/
-│       ├── db.py                   tracker.db schema + migrations + campaign / trajectory / recommendation / acquisition ledger
+│       ├── db.py                   tracker.db schema + migrations + campaign / trajectory / recommendation / acquisition / run_metrics ledger
 │       ├── tui.py                  ASCII sparkline / progress bar
 │       ├── mcts.py                 通用 MCTS 算法（Python 参考实现）
 │       ├── mcts_c.c                C 原生 MCTS 树操作（v14 落地）
@@ -57,7 +58,7 @@ myautoresearch/
 │       └── build_native.sh         一行编译脚本
 │
 ├── domains/                        ═══ 可替换的 domain 层 ═══
-│   └── gomoku/                     —— 五子棋 domain ——
+│   ├── gomoku/                     —— 五子棋 domain ——
 │       ├── train.py                训练入口（agent 修改的主目标文件）
 │       ├── game.py                 棋盘引擎 (Board, BatchBoards, Renderer)
 │       ├── prepare.py              minimax 对手 L0-L3 + evaluate_win_rate
@@ -73,6 +74,14 @@ myautoresearch/
 │       ├── replay.py               棋局回放 / 成长蒙太奇导出
 │       ├── web/                    FastAPI + 浏览器 UI
 │       └── build_native.sh         编译 minimax_c
+│   └── fx_spot/                    —— spot FX quote-surface mock domain ——
+│       ├── train.py                当前报价窗口内的 mock route evaluation 入口
+│       ├── portfolio.py            当前头寸 / liquidity floor / headroom
+│       ├── mock_provider.py        deterministic local quote provider
+│       ├── route_eval.py           本地 mock execution + run_metrics
+│       ├── airwallex_provider.py   quote-only adapter boundary（默认不执行 conversion）
+│       ├── search_space.json       v22 dynamic route search-space
+│       └── objective_profile.json  liquidity-first spot FX objectives
 │
 ├── output/                         ═══ 训练产物（gitignore）═══
 │   ├── tracker.db                  框架的核心数据库
@@ -87,8 +96,8 @@ myautoresearch/
 
 **框架与 domain 的契约** 是两个东西：
 
-1. **tracker.db schema**（数据协议）：framework 只读 domain 写入的几个标准列（`final_win_rate`、`wall_time_s`、`total_games`、`total_steps`、`num_params`），其余 domain 自定义列被 framework 透明展示，但 framework 不解读。
-2. **CLI subprocess 协议**：`sweep.py` / `branch.py` 通过 `python domains/<name>/train.py --time-budget N --sweep-tag X ...` 启动 domain。退出码 0 = 成功。
+1. **tracker.db schema**（数据协议）：Gomoku legacy 仍写 `final_win_rate / wall_time_s / total_games / total_steps / num_params`；v22 之后的新 domain 优先写 `run_metrics`，并用 `objective_profiles` 声明目标、约束、显示格式和 knee point 规则。
+2. **CLI subprocess 协议**：`sweep.py` / `branch.py` 通过 `python domains/<name>/train.py --time-budget N --sweep-tag X ...` 启动 domain；v22 的 generic domain 还可以接收 `--candidate-json`。退出码 0 = 成功。
 
 这两个协议合在一起就是 "如何接入新 domain"。详见下文 [Domain 接入指南](#domain-接入指南)。
 
@@ -199,9 +208,9 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
 
 ---
 
-## 当前阶段（v21.1）的核心能力
+## 当前阶段（v22）的核心能力
 
-下面按“Gomoku domain 能力”和“framework research loop 能力”分开写。前者仍然建立在 v14-v15 的训练体系上，后者已经推进到 v21.1。
+下面按“Gomoku domain 能力”和“framework research loop 能力”分开写。前者仍然建立在 v14-v15 的训练体系上，后者已经推进到 v22 的 multi-domain 泛化。
 
 ### Gomoku 训练侧（v14-v15 奠定的基础）
 
@@ -262,6 +271,20 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
   - `analyze.py --acquisition-summary`
   - `scripts/v21_1_replay_benchmark.py`
 
+- **Multi-domain metric / objective layer**（v22）
+  - `objective_profiles` / `run_metrics`
+  - campaign 可绑定 objective profile
+  - `analyze.py --pareto --metric-source run_metrics --objective-profile ...`
+  - generic Pareto 支持 hard constraints、infeasible 分组和 knee point
+  - `pareto_plot.py` 支持 profile-driven axis label / formatter / knee marker
+
+- **Spot FX mock domain**（v22）
+  - `domains/fx_spot/`
+  - 当前头寸 + liquidity floor + mock quote window
+  - direct / USD-bridge route candidate
+  - local mock execution 写入 `quote_windows` / `fx_quotes` / `fx_route_legs` / `run_metrics`
+  - Airwallex adapter 只定义 quote-only 边界，默认不执行 live conversion
+
 ---
 
 ## CLI 速查表
@@ -306,7 +329,7 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
 | `--runs` | 列出所有训练 run |
 | `--best` | 每个 run 的最佳 checkpoint |
 | `--frontier` | WR 前沿 |
-| `--pareto` | Pareto 非支配排序（成本 vs WR） |
+| `--pareto` | Pareto 非支配排序（legacy: 成本 vs WR；v22: 可用 `--metric-source run_metrics --objective-profile ...`） |
 | `--compare RUN_A RUN_B` | 两个 run 并排对比 |
 | `--compare-by-steps RUN_A RUN_B` | 按训练步数对齐对比（用于 MCTS vs non-MCTS） |
 | `--lineage RUN_ID` | 追溯 resume 链 |
@@ -337,10 +360,12 @@ myautoresearch 框架对一个新 domain 的最小要求：
 1. **目录结构**：`domains/<name>/`
 2. **入口脚本** `domains/<name>/train.py`：
    - 接受 `--time-budget`、`--seed`、`--sweep-tag` 等标准参数
-   - 跑完后写入 `tracker.db`：至少 `runs.final_win_rate`（domain 真理）、`runs.wall_time_s`、`runs.total_games`、`runs.total_steps`、`runs.num_params`
+   - v22 generic domain 建议接受 `--candidate-json`
+   - 跑完后写入 `tracker.db`：legacy domain 至少写 `runs.final_win_rate`（domain 真理）、`runs.wall_time_s`、`runs.total_games`、`runs.total_steps`、`runs.num_params`；generic domain 优先写 `run_metrics`
    - 退出码 0 = 成功
 3. **policy 文件**：
    - `search_space.json`
+   - `objective_profile.json`（v22 generic Pareto / constraints）
    - `stage_policy.json`
    - `branch_policy.json`
    - `selector_policy.json`
@@ -350,15 +375,15 @@ myautoresearch 框架对一个新 domain 的最小要求：
 
 接入完成后，**framework 层自动复用**：
 
-- `sweep.py` 可以 sweep 你的超参矩阵
+- `sweep.py` 可以 sweep 你的超参矩阵或 dynamic JSON candidate
 - `promote.py` 可以做多阶段晋升
 - `branch.py` 可以做 continuation / trajectory
-- `analyze.py --pareto` 可以画你的成本 vs 真理前沿
+- `analyze.py --pareto` 可以画你的成本 vs 真理前沿，或按 objective profile 读取 `run_metrics`
 - `analyze.py --recommend-next` 可以生成 recommendation
 - `analyze.py --acquisition-summary` 可以追踪 acquisition evidence
 - tracker.db 自动追踪所有数据
 
-参考实现：`domains/gomoku/`（约 4000 行，含 game engine + minimax + train loop + replay + web UI）。
+参考实现：`domains/gomoku/`（完整训练 domain，含 game engine + minimax + train loop + replay + web UI）与 `domains/fx_spot/`（轻量 mock domain，展示 v22 generic metrics / objective profile / quote evidence）。
 
 ---
 
@@ -373,7 +398,7 @@ myautoresearch 框架对一个新 domain 的最小要求：
 | **v20.3** | Continuation / trajectory | `run_branches` / `branch.py` / trajectory report |
 | **v21** | Selector / recommendation | next-point / next-branch recommendation ledger |
 | **v21.1** | Acquisition / execution closure | accepted recommendation execution / surrogate snapshots / replay benchmark |
-| v22（下一阶段） | 新 domain research loop | 把 v21.1 骨架迁移到与 Gomoku 完全不同的 domain |
+| **v22** | Multi-domain / spot FX quote-surface | `run_metrics` / `objective_profiles` / dynamic candidate / `fx_spot` mock domain |
 
 每个版本的细节在 `updates/v{N}-update.md`（计划）和 `updates/v{N}-findings.md`（实测）。
 
