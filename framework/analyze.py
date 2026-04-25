@@ -75,6 +75,69 @@ def _col(text: str, width: int) -> str:
     return str(text)[:width].ljust(width)
 
 
+def _capture_frontier_snapshot_for_campaign(
+    conn: sqlite3.Connection,
+    campaign: dict,
+    *,
+    maximize: list[str] | None = None,
+    minimize: list[str] | None = None,
+) -> str | None:
+    """Compute and persist a fresh frontier snapshot for a campaign, returning its id."""
+    maximize = maximize or ["wr"]
+    minimize = minimize or ["params", "wall_s"]
+    rows = conn.execute(
+        """SELECT r.id, r.num_res_blocks, r.num_filters, r.num_params,
+                  r.final_win_rate, r.wall_time_s, r.total_games, r.total_cycles,
+                  r.total_steps, r.eval_level, r.eval_opponent, r.is_benchmark,
+                  r.learning_rate, r.train_steps_per_cycle, r.parallel_games,
+                  r.sweep_tag
+           FROM runs r
+           JOIN campaign_runs cr ON cr.run_id = r.id
+           WHERE cr.campaign_id = ?
+             AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')
+             AND r.final_win_rate IS NOT NULL
+           ORDER BY r.final_win_rate DESC""",
+        (campaign["id"],),
+    ).fetchall()
+    if not rows:
+        return None
+
+    points = []
+    for r in rows:
+        wall_s = r["wall_time_s"]
+        games = r["total_games"]
+        throughput = (games / wall_s) if (games and wall_s and wall_s > 0) else None
+        points.append({
+            "run": r["id"][:8],
+            "run_full": r["id"],
+            "arch": f"{r['num_res_blocks'] or '?'}x{r['num_filters'] or '?'}",
+            "params": r["num_params"],
+            "wr": r["final_win_rate"],
+            "wall_s": wall_s,
+            "games": games,
+            "cycles": r["total_cycles"],
+            "steps": r["total_steps"],
+            "lr": r["learning_rate"],
+            "throughput": throughput,
+            "eval_level": r["eval_level"],
+            "eval_opponent": r["eval_opponent"],
+            "is_benchmark": r["is_benchmark"],
+            "sweep_tag": r["sweep_tag"],
+        })
+
+    front, dominated = _pareto_front(points, maximize=maximize, minimize=minimize)
+    return _save_frontier_snapshot(
+        conn,
+        front,
+        dominated,
+        maximize,
+        minimize,
+        campaign.get("protocol", {}).get("eval_level"),
+        None,
+        campaign["id"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # 命令
 # ---------------------------------------------------------------------------
@@ -570,16 +633,20 @@ def cmd_compare_parent_child(conn: sqlite3.Connection, branch_id: str) -> None:
 
 def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
                        selector_policy: str | None = None,
+                       acquisition_policy: str | None = None,
                        candidate_type: str | None = None,
                        limit: int = 5,
                        fmt: str = "md") -> None:
     """Generate and display recommendations for a campaign."""
     from selector_policy import load_selector_policy, policy_hash
     from selector import recommend_for_campaign, build_recommendation_id
+    from acquisition_policy import load_acquisition_policy, policy_hash as acquisition_policy_hash
+    from acquisition import rerank_candidates, snapshot_payload
     from core.db import (
         get_campaign,
         save_recommendation_batch,
         save_recommendation,
+        save_surrogate_snapshot,
     )
 
     c = get_campaign(conn, campaign)
@@ -599,9 +666,20 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
             print(f"No selector policy found for domain '{c['domain']}'")
             return
 
+    acquisition = None
+    if acquisition_policy:
+        acquisition = load_acquisition_policy(acquisition_policy)
+    else:
+        default_path = f"domains/{c['domain']}/acquisition_policy.json"
+        if os.path.isfile(default_path):
+            acquisition = load_acquisition_policy(default_path)
+
     # Verify domain match
     if policy["domain"] != c["domain"]:
         print(f"Error: policy domain '{policy['domain']}' != campaign domain '{c['domain']}'")
+        return
+    if acquisition and acquisition["domain"] != c["domain"]:
+        print(f"Error: acquisition domain '{acquisition['domain']}' != campaign domain '{c['domain']}'")
         return
 
     # Protocol drift guard: check campaign runs against protocol
@@ -625,9 +703,39 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
             print(f"  Run {d['run_id']}: {', '.join(d['reasons'])}")
         return
 
-    recommendations = recommend_for_campaign(conn, c, policy,
-                                              candidate_type=candidate_type,
-                                              limit=limit)
+    campaign_data = dict(c)
+    if campaign_data.get("protocol_json"):
+        try:
+            campaign_data["protocol"] = _json.loads(campaign_data["protocol_json"])
+        except Exception:
+            campaign_data["protocol"] = {}
+    else:
+        campaign_data["protocol"] = {}
+
+    frontier_snapshot_id = _capture_frontier_snapshot_for_campaign(conn, campaign_data)
+    pool = recommend_for_campaign(conn, campaign_data, policy,
+                                  candidate_type=candidate_type,
+                                  limit=None)
+
+    surrogate_snapshot_id = None
+    if acquisition and pool:
+        pool, surrogate_summary = rerank_candidates(pool, acquisition)
+        surrogate_snapshot_id = f"sur-{uuid.uuid4().hex[:16]}"
+        save_surrogate_snapshot(
+            conn,
+            snapshot_id=surrogate_snapshot_id,
+            campaign_id=campaign_data["id"],
+            frontier_snapshot_id=frontier_snapshot_id,
+            acquisition_name=acquisition["name"],
+            acquisition_version=acquisition["version"],
+            policy_hash=acquisition_policy_hash(acquisition),
+            objectives_json=_json.dumps(acquisition["objectives"], ensure_ascii=False, sort_keys=True),
+            feature_schema_json=_json.dumps(surrogate_summary["feature_schema"], ensure_ascii=False, sort_keys=True),
+            summary_json=_json.dumps(snapshot_payload(acquisition, surrogate_summary), ensure_ascii=False, sort_keys=True),
+            candidate_count=len(pool),
+        )
+
+    recommendations = pool[:limit]
 
     if not recommendations:
         print(f"No recommendations for campaign '{campaign}'")
@@ -653,6 +761,10 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
         selector_name=policy["name"],
         selector_version=policy["version"],
         selector_hash=policy_hash(policy),
+        frontier_snapshot_id=frontier_snapshot_id,
+        acquisition_name=acquisition["name"] if acquisition else None,
+        acquisition_version=acquisition["version"] if acquisition else None,
+        surrogate_snapshot_id=surrogate_snapshot_id,
     )
     for rank, rec in enumerate(recommendations, 1):
         rec_id = build_recommendation_id(batch_id, rec)
@@ -669,6 +781,10 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
             axis_values_json=_json.dumps(rec.get("axis_values", {}), ensure_ascii=False, sort_keys=True) if rec.get("axis_values") else None,
             branch_reason=rec.get("branch_reason"),
             delta_json=rec.get("delta_json"),
+            selector_score_total=rec.get("selector_score_total", rec["score_total"]),
+            acquisition_score=rec.get("acquisition_score"),
+            parent_run_id=rec.get("parent_run_id"),
+            parent_checkpoint_id=rec.get("parent_checkpoint_id"),
         )
 
     if fmt == "json":
@@ -676,13 +792,22 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
             "campaign": campaign,
             "batch_id": batch_id,
             "selector": policy["name"],
+            "acquisition": acquisition["name"] if acquisition else None,
+            "frontier_snapshot_id": frontier_snapshot_id,
+            "surrogate_snapshot_id": surrogate_snapshot_id,
             "recommendations": recommendations,
         }
         print(_json.dumps(output, indent=2, ensure_ascii=False))
     else:
         print(f"Recommendations for: {campaign}")
         print(f"Selector: {policy['name']} v{policy['version']}")
+        if acquisition:
+            print(f"Acquisition: {acquisition['name']} v{acquisition['version']}")
         print(f"Batch: {batch_id}")
+        if frontier_snapshot_id:
+            print(f"Frontier snapshot: {frontier_snapshot_id[:16]}")
+        if surrogate_snapshot_id:
+            print(f"Surrogate snapshot: {surrogate_snapshot_id[:16]}")
         print("=" * 80)
         print(f"  {'#':>3}  {'Type':>16}  {'Score':>8}  {'Key':>20}  {'Rationale'}")
         print("-" * 80)
@@ -728,8 +853,15 @@ def cmd_recommendation_log(conn: sqlite3.Connection, campaign: str, fmt: str = "
             status_counts = {}
             for r in recs:
                 status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
-            print(f"\n  Batch: {b['id'][:16]} | {b['selector_name']} v{b['selector_version']}")
+            acq = ""
+            if b.get("acquisition_name"):
+                acq = f" | {b['acquisition_name']} v{b.get('acquisition_version') or '?'}"
+            print(f"\n  Batch: {b['id'][:16]} | {b['selector_name']} v{b['selector_version']}{acq}")
             print(f"  Created: {b['created_at']}")
+            if b.get("frontier_snapshot_id"):
+                print(f"  Frontier snapshot: {b['frontier_snapshot_id'][:16]}")
+            if b.get("surrogate_snapshot_id"):
+                print(f"  Surrogate snapshot: {b['surrogate_snapshot_id'][:16]}")
             print(f"  Status: {', '.join(f'{k}={v}' for k, v in status_counts.items())}")
             print(f"  {'#':>3}  {'Type':>16}  {'Score':>8}  {'Status':>10}  {'Key'}")
             print(f"  {'─' * 60}")
@@ -766,6 +898,8 @@ def cmd_recommendation_outcomes(conn: sqlite3.Connection, campaign: str, fmt: st
             for o in outcomes:
                 all_outcomes.append({
                     "batch_id": b["id"],
+                    "frontier_snapshot_id": b.get("frontier_snapshot_id"),
+                    "surrogate_snapshot_id": b.get("surrogate_snapshot_id"),
                     "recommendation_id": r["id"],
                     "candidate_type": r["candidate_type"],
                     "rank": r["rank"],
@@ -793,6 +927,59 @@ def cmd_recommendation_outcomes(conn: sqlite3.Connection, campaign: str, fmt: st
             labels[o["outcome_label"]] = labels.get(o["outcome_label"], 0) + 1
         print(f"Summary: {', '.join(f'{k}={v}' for k, v in labels.items())}")
         print()
+
+
+def cmd_acquisition_summary(conn: sqlite3.Connection, campaign: str, fmt: str = "md") -> None:
+    """Show v21.1 acquisition lineage for recommendation batches."""
+    from core.db import (
+        get_campaign,
+        list_recommendation_batches,
+        list_recommendations_for_batch,
+        list_recommendation_outcomes,
+        get_surrogate_snapshot,
+    )
+
+    c = get_campaign(conn, campaign)
+    if not c:
+        print(f"Campaign not found: {campaign}")
+        return
+
+    batches = list_recommendation_batches(conn, c["id"])
+    if not batches:
+        print(f"No recommendation batches for campaign '{campaign}'")
+        return
+
+    rows = []
+    for b in batches:
+        recs = list_recommendations_for_batch(conn, b["id"])
+        outcomes = []
+        for r in recs:
+            outcomes.extend(list_recommendation_outcomes(conn, r["id"]))
+        snapshot = get_surrogate_snapshot(conn, b["surrogate_snapshot_id"]) if b.get("surrogate_snapshot_id") else None
+        rows.append({
+            "batch_id": b["id"],
+            "selector": f"{b['selector_name']} v{b['selector_version']}",
+            "acquisition": f"{b['acquisition_name']} v{b['acquisition_version']}" if b.get("acquisition_name") else None,
+            "frontier_snapshot_id": b.get("frontier_snapshot_id"),
+            "surrogate_snapshot_id": b.get("surrogate_snapshot_id"),
+            "candidate_count": snapshot.get("candidate_count") if snapshot else len(recs),
+            "outcome_count": len(outcomes),
+        })
+
+    if fmt == "json":
+        print(_json.dumps({"campaign": campaign, "batches": rows}, indent=2, ensure_ascii=False))
+        return
+
+    print(f"Acquisition Summary: {campaign}")
+    print("=" * 80)
+    print(f"  {'Batch':>16}  {'Candidates':>10}  {'Outcomes':>8}  {'Acquisition'}")
+    print("-" * 80)
+    for row in rows:
+        print(
+            f"  {row['batch_id'][:16]:>16}  {row['candidate_count']:>10}  "
+            f"{row['outcome_count']:>8}  {(row['acquisition'] or 'heuristic'):>20}"
+        )
+    print()
 
 
 def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str, campaign: str | None = None,
@@ -1358,17 +1545,17 @@ def _save_frontier_snapshot(conn: sqlite3.Connection,
                             front: list[dict], dominated: list[dict],
                             maximize: list[str], minimize: list[str],
                             eval_level: int | None, sweep_tag: str | None,
-                            campaign_id: str | None = None) -> None:
-    """Persist a frontier snapshot to the frontier_snapshots table."""
-    import uuid
+                            campaign_id: str | None = None) -> str | None:
+    """Persist a frontier snapshot to the frontier_snapshots table and return its id."""
     try:
+        snapshot_id = str(uuid.uuid4())
         conn.execute(
             """INSERT INTO frontier_snapshots
                (id, created_at, maximize_axes, minimize_axes, front_run_ids,
-                dominated_count, total_runs, eval_level, sweep_tag, campaign_id)
+                 dominated_count, total_runs, eval_level, sweep_tag, campaign_id)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                str(uuid.uuid4()),
+                snapshot_id,
                 datetime.now(timezone.utc).isoformat(),
                 _json.dumps(maximize),
                 _json.dumps(minimize),
@@ -1381,8 +1568,9 @@ def _save_frontier_snapshot(conn: sqlite3.Connection,
             )
         )
         conn.commit()
+        return snapshot_id
     except sqlite3.OperationalError:
-        pass  # table not yet migrated
+        return None  # table not yet migrated
 
 
 # ---------------------------------------------------------------------------
@@ -2127,6 +2315,8 @@ def main():
                        help="Show recommendation history for a campaign (v21)")
     group.add_argument("--recommendation-outcomes", metavar="CAMPAIGN",
                        help="Show recommendation outcome summary for a campaign (v21)")
+    group.add_argument("--acquisition-summary", metavar="CAMPAIGN",
+                       help="Show acquisition lineage summary for a campaign (v21.1)")
 
     parser.add_argument("--format", choices=["md", "json"], default="md",
                         help="Report format: md (Chinese markdown) or json (structured)")
@@ -2156,6 +2346,8 @@ def main():
     # v21: selector configuration
     parser.add_argument("--selector-policy", type=str, default=None,
                         help="Path to selector policy JSON (used with --recommend-next)")
+    parser.add_argument("--acquisition-policy", type=str, default=None,
+                        help="Path to acquisition policy JSON (used with --recommend-next)")
     parser.add_argument("--candidate-type", type=str, default=None,
                         help="Filter recommendations by candidate type (new_point, seed_recheck, continue_branch, eval_upgrade)")
     parser.add_argument("--limit", type=int, default=5,
@@ -2216,6 +2408,7 @@ def main():
     elif args.recommend_next:
         cmd_recommend_next(conn, args.recommend_next,
                            selector_policy=args.selector_policy,
+                           acquisition_policy=args.acquisition_policy,
                            candidate_type=args.candidate_type,
                            limit=args.limit,
                            fmt=args.format)
@@ -2223,6 +2416,8 @@ def main():
         cmd_recommendation_log(conn, args.recommendation_log, fmt=args.format)
     elif args.recommendation_outcomes:
         cmd_recommendation_outcomes(conn, args.recommendation_outcomes, fmt=args.format)
+    elif args.acquisition_summary:
+        cmd_acquisition_summary(conn, args.acquisition_summary, fmt=args.format)
 
     conn.close()
 

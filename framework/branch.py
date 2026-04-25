@@ -30,11 +30,14 @@ from core.db import (
     get_campaign_stage,
     get_campaign_stages,
     get_latest_checkpoint,
+    get_recommendation_by_id,
     get_search_space,
     init_db,
     link_run_to_campaign_v20,
     list_branches_for_campaign,
+    save_recommendation_outcome,
     save_run_branch,
+    update_recommendation_status,
     update_branch_status,
 )
 from branch_policy import (
@@ -50,18 +53,20 @@ from branch_policy import (
 def parse_args():
     p = argparse.ArgumentParser(description="autoresearch branch planner / executor")
     p.add_argument("--db", type=str, default=DB_PATH)
-    p.add_argument("--campaign", type=str, required=True)
-    p.add_argument("--branch-policy", type=str, required=True)
+    p.add_argument("--campaign", type=str, default=None)
+    p.add_argument("--branch-policy", type=str, default=None)
     p.add_argument("--parent-checkpoint", type=str, default=None,
                    help="Explicit checkpoint tag to branch from; default: latest")
-    p.add_argument("--reason", type=str, action="append", required=True,
+    p.add_argument("--reason", type=str, action="append", default=None,
                    help="Branch reason(s) to apply (can specify multiple)")
     p.add_argument("--delta", type=str, action="append", default=None,
                    help="Optional JSON delta override per reason (same order as --reason)")
     p.add_argument("--plan", action="store_true", help="Output branch plan only")
     p.add_argument("--dry-run", action="store_true", help="With --plan: show but do not persist")
     p.add_argument("--execute", action="store_true", help="Execute branch plan")
-    p.add_argument("--train-script", type=str, default="domains/gomoku/train.py")
+    p.add_argument("--execute-recommendation", type=str, default=None,
+                   help="Execute an accepted branch recommendation by id (v21.1)")
+    p.add_argument("--train-script", type=str, default=None)
     p.add_argument("--time-budget", type=int, default=60,
                    help="Time budget for each child continuation run")
     p.add_argument("--eval-level", type=int, default=None)
@@ -290,7 +295,50 @@ def print_plan(plans: list[dict], parent_tag: str):
     print()
 
 
-def execute_branches(conn, campaign, policy, plans: list[dict], parent_ckpt: dict, args):
+def _build_frontier_delta(conn, campaign_id: str, previous_best_wr: float | None, run_id: str) -> tuple[str, str, str]:
+    row = conn.execute(
+        """SELECT final_win_rate, wall_time_s, num_params, total_games, status
+           FROM runs WHERE id = ?""",
+        (run_id,),
+    ).fetchone()
+    observed = {
+        "final_win_rate": row["final_win_rate"],
+        "wall_time_s": row["wall_time_s"],
+        "num_params": row["num_params"],
+        "total_games": row["total_games"],
+        "status": row["status"],
+    }
+    latest_best = conn.execute(
+        """SELECT MAX(r.final_win_rate) AS best_wr
+           FROM campaign_runs cr
+           JOIN runs r ON r.id = cr.run_id
+           WHERE cr.campaign_id = ?
+             AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')""",
+        (campaign_id,),
+    ).fetchone()
+    new_best_wr = latest_best["best_wr"] if latest_best else None
+    old_best_wr = previous_best_wr or 0.0
+    current_wr = observed["final_win_rate"] or 0.0
+    if current_wr > old_best_wr:
+        outcome_label = "new_front"
+    elif current_wr >= max(0.0, old_best_wr - 0.02):
+        outcome_label = "near_front"
+    else:
+        outcome_label = "no_gain"
+    frontier_delta = {
+        "old_best_wr": old_best_wr,
+        "new_best_wr": new_best_wr,
+        "delta": round((new_best_wr or 0.0) - old_best_wr, 6),
+    }
+    return (
+        json.dumps(observed, ensure_ascii=False, sort_keys=True),
+        json.dumps(frontier_delta, ensure_ascii=False, sort_keys=True),
+        outcome_label,
+    )
+
+
+def execute_branches(conn, campaign, policy, plans: list[dict], parent_ckpt: dict, args,
+                     recommendation_by_branch_id: dict[str, dict] | None = None):
     """Launch child continuation runs and record them in the branch ledger."""
     print(f"\nExecuting {len(plans)} branches...")
     print("=" * 72)
@@ -300,6 +348,18 @@ def execute_branches(conn, campaign, policy, plans: list[dict], parent_ckpt: dic
         reason = p["reason"]
         tag = p["tag"]
         child_params = p["child_params"]
+        rec = recommendation_by_branch_id.get(branch_id) if recommendation_by_branch_id else None
+        previous_best_wr = None
+        if rec:
+            best_row = conn.execute(
+                """SELECT MAX(r.final_win_rate) AS best_wr
+                   FROM campaign_runs cr
+                   JOIN runs r ON r.id = cr.run_id
+                   WHERE cr.campaign_id = ?
+                     AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')""",
+                (campaign["id"],),
+            ).fetchone()
+            previous_best_wr = best_row["best_wr"] if best_row else None
 
         # Check if this exact branch already has a completed child run
         existing = get_branch_by_id(conn, branch_id)
@@ -387,6 +447,21 @@ def execute_branches(conn, campaign, policy, plans: list[dict], parent_ckpt: dic
                 axis_values=child_axis_values,
                 status="linked",
             )
+            if rec:
+                update_recommendation_status(conn, recommendation_id=rec["id"], status="executed")
+                observed_json, frontier_delta_json, outcome_label = _build_frontier_delta(
+                    conn, campaign["id"], previous_best_wr, child_run_id
+                )
+                save_recommendation_outcome(
+                    conn,
+                    recommendation_id=rec["id"],
+                    run_id=child_run_id,
+                    branch_id=branch_id,
+                    observed_metrics_json=observed_json,
+                    frontier_delta_json=frontier_delta_json,
+                    outcome_label=outcome_label,
+                )
+                print(f"  Recommendation executed: {rec['id'][:16]} ({outcome_label})")
         else:
             update_branch_status(conn, branch_id=branch_id, status="completed")
 
@@ -394,11 +469,128 @@ def execute_branches(conn, campaign, policy, plans: list[dict], parent_ckpt: dic
     print("Branch execution complete.")
 
 
+def _resolve_branch_policy_path(campaign: dict, explicit_path: str | None) -> str:
+    if explicit_path:
+        return explicit_path
+    default_path = os.path.join(_PROJECT_ROOT, "domains", campaign["domain"], "branch_policy.json")
+    if os.path.isfile(default_path):
+        return default_path
+    raise ValueError(f"No branch policy found for domain '{campaign['domain']}'")
+
+
+def _plan_from_recommendation(conn, campaign, policy, rec: dict, args) -> tuple[list[dict], dict]:
+    row = None
+    if rec.get("parent_checkpoint_id") is not None:
+        row = conn.execute(
+            "SELECT * FROM checkpoints WHERE id = ?",
+            (rec["parent_checkpoint_id"],),
+        ).fetchone()
+    parent_ckpt = dict(row) if row else None
+    if parent_ckpt is None and rec.get("parent_run_id"):
+        parent_ckpt = get_latest_checkpoint(conn, rec["parent_run_id"])
+    if parent_ckpt is None:
+        raise ValueError(f"Recommendation {rec['id']} has no resolvable parent checkpoint")
+
+    parent_run_id = rec["parent_run_id"]
+    reason = rec["branch_reason"]
+    parent_params = _get_parent_params(conn, parent_run_id)
+    override = json.loads(rec.get("delta_json") or "{}")
+    child_params = apply_delta(parent_params, reason, policy, override)
+
+    if reason == "seed_recheck" and (
+        child_params.get("seed") is None
+        or child_params.get("seed") == parent_params.get("seed")
+    ):
+        parent_seed = parent_params.get("seed") or 0
+        new_seed = (parent_seed % 997) + 1
+        if new_seed == parent_seed:
+            new_seed = (new_seed % 997) + 1
+        child_params["seed"] = new_seed
+
+    delta_json = rec.get("delta_json") or json.dumps(
+        _infer_delta(parent_params, child_params),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    branch_id = _build_branch_id(campaign["id"], parent_run_id, reason, delta_json)
+    plan = {
+        "branch_id": branch_id,
+        "reason": reason,
+        "parent_run_id": parent_run_id,
+        "parent_checkpoint_id": parent_ckpt["id"],
+        "child_params": child_params,
+        "delta_json": delta_json,
+        "tag": _build_child_tag(campaign["name"], parent_ckpt["tag"], reason, delta_json),
+    }
+    return [plan], parent_ckpt
+
+
+def _execute_branch_recommendation(args) -> None:
+    conn = init_db(args.db)
+    rec = get_recommendation_by_id(conn, args.execute_recommendation)
+    if not rec:
+        print(f"Recommendation not found: {args.execute_recommendation}")
+        conn.close()
+        sys.exit(1)
+    if rec["status"] != "accepted":
+        print(f"Recommendation {rec['id']} status is '{rec['status']}', expected 'accepted'")
+        conn.close()
+        sys.exit(1)
+    if rec["candidate_type"] not in ("continue_branch", "eval_upgrade"):
+        print(f"Recommendation {rec['id']} is '{rec['candidate_type']}', use sweep.py for point execution")
+        conn.close()
+        sys.exit(1)
+
+    campaign = _resolve_campaign(conn, rec["campaign_id"])
+    if not args.train_script:
+        args.train_script = campaign["train_script"]
+    try:
+        policy_path = _resolve_branch_policy_path(campaign, args.branch_policy)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        conn.close()
+        sys.exit(1)
+    policy = load_branch_policy(policy_path)
+
+    plans, parent_ckpt = _plan_from_recommendation(conn, campaign, policy, rec, args)
+    execute_branches(
+        conn,
+        campaign,
+        policy,
+        plans,
+        parent_ckpt,
+        args,
+        recommendation_by_branch_id={plans[0]["branch_id"]: rec},
+    )
+    conn.close()
+
+
 def main():
     args = parse_args()
+
+    if args.execute_recommendation:
+        _execute_branch_recommendation(args)
+        return
+
     conn = init_db(args.db)
 
+    if not args.campaign:
+        print("Error: --campaign is required unless --execute-recommendation is used")
+        conn.close()
+        sys.exit(1)
+
     campaign = _resolve_campaign(conn, args.campaign)
+    if not args.train_script:
+        args.train_script = campaign["train_script"]
+    if not args.branch_policy:
+        print("Error: --branch-policy is required unless --execute-recommendation is used")
+        conn.close()
+        sys.exit(1)
+    if not args.reason:
+        print("Error: at least one --reason is required unless --execute-recommendation is used")
+        conn.close()
+        sys.exit(1)
+
     policy = load_branch_policy(args.branch_policy)
 
     # Verify policy domain matches campaign domain

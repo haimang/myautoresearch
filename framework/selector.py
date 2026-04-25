@@ -344,7 +344,7 @@ def _is_dominated(candidate: dict, all_candidates: list[dict]) -> bool:
 
 def recommend_for_campaign(conn, campaign, policy,
                            candidate_type: str | None = None,
-                           limit: int = 5) -> list[dict]:
+                           limit: int | None = 5) -> list[dict]:
     """Generate and score recommendations for a campaign.
 
     Returns a list of recommendation dicts sorted by score descending.
@@ -409,6 +409,8 @@ def recommend_for_campaign(conn, campaign, policy,
         })
 
     scored.sort(key=lambda x: x["score_total"], reverse=True)
+    if limit is None:
+        return scored
     return scored[:limit]
 
 

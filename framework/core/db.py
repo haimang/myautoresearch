@@ -427,11 +427,23 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             selector_version    TEXT NOT NULL,
             selector_hash       TEXT NOT NULL,
             frontier_snapshot_id TEXT,
+            acquisition_name    TEXT,
+            acquisition_version TEXT,
+            surrogate_snapshot_id TEXT,
             created_at          TEXT NOT NULL
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_rec_batches_campaign "
                  "ON recommendation_batches(campaign_id)")
+    for col, typ in [
+        ("acquisition_name", "TEXT"),
+        ("acquisition_version", "TEXT"),
+        ("surrogate_snapshot_id", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE recommendation_batches ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS recommendations (
@@ -446,6 +458,10 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             axis_values_json    TEXT,
             branch_reason       TEXT,
             delta_json          TEXT,
+            selector_score_total REAL,
+            acquisition_score  REAL,
+            parent_run_id      TEXT REFERENCES runs(id),
+            parent_checkpoint_id INTEGER REFERENCES checkpoints(id),
             status              TEXT NOT NULL DEFAULT 'planned',
             created_at          TEXT NOT NULL
         )
@@ -454,6 +470,16 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
                  "ON recommendations(batch_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_campaign "
                  "ON recommendations(batch_id, candidate_type)")
+    for col, typ in [
+        ("selector_score_total", "REAL"),
+        ("acquisition_score", "REAL"),
+        ("parent_run_id", "TEXT"),
+        ("parent_checkpoint_id", "INTEGER"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE recommendations ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS recommendation_outcomes (
@@ -469,6 +495,25 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_rec_outcomes_rec "
                  "ON recommendation_outcomes(recommendation_id)")
+
+    # v21.1: surrogate / acquisition evidence lineage
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS surrogate_snapshots (
+            id                   TEXT PRIMARY KEY,
+            campaign_id          TEXT NOT NULL REFERENCES campaigns(id),
+            frontier_snapshot_id TEXT REFERENCES frontier_snapshots(id),
+            acquisition_name     TEXT NOT NULL,
+            acquisition_version  TEXT NOT NULL,
+            policy_hash          TEXT NOT NULL,
+            objectives_json      TEXT NOT NULL,
+            feature_schema_json  TEXT NOT NULL,
+            summary_json         TEXT NOT NULL,
+            candidate_count      INTEGER NOT NULL,
+            created_at           TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_surrogate_snapshots_campaign "
+                 "ON surrogate_snapshots(campaign_id)")
 
     conn.commit()
     return conn
@@ -1512,20 +1557,29 @@ def save_recommendation_batch(
     selector_version: str,
     selector_hash: str,
     frontier_snapshot_id: str | None = None,
+    acquisition_name: str | None = None,
+    acquisition_version: str | None = None,
+    surrogate_snapshot_id: str | None = None,
 ) -> None:
     """Persist a recommendation batch."""
     conn.execute(
         """INSERT INTO recommendation_batches
-           (id, campaign_id, selector_name, selector_version, selector_hash, frontier_snapshot_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+           (id, campaign_id, selector_name, selector_version, selector_hash,
+            frontier_snapshot_id, acquisition_name, acquisition_version,
+            surrogate_snapshot_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
                campaign_id = excluded.campaign_id,
                selector_name = excluded.selector_name,
                selector_version = excluded.selector_version,
                selector_hash = excluded.selector_hash,
-               frontier_snapshot_id = excluded.frontier_snapshot_id""",
+               frontier_snapshot_id = excluded.frontier_snapshot_id,
+               acquisition_name = excluded.acquisition_name,
+               acquisition_version = excluded.acquisition_version,
+               surrogate_snapshot_id = excluded.surrogate_snapshot_id""",
         (batch_id, campaign_id, selector_name, selector_version, selector_hash,
-         frontier_snapshot_id, datetime.now(timezone.utc).isoformat()),
+         frontier_snapshot_id, acquisition_name, acquisition_version,
+         surrogate_snapshot_id, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
 
@@ -1543,32 +1597,107 @@ def save_recommendation(
     axis_values_json: str | None = None,
     branch_reason: str | None = None,
     delta_json: str | None = None,
+    selector_score_total: float | None = None,
+    acquisition_score: float | None = None,
+    parent_run_id: str | None = None,
+    parent_checkpoint_id: int | None = None,
     status: str = "planned",
 ) -> None:
     """Persist a single recommendation."""
     conn.execute(
         """INSERT INTO recommendations
            (id, batch_id, candidate_type, candidate_key, rank, score_total,
-            score_breakdown_json, rationale_json, axis_values_json,
-            branch_reason, delta_json, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-               batch_id = excluded.batch_id,
-               candidate_type = excluded.candidate_type,
-               candidate_key = excluded.candidate_key,
-               rank = excluded.rank,
+             score_breakdown_json, rationale_json, axis_values_json,
+             branch_reason, delta_json, selector_score_total, acquisition_score,
+             parent_run_id, parent_checkpoint_id, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                batch_id = excluded.batch_id,
+                candidate_type = excluded.candidate_type,
+                candidate_key = excluded.candidate_key,
+                rank = excluded.rank,
                score_total = excluded.score_total,
-               score_breakdown_json = excluded.score_breakdown_json,
-               rationale_json = excluded.rationale_json,
-               axis_values_json = excluded.axis_values_json,
-               branch_reason = excluded.branch_reason,
-               delta_json = excluded.delta_json,
-               status = excluded.status""",
+                score_breakdown_json = excluded.score_breakdown_json,
+                rationale_json = excluded.rationale_json,
+                axis_values_json = excluded.axis_values_json,
+                branch_reason = excluded.branch_reason,
+                delta_json = excluded.delta_json,
+                selector_score_total = excluded.selector_score_total,
+                acquisition_score = excluded.acquisition_score,
+                parent_run_id = excluded.parent_run_id,
+                parent_checkpoint_id = excluded.parent_checkpoint_id,
+                status = excluded.status""",
         (recommendation_id, batch_id, candidate_type, candidate_key, rank,
          score_total, score_breakdown_json, rationale_json, axis_values_json,
-         branch_reason, delta_json, status, datetime.now(timezone.utc).isoformat()),
+         branch_reason, delta_json, selector_score_total, acquisition_score,
+         parent_run_id, parent_checkpoint_id, status, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
+
+
+def save_surrogate_snapshot(
+    conn: sqlite3.Connection, *,
+    snapshot_id: str,
+    campaign_id: str,
+    frontier_snapshot_id: str | None,
+    acquisition_name: str,
+    acquisition_version: str,
+    policy_hash: str,
+    objectives_json: str,
+    feature_schema_json: str,
+    summary_json: str,
+    candidate_count: int,
+) -> None:
+    """Persist a surrogate/acquisition snapshot for recommendation replay."""
+    conn.execute(
+        """INSERT INTO surrogate_snapshots
+           (id, campaign_id, frontier_snapshot_id, acquisition_name,
+            acquisition_version, policy_hash, objectives_json,
+            feature_schema_json, summary_json, candidate_count, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               campaign_id = excluded.campaign_id,
+               frontier_snapshot_id = excluded.frontier_snapshot_id,
+               acquisition_name = excluded.acquisition_name,
+               acquisition_version = excluded.acquisition_version,
+               policy_hash = excluded.policy_hash,
+               objectives_json = excluded.objectives_json,
+               feature_schema_json = excluded.feature_schema_json,
+               summary_json = excluded.summary_json,
+               candidate_count = excluded.candidate_count""",
+        (
+            snapshot_id,
+            campaign_id,
+            frontier_snapshot_id,
+            acquisition_name,
+            acquisition_version,
+            policy_hash,
+            objectives_json,
+            feature_schema_json,
+            summary_json,
+            candidate_count,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def get_surrogate_snapshot(conn: sqlite3.Connection, snapshot_id: str) -> dict | None:
+    """Return a single surrogate snapshot by id, or None."""
+    row = conn.execute(
+        "SELECT * FROM surrogate_snapshots WHERE id = ?",
+        (snapshot_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_surrogate_snapshots(conn: sqlite3.Connection, campaign_id: str) -> list[dict]:
+    """Return surrogate snapshots for a campaign, newest first."""
+    rows = conn.execute(
+        "SELECT * FROM surrogate_snapshots WHERE campaign_id = ? ORDER BY created_at DESC",
+        (campaign_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def update_recommendation_status(
@@ -1653,7 +1782,8 @@ def get_recommendation_by_id(conn: sqlite3.Connection,
                               recommendation_id: str) -> dict | None:
     """Return a single recommendation by id, or None."""
     row = conn.execute(
-        """SELECT r.*, b.campaign_id
+        """SELECT r.*, b.campaign_id, b.frontier_snapshot_id,
+                  b.acquisition_name, b.acquisition_version, b.surrogate_snapshot_id
            FROM recommendations r
            JOIN recommendation_batches b ON b.id = r.batch_id
            WHERE r.id = ?""",
