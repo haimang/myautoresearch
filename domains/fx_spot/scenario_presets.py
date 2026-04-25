@@ -91,6 +91,45 @@ SCENARIO_PRESETS = {
             "GBP/CNY": -1.0,
         },
     },
+    "uplift_corridor": {
+        "spread_base_bps": 9.0,
+        "default_validity_s": 1200,
+        "quote_latency_ms": 1.5,
+        "settlement_lag_s": 105,
+        "currency_spread_adjust_bps": {"USD": -2.0, "HKD": -2.0, "SGD": -1.5, "MXN": 5.0},
+        "pair_spread_adjust_bps": {
+            "EUR/USD": -3.0,
+            "USD/HKD": -4.0,
+            "HKD/CNY": -5.0,
+            "SGD/USD": -2.0,
+            "USD/CNY": -1.0,
+        },
+        "pair_rate_edge_bps": {
+            "EUR/USD": 5.0,
+            "USD/HKD": 4.0,
+            "HKD/CNY": 5.5,
+            "SGD/USD": 3.5,
+            "USD/CNY": 2.5,
+        },
+        "amount_tiers": [
+            {"min_amount": 0.0, "rate_edge_bps": 0.0},
+            {"min_amount": 100000.0, "rate_edge_bps": 1.5},
+            {"min_amount": 500000.0, "rate_edge_bps": 3.0},
+        ],
+    },
+    "constraint_stress": {
+        "spread_base_bps": 16.0,
+        "default_validity_s": 600,
+        "quote_latency_ms": 1.8,
+        "settlement_lag_s": 120,
+        "currency_spread_adjust_bps": {"MXN": 10.0, "JPY": 4.0, "AUD": 3.0},
+        "pair_contains_adjust_bps": {"USD": -1.0},
+        "pair_rate_edge_bps": {
+            "USD/CNY": 1.0,
+            "HKD/CNY": 1.0,
+            "EUR/USD": 1.5,
+        },
+    },
     "latam_volatility": {
         "spread_base_bps": 18.0,
         "default_validity_s": 600,
@@ -107,4 +146,3 @@ SCENARIO_PRESETS = {
         "pair_validity_s": {"MXN/CNY": 120, "MXN/EUR": 150},
     },
 }
-

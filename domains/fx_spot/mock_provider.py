@@ -47,12 +47,21 @@ class MockQuoteProvider:
                 return int(self.preset["currency_validity_s"][ccy])
         return int(self.preset.get("default_validity_s", self.quote_validity_seconds))
 
+    def _rate_edge_bps(self, sell_currency: str, buy_currency: str, sell_amount: float) -> float:
+        pair = f"{sell_currency}/{buy_currency}"
+        edge = float(self.preset.get("pair_rate_edge_bps", {}).get(pair, 0.0))
+        for tier in self.preset.get("amount_tiers", []):
+            if float(sell_amount) >= float(tier.get("min_amount", 0.0)):
+                edge += float(tier.get("rate_edge_bps", 0.0))
+        return edge
+
     def quote(self, sell_currency: str, buy_currency: str, sell_amount: float) -> dict:
         now = datetime.now(timezone.utc)
         validity = self._validity_seconds(sell_currency, buy_currency)
         mid = self.mid_rate(sell_currency, buy_currency)
         spread_bps = self._spread_bps(sell_currency, buy_currency)
-        client_rate = mid * (1.0 - spread_bps / 10000.0)
+        rate_edge_bps = self._rate_edge_bps(sell_currency, buy_currency, sell_amount)
+        client_rate = mid * (1.0 + (rate_edge_bps - spread_bps) / 10000.0)
         buy_amount = float(sell_amount) * client_rate
         quote_id = f"mock-{uuid.uuid4().hex[:16]}"
         return {
@@ -72,5 +81,5 @@ class MockQuoteProvider:
             "conversion_date": now.date().isoformat(),
             "quote_latency_ms": float(self.preset.get("quote_latency_ms", 1.0)),
             "settlement_lag_s": int(self.preset.get("settlement_lag_s", 60)),
-            "rate_details": {"embedded_spread_bps": spread_bps},
+            "rate_details": {"embedded_spread_bps": spread_bps, "rate_edge_bps": rate_edge_bps},
         }

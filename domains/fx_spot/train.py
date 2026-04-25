@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-legs", type=int, default=2)
     p.add_argument("--provider", default="mock")
     p.add_argument("--quote-scenario", default="base")
+    p.add_argument("--run-id", default=None, help="Filesystem-level fx_spot experiment run id")
+    p.add_argument("--artifact-root", default=None, help="Run-scoped artifact workspace root")
     return p.parse_args()
 
 
@@ -83,6 +85,15 @@ def main() -> None:
     anchor = candidate.get("anchor_currency", DEFAULT_ANCHOR)
 
     run_id = str(uuid.uuid4())
+    artifact_dir = None
+    if args.artifact_root:
+        safe_campaign = args.campaign_id or "standalone"
+        artifact_dir = os.path.join(args.artifact_root, "runs", run_id)
+        os.makedirs(artifact_dir, exist_ok=True)
+        os.makedirs(os.path.join(args.artifact_root, "campaigns", safe_campaign), exist_ok=True)
+    elif args.run_id:
+        artifact_dir = os.path.join("output", "fx_spot", args.run_id, "runs", run_id)
+        os.makedirs(artifact_dir, exist_ok=True)
     conn = init_db(args.db)
     create_run(
         conn,
@@ -91,8 +102,10 @@ def main() -> None:
             "sweep_tag": args.sweep_tag,
             "seed": args.seed,
             "time_budget": args.time_budget,
+            "artifact_dir": artifact_dir,
         },
         hardware=collect_hardware_info(),
+        output_dir=artifact_dir,
         is_benchmark=False,
     )
 
@@ -144,6 +157,27 @@ def main() -> None:
                 route_state_after_json=leg["route_state_after_json"],
             )
         save_run_metrics(conn, run_id, metric_rows(result["metrics"]))
+        if artifact_dir:
+            with open(os.path.join(artifact_dir, "result.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "fx_run_id": args.run_id,
+                        "db_run_id": run_id,
+                        "sweep_tag": args.sweep_tag,
+                        "candidate": candidate,
+                        "route": result["route"],
+                        "route_signature": result["route_signature"],
+                        "route_family": result["route_family"],
+                        "breach_reasons": result["breach_reasons"],
+                        "metrics": result["metrics"],
+                        "portfolio_before": result["portfolio_before"],
+                        "portfolio_after": result["portfolio_after"],
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
         finish_run(
             conn,
             run_id,
@@ -157,6 +191,8 @@ def main() -> None:
             },
         )
         print(f"Run: {run_id[:8]} ({args.sweep_tag or '-'})")
+        if args.run_id:
+            print(f"FX run id: {args.run_id}")
         print(f"Preservation ratio: {result['metrics']['preservation_ratio']:.6f}")
         print(f"Liquidity floor ok: {result['metrics']['liquidity_floor_ok']:.0f}")
     except Exception:

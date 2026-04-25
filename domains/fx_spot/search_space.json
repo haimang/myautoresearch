@@ -54,6 +54,30 @@
       "allow_continuation": false,
       "description": "Fraction of sell-currency surplus to convert."
     },
+    "sell_amount_mode": {
+      "type": "categorical",
+      "values": ["surplus_fraction", "explicit_ratio", "floor_probe"],
+      "scale": "linear",
+      "role": "execution",
+      "allow_continuation": false,
+      "description": "How the first-leg sell amount is derived; v23 adds explicit and floor-probe modes to activate constraints."
+    },
+    "sell_amount_ratio": {
+      "type": "float",
+      "values": [0.0, 0.15, 0.35, 0.6, 0.9, 1.1],
+      "scale": "linear",
+      "role": "execution",
+      "allow_continuation": false,
+      "description": "Share of current sell-currency holding used when sell_amount_mode=explicit_ratio."
+    },
+    "floor_buffer_target": {
+      "type": "float",
+      "values": [-0.05, 0.0, 0.05, 0.15],
+      "scale": "linear",
+      "role": "risk",
+      "allow_continuation": false,
+      "description": "Target post-trade buffer over liquidity floor when sell_amount_mode=floor_probe."
+    },
     "max_legs": {
       "type": "int",
       "values": [2],
@@ -80,7 +104,9 @@
         "asia_hub",
         "usd_liquidity",
         "europe_corridor",
-        "latam_volatility"
+        "latam_volatility",
+        "uplift_corridor",
+        "constraint_stress"
       ],
       "scale": "linear",
       "role": "provider",

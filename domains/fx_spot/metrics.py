@@ -12,9 +12,11 @@ MINIMIZE = [
     "route_leg_count",
     "settlement_lag_s",
     "locked_funds_ratio",
+    "insufficient_balance_count",
+    "expired_quote_count",
 ]
 
-HARD = ["liquidity_floor_ok"]
+HARD = ["liquidity_floor_ok", "liquidity_breach_count"]
 
 
 def metric_rows(metrics: dict[str, float]) -> list[dict]:
@@ -26,9 +28,12 @@ def metric_rows(metrics: dict[str, float]) -> list[dict]:
         elif name in MINIMIZE:
             direction = "minimize"
             role = "objective"
-        else:
+        elif name in HARD or name.endswith("_count"):
             direction = "none"
             role = "constraint"
+        else:
+            direction = "none"
+            role = "diagnostic"
         unit = "ratio" if name.endswith("_ratio") or name.endswith("_ok") else None
         if name.endswith("_bps"):
             unit = "bps"
@@ -43,4 +48,3 @@ def metric_rows(metrics: dict[str, float]) -> list[dict]:
             "source": "fx_spot_mock",
         })
     return rows
-
