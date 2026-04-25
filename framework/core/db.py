@@ -1342,6 +1342,18 @@ def save_run_branch(
     result_summary_json: str = "{}",
 ) -> None:
     """Persist a planned branch record."""
+    # Application-layer guard: SQLite treats NULL != NULL in UNIQUE constraints,
+    # so duplicates can sneak through when parent_checkpoint_id IS NULL.
+    if parent_checkpoint_id is None:
+        existing = conn.execute(
+            """SELECT id FROM run_branches
+               WHERE campaign_id = ? AND parent_run_id = ?
+                 AND branch_reason = ? AND delta_json = ?
+                 AND parent_checkpoint_id IS NULL""",
+            (campaign_id, parent_run_id, branch_reason, delta_json),
+        ).fetchone()
+        if existing and existing["id"] != branch_id:
+            return  # Semantic duplicate, skip silent insert
     conn.execute(
         """INSERT INTO run_branches
            (id, campaign_id, parent_run_id, parent_checkpoint_id, child_run_id,

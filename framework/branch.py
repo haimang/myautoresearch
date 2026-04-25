@@ -32,7 +32,7 @@ from core.db import (
     get_latest_checkpoint,
     get_search_space,
     init_db,
-    link_run_to_campaign,
+    link_run_to_campaign_v20,
     list_branches_for_campaign,
     save_run_branch,
     update_branch_status,
@@ -97,7 +97,7 @@ def _resolve_parent_checkpoint(conn, campaign, args):
            JOIN runs r ON r.id = cr.run_id
            WHERE cr.campaign_id = ? AND cr.stage = ?
              AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')
-           ORDER BY r.final_win_rate DESC LIMIT 1""",
+           ORDER BY r.final_win_rate DESC LIMIT 10""",
         (campaign["id"], from_stage),
     ).fetchall()
 
@@ -105,14 +105,16 @@ def _resolve_parent_checkpoint(conn, campaign, args):
         print(f"No completed runs found in campaign '{campaign['name']}' stage {from_stage}")
         sys.exit(1)
 
-    run_id = rows[0]["run_id"]
-    ckpt = get_latest_checkpoint(conn, run_id)
-    if not ckpt:
-        print(f"No checkpoint found for run {run_id[:8]}")
-        sys.exit(1)
+    for row in rows:
+        run_id = row["run_id"]
+        ckpt = get_latest_checkpoint(conn, run_id)
+        if ckpt:
+            print(f"Auto-selected parent: run {run_id[:8]}, checkpoint {ckpt['tag']} (cycle {ckpt['cycle']})")
+            return ckpt, run_id
+        print(f"Skipping run {run_id[:8]}: no checkpoint found, trying next best run...")
 
-    print(f"Auto-selected parent: run {run_id[:8]}, checkpoint {ckpt['tag']} (cycle {ckpt['cycle']})")
-    return ckpt, run_id
+    print(f"No run with a checkpoint found in campaign '{campaign['name']}' stage {from_stage}")
+    sys.exit(1)
 
 
 def _get_parent_params(conn, run_id: str) -> dict:
@@ -219,6 +221,18 @@ def plan_branches(conn, campaign, policy, parent_ckpt, parent_run_id, args) -> l
         except ValueError as exc:
             print(f"Error applying delta for '{reason}': {exc}")
             sys.exit(1)
+
+        # H-4: seed_recheck with null default → assign deterministic seed
+        if reason == "seed_recheck" and (
+            child_params.get("seed") is None
+            or child_params.get("seed") == parent_params.get("seed")
+        ):
+            parent_seed = parent_params.get("seed") or 0
+            new_seed = (parent_seed % 997) + 1
+            # Avoid accidental collision with parent seed
+            if new_seed == parent_seed:
+                new_seed = (new_seed % 997) + 1
+            child_params["seed"] = new_seed
 
         # Protocol guard: check override AND final child_params against parent
         if not reason_preserves_protocol(policy, reason):
@@ -357,15 +371,20 @@ def execute_branches(conn, campaign, policy, plans: list[dict], parent_ckpt: dic
                 result_summary_json=json.dumps({"elapsed_s": round(elapsed, 1)}),
             )
             print(f"  Linked child run: {child_run_id[:8]}")
-            # v20.3: also link child run into campaign_runs for unified campaign lineage
-            link_run_to_campaign(
+            # v20.3: link child run into campaign_runs with proper hyperparam axis_values
+            # Exclude non-identity fields (seed, time_budget) so candidate_key is meaningful
+            child_axis_values = {
+                k: v for k, v in child_params.items()
+                if k not in {"seed", "time_budget"}
+            }
+            link_run_to_campaign_v20(
                 conn,
                 campaign_id=campaign["id"],
                 run_id=child_run_id,
                 stage="D",
                 sweep_tag=tag,
                 seed=child_params.get("seed"),
-                axis_values={"branch_reason": reason, "parent_run_id": p["parent_run_id"]},
+                axis_values=child_axis_values,
                 status="linked",
             )
         else:

@@ -96,14 +96,27 @@ def validate_selector_policy(data: dict) -> None:
         if val < 0:
             raise ValueError(f"score_weights['{key}'] must be non-negative, got {val}")
 
+    # Validate limits (optional field)
+    limits = data.get("limits")
+    if limits is not None:
+        if not isinstance(limits, dict):
+            raise ValueError("'limits' must be an object")
+        for key in ("default_batch_size", "min_runs_for_variance"):
+            if key in limits and not isinstance(limits[key], int):
+                raise ValueError(f"limits.{key} must be an integer")
+        if "max_wr_std_for_confident" in limits:
+            val = limits["max_wr_std_for_confident"]
+            if not isinstance(val, (int, float)) or val < 0:
+                raise ValueError("limits.max_wr_std_for_confident must be a non-negative number")
+
 
 def describe_selector_policy(policy: dict) -> str:
     """Return a human-readable summary of the selector policy."""
     lines = [
         f"Selector Policy: {policy['name']} v{policy['version']} ({policy['domain']})",
-        f"Search space: {policy['search_space_ref']['name']} v{policy['search_space_ref']['version']}",
-        f"Stage policy: {policy['stage_policy_ref']['name']} v{policy['stage_policy_ref']['version']}",
-        f"Branch policy: {policy['branch_policy_ref']['name']} v{policy['branch_policy_ref']['version']}",
+        f"Search space: {policy['search_space_ref']['name']} v{policy['search_space_ref'].get('version', '?')}",
+        f"Stage policy: {policy['stage_policy_ref']['name']} v{policy['stage_policy_ref'].get('version', '?')}",
+        f"Branch policy: {policy['branch_policy_ref']['name']} v{policy['branch_policy_ref'].get('version', '?')}",
         f"Candidate kinds ({len(policy['candidate_kinds'])}):",
     ]
     for name, cfg in policy["candidate_kinds"].items():

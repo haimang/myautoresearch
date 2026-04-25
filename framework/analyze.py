@@ -580,7 +580,6 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
         get_campaign,
         save_recommendation_batch,
         save_recommendation,
-        get_latest_recommendation_batch,
     )
 
     c = get_campaign(conn, campaign)
@@ -865,7 +864,7 @@ def cmd_matrix(conn: sqlite3.Connection, tag_prefix: str, campaign: str | None =
                 throughputs.append(r["games"] / r["wall_s"])
 
         mean_wr = sum(wrs) / len(wrs) if wrs else 0
-        std_wr = math.sqrt(sum((w - mean_wr)**2 for w in wrs) / len(wrs)) if len(wrs) > 1 else 0
+        std_wr = math.sqrt(sum((w - mean_wr)**2 for w in wrs) / (len(wrs) - 1)) if len(wrs) > 1 else 0
         mean_loss = sum(losses) / len(losses) if losses else 0
         mean_thr = sum(throughputs) / len(throughputs) if throughputs else 0
         params = runs[0]["params"] or 0

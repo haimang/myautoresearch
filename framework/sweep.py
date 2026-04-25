@@ -327,7 +327,6 @@ def main():
 
         # v20.2: stage policy
         if args.stage_policy:
-            from framework.stage_policy import load_stage_policy, get_stage_by_name
             stage_policy = load_stage_policy(args.stage_policy)
             if args.stage:
                 stage_cfg = get_stage_by_name(stage_policy, args.stage)

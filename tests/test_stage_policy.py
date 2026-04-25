@@ -34,6 +34,53 @@ class TestStagePolicyLoad(unittest.TestCase):
             load_stage_policy("/nonexistent/stage_policy.json")
 
 
+class TestValidateMetricWhitelist(unittest.TestCase):
+    """T-2: validate that disallowed metric names are rejected (SQL injection guard)."""
+
+    def _make_policy(self, metric):
+        return {
+            "domain": "test",
+            "name": "test-policy",
+            "version": "1.0",
+            "search_space_ref": {"domain": "test", "name": "ss"},
+            "stages": [
+                {"name": "A", "time_budget": 60, "seed_count": 1,
+                 "promote_top_k": 1, "metric": metric, "min_runs": 1},
+                {"name": "B", "time_budget": 180, "seed_count": 1,
+                 "promote_top_k": 1, "metric": "win_rate", "min_runs": 1},
+                {"name": "C", "time_budget": 600, "seed_count": 1,
+                 "promote_top_k": 1, "metric": "win_rate", "min_runs": 1},
+                {"name": "D", "time_budget": 1800, "seed_count": 1,
+                 "promote_top_k": 0, "metric": "win_rate", "min_runs": 1},
+            ],
+        }
+
+    def test_unknown_metric_rejected_in_validate(self):
+        with self.assertRaisesRegex(ValueError, "metric"):
+            validate_stage_policy(self._make_policy("wr"))
+
+    def test_sql_injection_metric_rejected_in_validate(self):
+        with self.assertRaisesRegex(ValueError, "metric"):
+            validate_stage_policy(
+                self._make_policy("final_win_rate; DROP TABLE runs--")
+            )
+
+    def test_aggregate_stage_metrics_rejects_bad_col(self):
+        from core.db import init_db
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            conn = init_db(db_path)
+            with self.assertRaisesRegex(ValueError, "metric_col"):
+                aggregate_stage_metrics(conn, "some-id", "A", "bad_col")
+            with self.assertRaisesRegex(ValueError, "metric_col"):
+                aggregate_stage_metrics(conn, "some-id", "A",
+                                        "final_win_rate; DROP TABLE runs--")
+            conn.close()
+        finally:
+            import os; os.remove(db_path)
+
+
 class TestStagePolicyValidate(unittest.TestCase):
     def test_valid_policy_passes(self):
         policy = {
@@ -42,10 +89,10 @@ class TestStagePolicyValidate(unittest.TestCase):
             "version": "1.0",
             "search_space_ref": {"domain": "test", "name": "ss", "version": "1.0"},
             "stages": [
-                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "wr", "min_runs": 1},
-                {"name": "B", "time_budget": 180, "seed_count": 2, "promote_top_k": 1, "metric": "wr", "min_runs": 1},
-                {"name": "C", "time_budget": 600, "seed_count": 3, "promote_top_k": 1, "metric": "wr", "min_runs": 1},
-                {"name": "D", "time_budget": 1800, "seed_count": 3, "promote_top_k": 0, "metric": "wr", "min_runs": 1},
+                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "win_rate", "min_runs": 1},
+                {"name": "B", "time_budget": 180, "seed_count": 2, "promote_top_k": 1, "metric": "win_rate", "min_runs": 1},
+                {"name": "C", "time_budget": 600, "seed_count": 3, "promote_top_k": 1, "metric": "win_rate", "min_runs": 1},
+                {"name": "D", "time_budget": 1800, "seed_count": 3, "promote_top_k": 0, "metric": "win_rate", "min_runs": 1},
             ],
         }
         validate_stage_policy(policy)  # should not raise
@@ -61,8 +108,8 @@ class TestStagePolicyValidate(unittest.TestCase):
             "version": "1",
             "search_space_ref": {"domain": "test", "name": "ss"},
             "stages": [
-                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "wr", "min_runs": 1},
-                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "wr", "min_runs": 1},
+                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "win_rate", "min_runs": 1},
+                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "win_rate", "min_runs": 1},
             ],
         }
         with self.assertRaisesRegex(ValueError, "Duplicate stage name"):
@@ -75,7 +122,7 @@ class TestStagePolicyValidate(unittest.TestCase):
             "version": "1",
             "search_space_ref": {"domain": "test", "name": "ss"},
             "stages": [
-                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": -1, "metric": "wr", "min_runs": 1},
+                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": -1, "metric": "win_rate", "min_runs": 1},
             ],
         }
         with self.assertRaisesRegex(ValueError, "promote_top_k must be >= 0"):
@@ -88,7 +135,7 @@ class TestStagePolicyValidate(unittest.TestCase):
             "version": "1",
             "search_space_ref": {"domain": "test", "name": "ss"},
             "stages": [
-                {"name": "B", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "wr", "min_runs": 1},
+                {"name": "B", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "win_rate", "min_runs": 1},
             ],
         }
         with self.assertRaisesRegex(ValueError, "Stage order must be"):
@@ -101,9 +148,9 @@ class TestStagePolicyValidate(unittest.TestCase):
             "version": "1",
             "search_space_ref": {"domain": "test", "name": "ss"},
             "stages": [
-                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "wr", "min_runs": 1},
-                {"name": "B", "time_budget": 180, "seed_count": 2, "promote_top_k": 1, "metric": "wr", "min_runs": 1},
-                {"name": "C", "time_budget": 600, "seed_count": 3, "promote_top_k": 1, "metric": "wr", "min_runs": 1},
+                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "win_rate", "min_runs": 1},
+                {"name": "B", "time_budget": 180, "seed_count": 2, "promote_top_k": 1, "metric": "win_rate", "min_runs": 1},
+                {"name": "C", "time_budget": 600, "seed_count": 3, "promote_top_k": 1, "metric": "win_rate", "min_runs": 1},
             ],
         }
         with self.assertRaisesRegex(ValueError, "Stage D must be present"):
@@ -112,7 +159,7 @@ class TestStagePolicyValidate(unittest.TestCase):
     def test_insufficient_min_runs_gets_hold(self):
         policy = {
             "stages": [
-                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 1, "metric": "wr", "min_runs": 3},
+                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 1, "metric": "win_rate", "min_runs": 3},
             ]
         }
         aggregated = [
@@ -155,7 +202,7 @@ class TestStagePolicyHelpers(unittest.TestCase):
             "version": "1.0",
             "search_space_ref": {"name": "ss", "version": "1.0"},
             "stages": [
-                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "wr", "min_runs": 1},
+                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "win_rate", "min_runs": 1},
             ],
         }
         desc = describe_stage_policy(policy)
@@ -167,7 +214,7 @@ class TestPlanPromotions(unittest.TestCase):
     def test_top_k_gets_promoted(self):
         policy = {
             "stages": [
-                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "wr", "min_runs": 1},
+                {"name": "A", "time_budget": 60, "seed_count": 1, "promote_top_k": 2, "metric": "win_rate", "min_runs": 1},
             ]
         }
         aggregated = [
@@ -184,7 +231,7 @@ class TestPlanPromotions(unittest.TestCase):
     def test_insufficient_seeds_gets_hold(self):
         policy = {
             "stages": [
-                {"name": "A", "time_budget": 60, "seed_count": 3, "promote_top_k": 1, "metric": "wr", "min_runs": 1},
+                {"name": "A", "time_budget": 60, "seed_count": 3, "promote_top_k": 1, "metric": "win_rate", "min_runs": 1},
             ]
         }
         aggregated = [

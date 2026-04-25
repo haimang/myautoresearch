@@ -25,6 +25,7 @@ from core.db import (
     get_campaign_runs_by_stage,
     get_branch_tree,
     get_latest_checkpoint,
+    get_search_space,
     list_all_checkpoints,
 )
 
@@ -69,6 +70,16 @@ def generate_point_candidates(conn, campaign, policy, limit: int = 5) -> list[di
     if not rows:
         return candidates
 
+    # Load search space axes for bounds-checking new_point candidates
+    space_axes: dict = {}
+    space_row = get_search_space(conn, campaign["search_space_id"] or "")
+    if space_row:
+        try:
+            profile = json.loads(space_row["profile_json"])
+            space_axes = profile.get("axes", {})
+        except (json.JSONDecodeError, KeyError):
+            pass
+
     # Identify frontier points (top 3 by mean WR)
     frontier = [dict(r) for r in rows[:3]]
     frontier_keys = {p["candidate_key"] for p in frontier}
@@ -94,38 +105,60 @@ def generate_point_candidates(conn, campaign, policy, limit: int = 5) -> list[di
                     },
                 })
 
-    # 1b. new_point candidates: frontier-neighbour sparse regions
-    # Simple heuristic: generate a neighbour of the best frontier point
-    # by perturbing one numeric axis value
+    # 1b. new_point candidates: frontier-neighbour exploration
+    # Perturb each axis of the best frontier point toward adjacent allowed values.
     if frontier and len(existing_keys) < limit * 2:
         best = frontier[0]
         axis_values = json.loads(best["axis_values_json"] or "{}")
-        # Find a numeric axis to perturb
+
         for axis_key, current_val in axis_values.items():
-            if isinstance(current_val, (int, float)):
-                # Try +10% perturbation
+            if axis_key == "seed":
+                continue
+            axis_spec = space_axes.get(axis_key, {})
+            allowed_values = axis_spec.get("values")
+
+            if allowed_values and current_val in allowed_values:
+                # Discrete axis: try next value in list (wrap to prev if at end)
+                idx = allowed_values.index(current_val)
+                next_idx = idx + 1 if idx + 1 < len(allowed_values) else idx - 1
+                if next_idx < 0 or next_idx == idx:
+                    continue
+                new_val = allowed_values[next_idx]
+            elif isinstance(current_val, (int, float)):
+                # No explicit value list: +10% perturbation
                 new_val = current_val * 1.1 if isinstance(current_val, float) else current_val + 1
-                new_axis = dict(axis_values)
-                new_axis[axis_key] = round(new_val, 4) if isinstance(current_val, float) else new_val
-                new_key = _stable_json(new_axis)
-                if new_key not in existing_keys:
-                    candidates.append({
-                        "candidate_type": "new_point",
-                        "candidate_key": new_key,
-                        "axis_values": new_axis,
-                        "score_signals": {
-                            "parent_wr": best["mean_wr"] or 0,
-                            "mean_params": best.get("mean_params") or 200000,
-                            "perturbed_axis": axis_key,
-                            "perturbation_ratio": 1.1,
-                        },
-                    })
-                    break  # only one neighbour candidate
+                new_val = round(new_val, 4) if isinstance(current_val, float) else new_val
+                # Bounds check against range spec
+                if "min" in axis_spec and new_val < axis_spec["min"]:
+                    new_val = axis_spec["min"]
+                if "max" in axis_spec and new_val > axis_spec["max"]:
+                    continue
+            else:
+                continue
+
+            new_axis = dict(axis_values)
+            new_axis[axis_key] = new_val
+            new_key = _stable_json({k: v for k, v in new_axis.items() if k != "seed"})
+            if new_key not in existing_keys:
+                candidates.append({
+                    "candidate_type": "new_point",
+                    "candidate_key": new_key,
+                    "axis_values": new_axis,
+                    "score_signals": {
+                        "parent_wr": best["mean_wr"] or 0,
+                        "mean_params": best.get("mean_params") or 200000,
+                        "perturbed_axis": axis_key,
+                        "perturbation_ratio": round(new_val / current_val, 3) if current_val else 1.0,
+                    },
+                })
+                if len(candidates) >= limit:
+                    break
 
     return candidates
 
 
-def generate_branch_candidates(conn, campaign, policy, limit: int = 3) -> list[dict]:
+def generate_branch_candidates(conn, campaign, policy, limit: int = 3,
+                               branch_policy: dict | None = None) -> list[dict]:
     """Generate continue_branch and eval_upgrade candidates from branch tree."""
     candidates = []
     campaign_id = campaign["id"]
@@ -149,10 +182,21 @@ def generate_branch_candidates(conn, campaign, policy, limit: int = 3) -> list[d
     if not rows:
         return candidates
 
-    # Get branch policy reasons
+    # Get branch policy reasons and factors
     branch_reasons = policy.get("branch_policy_ref", {}).get("reasons", [])
     if not branch_reasons:
         branch_reasons = ["lr_decay", "mcts_upshift", "seed_recheck"]
+
+    # Extract lr_decay factor from branch_policy if available
+    lr_decay_factor = 0.1
+    if branch_policy:
+        lr_spec = (branch_policy.get("branch_reasons", {})
+                   .get("lr_decay", {})
+                   .get("allowed_deltas", {})
+                   .get("learning_rate", {}))
+        lr_decay_factor = lr_spec.get("default_factor", 0.1)
+
+    max_eval_level = policy.get("limits", {}).get("max_eval_level", 2)
 
     for r in rows:
         parent_run_id = r["run_id"]
@@ -174,13 +218,15 @@ def generate_branch_candidates(conn, campaign, policy, limit: int = 3) -> list[d
 
         # Suggest lr_decay for high-LR parents
         if (r["learning_rate"] or 0) > 0.001:
+            # delta_json stores the factor for multiply-type deltas (consistent with validate_delta)
+            delta_json = json.dumps({"learning_rate": lr_decay_factor}, sort_keys=True, separators=(",", ":"))
             candidates.append({
                 "candidate_type": "continue_branch",
                 "candidate_key": r["candidate_key"],
                 "parent_run_id": parent_run_id,
                 "parent_checkpoint_id": ckpt["id"],
                 "branch_reason": "lr_decay",
-                "delta_json": '{"learning_rate": 0.1}',
+                "delta_json": delta_json,
                 "axis_values": json.loads(r["axis_values_json"] or "{}"),
                 "score_signals": {
                     "parent_wr": r["final_win_rate"] or 0,
@@ -203,13 +249,31 @@ def generate_branch_candidates(conn, campaign, policy, limit: int = 3) -> list[d
                 "parent_run_id": parent_run_id,
                 "parent_checkpoint_id": ckpt["id"],
                 "branch_reason": "seed_recheck",
-                "delta_json": '{"seed": 99}',
+                "delta_json": "{}",  # No explicit delta; branch.py uses policy default (deterministic seed)
                 "axis_values": json.loads(r["axis_values_json"] or "{}"),
                 "score_signals": {
                     "parent_wr": r["final_win_rate"] or 0,
                     "mean_params": r["num_params"] if r["num_params"] is not None else 200000,
                     "existing_branches": existing_branches,
                     "reason": "seed_recheck",
+                },
+            })
+
+        # Suggest eval_upgrade for high-WR parents below max eval_level
+        if (r["final_win_rate"] or 0) >= 0.6 and (r["eval_level"] or 0) < max_eval_level:
+            candidates.append({
+                "candidate_type": "eval_upgrade",
+                "candidate_key": r["candidate_key"],
+                "parent_run_id": parent_run_id,
+                "parent_checkpoint_id": ckpt["id"],
+                "branch_reason": "eval_upgrade",
+                "delta_json": "{}",
+                "axis_values": json.loads(r["axis_values_json"] or "{}"),
+                "score_signals": {
+                    "parent_wr": r["final_win_rate"] or 0,
+                    "mean_params": r["num_params"] if r["num_params"] is not None else 200000,
+                    "existing_branches": existing_branches,
+                    "reason": "eval_upgrade",
                 },
             })
 
@@ -307,13 +371,25 @@ def recommend_for_campaign(conn, campaign, policy,
 
     candidates = []
 
+    # Load branch policy for delta computation in branch candidates
+    bp: dict | None = None
+    bp_ref = policy.get("branch_policy_ref", {})
+    if bp_ref.get("domain") and bp_ref.get("name"):
+        bp_path = os.path.join(_PROJECT_ROOT, "domains", bp_ref["domain"], "branch_policy.json")
+        if os.path.isfile(bp_path):
+            try:
+                with open(bp_path, "r", encoding="utf-8") as _f:
+                    bp = json.load(_f)
+            except (json.JSONDecodeError, OSError):
+                pass
+
     if candidate_type is None or candidate_type in ("new_point", "seed_recheck"):
         point_cands = generate_point_candidates(conn, campaign, policy)
         if candidate_type:
             point_cands = [c for c in point_cands if c["candidate_type"] == candidate_type]
         candidates.extend(c for c in point_cands if _identity(c) not in accepted_identities)
     if candidate_type is None or candidate_type in ("continue_branch", "eval_upgrade"):
-        branch_cands = generate_branch_candidates(conn, campaign, policy)
+        branch_cands = generate_branch_candidates(conn, campaign, policy, branch_policy=bp)
         if candidate_type:
             branch_cands = [c for c in branch_cands if c["candidate_type"] == candidate_type]
         candidates.extend(c for c in branch_cands if _identity(c) not in accepted_identities)

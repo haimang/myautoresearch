@@ -259,6 +259,22 @@ def execute_promotion(conn, campaign_id: str, policy: dict,
         status="open",
     )
 
+    # Persist promotion decisions BEFORE running seeds (crash-safe audit trail)
+    for d in decisions:
+        save_promotion_decision(
+            conn,
+            campaign_id=campaign_id,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            candidate_key=d["candidate_key"],
+            axis_values=d["axis_values"],
+            aggregated_metrics=d["aggregated_metrics"],
+            seed_count=d["seed_count"],
+            decision=d["decision"],
+            decision_rank=d["decision_rank"],
+            reason=d["reason"],
+        )
+
     results = []
     for wi in work_items:
         axis_values = wi["axis_values"]
@@ -332,22 +348,6 @@ def execute_promotion(conn, campaign_id: str, policy: dict,
     print(f"\n{'='*60}")
     print(f"Promotion execute 完成: {n_ok} 成功, {n_fail} 失败")
     print(f"{'='*60}")
-
-    # Persist promotion decisions
-    for d in decisions:
-        save_promotion_decision(
-            conn,
-            campaign_id=campaign_id,
-            from_stage=from_stage,
-            to_stage=to_stage,
-            candidate_key=d["candidate_key"],
-            axis_values=d["axis_values"],
-            aggregated_metrics=d["aggregated_metrics"],
-            seed_count=d["seed_count"],
-            decision=d["decision"],
-            decision_rank=d["decision_rank"],
-            reason=d["reason"],
-        )
 
     # Close from_stage
     close_campaign_stage(conn, campaign_id, from_stage)

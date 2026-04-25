@@ -156,7 +156,10 @@ def _compute_default_delta(current, delta_spec: dict):
     dtype = delta_spec["type"]
     if dtype == "multiply":
         factor = delta_spec.get("default_factor", 1.0)
-        return (current * factor) if current is not None else factor
+        if current is not None:
+            result = current * factor
+            return int(round(result)) if isinstance(current, int) else result
+        return factor
     elif dtype == "add":
         delta = delta_spec.get("default_delta", 0)
         return (current + delta) if current is not None else delta

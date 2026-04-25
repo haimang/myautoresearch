@@ -276,5 +276,117 @@ class TestSelectorEngine(unittest.TestCase):
         )
 
 
+class TestNewPointBoundsAndAxisValues(unittest.TestCase):
+    """T-4: new_point candidates respect search space discrete bounds.
+    T-6: Stage D axis_values contain actual hyperparams (not branch metadata).
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "tracker.db")
+        self.conn = init_db(self.db_path)
+        self.profile = load_profile(str(PROFILE_PATH))
+        self.space_id = save_search_space(self.conn, self.profile)
+        self.campaign = get_or_create_campaign(
+            self.conn,
+            name="bounds-test",
+            domain="gomoku",
+            train_script="t.py",
+            search_space_id=self.space_id,
+            protocol={"eval_level": 0},
+        )
+        self.policy = load_selector_policy(str(SELECTOR_POLICY_PATH))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_new_point_axis_values_within_allowed_values(self):
+        """T-4: perturbed axis values must appear in search space allowed values."""
+        # Insert run first (FK constraint), then link into campaign_runs
+        create_run(self.conn, "run-b1", {"sweep_tag": "rb1", "eval_level": 0, "learning_rate": 0.0003}, is_benchmark=True)
+        finish_run(self.conn, "run-b1", {
+            "status": "completed", "final_win_rate": 0.7,
+            "wall_time_s": 100.0, "num_params": 100000, "total_games": 500,
+        })
+        self.conn.execute(
+            """INSERT INTO campaign_runs (campaign_id, run_id, stage, sweep_tag, seed,
+               axis_values_json, status, created_at, candidate_key)
+               VALUES (?, 'run-b1', 'A', 'rb1', 1,
+               '{"learning_rate":0.0003,"num_blocks":6,"num_filters":64}',
+               'linked', '2024-01-01',
+               '{"learning_rate":0.0003,"num_blocks":6,"num_filters":64}')""",
+            (self.campaign["id"],),
+        )
+        self.conn.commit()
+
+        candidates = generate_point_candidates(self.conn, self.campaign, self.policy)
+
+        # Extract learning_rate values from new_point candidates
+        new_point_cands = [c for c in candidates if c["candidate_type"] == "new_point"]
+        for c in new_point_cands:
+            av = c["axis_values"]
+            lr = av.get("learning_rate")
+            if lr is not None:
+                allowed_lr = [0.0003, 0.0005, 0.0007]
+                self.assertIn(
+                    lr, allowed_lr,
+                    f"learning_rate={lr} not in allowed values {allowed_lr}"
+                )
+
+    def test_stage_d_axis_values_contain_hyperparams(self):
+        """T-6: campaign_runs for Stage D must contain actual hyperparams, not branch metadata."""
+        from core.db import link_run_to_campaign_v20
+
+        # Simulate what execute_branches now does: store child hyperparam axis_values
+        child_params = {
+            "num_blocks": 8,
+            "num_filters": 64,
+            "learning_rate": 0.0001,
+            "steps_per_cycle": 30,
+            "buffer_size": 100000,
+            "mcts_simulations": 400,
+            "seed": 42,
+            "time_budget": 1800,
+        }
+        child_axis_values = {k: v for k, v in child_params.items() if k not in {"seed", "time_budget"}}
+
+        create_run(self.conn, "child-d", {"sweep_tag": "d-child", "eval_level": 0}, is_benchmark=True)
+        finish_run(self.conn, "child-d", {
+            "status": "completed", "final_win_rate": 0.88,
+            "wall_time_s": 1800.0, "num_params": 200000, "total_games": 1000,
+        })
+        link_run_to_campaign_v20(
+            self.conn,
+            campaign_id=self.campaign["id"],
+            run_id="child-d",
+            stage="D",
+            sweep_tag="d-child",
+            seed=42,
+            axis_values=child_axis_values,
+            status="linked",
+        )
+        self.conn.commit()
+
+        row = self.conn.execute(
+            "SELECT axis_values_json, candidate_key FROM campaign_runs "
+            "WHERE run_id = 'child-d'",
+        ).fetchone()
+        self.assertIsNotNone(row)
+        av = json.loads(row["axis_values_json"])
+
+        # axis_values must contain hyperparams, not branch metadata
+        self.assertIn("num_blocks", av)
+        self.assertIn("learning_rate", av)
+        self.assertNotIn("branch_reason", av)
+        self.assertNotIn("parent_run_id", av)
+
+        # candidate_key must be non-trivial (JSON of hyperparams)
+        ck = row["candidate_key"]
+        self.assertIsNotNone(ck)
+        ck_obj = json.loads(ck)
+        self.assertIn("num_blocks", ck_obj)
+
+
 if __name__ == "__main__":
     unittest.main()

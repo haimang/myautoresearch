@@ -26,8 +26,10 @@ PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
 
 class TestTrajectoryReport(unittest.TestCase):
     def setUp(self):
-        self.tmp_dir = Path(__file__).resolve().parents[1] / "output" / "test_traj.db"
-        self.db_path = str(self.tmp_dir)
+        import tempfile
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self.db_path = self._tmp.name
         self.conn = init_db(self.db_path)
         self.profile = load_profile(str(PROFILE_PATH))
         self.space_id = save_search_space(self.conn, self.profile)

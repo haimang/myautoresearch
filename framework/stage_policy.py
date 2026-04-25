@@ -32,6 +32,8 @@ STAGE_ORDER = ["A", "B", "C", "D"]
 
 REQUIRED_STAGE_KEYS = {"name", "time_budget", "seed_count", "promote_top_k", "metric", "min_runs"}
 
+ALLOWED_METRICS = {"win_rate", "final_win_rate"}
+
 
 def load_stage_policy(path: str) -> dict:
     """Load a stage policy JSON from disk."""
@@ -74,6 +76,11 @@ def validate_stage_policy(data: dict) -> None:
             raise ValueError(f"Stage {name}: promote_top_k must be >= 0")
         if st["seed_count"] is not None and st["seed_count"] < 1:
             raise ValueError(f"Stage {name}: seed_count must be >= 1 or null")
+        metric = st["metric"]
+        if not isinstance(metric, str) or metric not in ALLOWED_METRICS:
+            raise ValueError(
+                f"Stage {name}: metric '{metric}' must be one of {sorted(ALLOWED_METRICS)}"
+            )
 
     # Validate stage order A→B→C→D (must be contiguous prefix)
     actual_order = [s["name"] for s in stages]
@@ -97,7 +104,7 @@ def describe_stage_policy(policy: dict) -> str:
     """Return a human-readable summary of the policy."""
     lines = [
         f"Stage Policy: {policy['name']} v{policy['version']} ({policy['domain']})",
-        f"Search space: {policy['search_space_ref']['name']} v{policy['search_space_ref']['version']}",
+        f"Search space: {policy['search_space_ref']['name']} v{policy['search_space_ref'].get('version', '?')}",
         "Stages:",
     ]
     for st in policy["stages"]:
@@ -157,6 +164,10 @@ def aggregate_stage_metrics(
     - seed_count
     - run_ids
     """
+    if metric_col not in ALLOWED_METRICS:
+        raise ValueError(
+            f"metric_col '{metric_col}' is not allowed; must be one of {sorted(ALLOWED_METRICS)}"
+        )
     rows = conn.execute(
         """
         SELECT cr.candidate_key, cr.axis_values_json, cr.seed, r.id, r.{metric}
