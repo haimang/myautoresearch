@@ -15,7 +15,7 @@ from copy import deepcopy
 
 VALID_AXIS_TYPES = {"int", "float", "categorical"}
 VALID_SCALES = {"linear", "log"}
-VALID_ROLES = {"structure", "training", "slow"}
+VALID_ROLES = {"structure", "training", "slow", "strategy", "execution", "risk", "provider"}
 
 
 def _stable_json(value: object) -> str:
@@ -166,7 +166,7 @@ def load_profile(path: str) -> dict:
 def describe_profile(profile: dict) -> str:
     """Human-readable profile summary."""
     protocol = profile["protocol"]
-    role_groups: dict[str, list[str]] = {"structure": [], "training": [], "slow": []}
+    role_groups: dict[str, list[str]] = {role: [] for role in sorted(VALID_ROLES)}
     for axis_name, axis in profile["axes"].items():
         role_groups[axis["role"]].append(axis_name)
 
@@ -177,7 +177,7 @@ def describe_profile(profile: dict) -> str:
         f"is_benchmark={protocol.get('is_benchmark')}",
         f"  Axes ({len(profile['axes'])}):",
     ]
-    for role in ("structure", "training", "slow"):
+    for role in sorted(VALID_ROLES):
         names = sorted(role_groups[role])
         if names:
             lines.append(f"    - {role}: {', '.join(names)}")

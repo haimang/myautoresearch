@@ -785,6 +785,8 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
             acquisition_score=rec.get("acquisition_score"),
             parent_run_id=rec.get("parent_run_id"),
             parent_checkpoint_id=rec.get("parent_checkpoint_id"),
+            candidate_payload_json=_json.dumps(rec.get("candidate_payload", rec.get("axis_values", {})), ensure_ascii=False, sort_keys=True) if (rec.get("candidate_payload") or rec.get("axis_values")) else None,
+            objective_metrics_json=_json.dumps(rec.get("score_signals", {}).get("objective_metrics", {}), ensure_ascii=False, sort_keys=True) if rec.get("score_signals", {}).get("objective_metrics") else None,
         )
 
     if fmt == "json":
@@ -1330,6 +1332,171 @@ def _pareto_front(points: list[dict], maximize: list[str],
     return front, dominated
 
 
+def _load_objective_profile_for_pareto(
+    conn: sqlite3.Connection,
+    profile_ref: str | None,
+    campaign_row: dict | None,
+) -> tuple[dict | None, str | None]:
+    """Resolve an objective profile from a path, id, or campaign binding."""
+    if profile_ref:
+        if os.path.isfile(profile_ref):
+            from objective_profile import load_objective_profile
+            profile = load_objective_profile(profile_ref)
+            return profile, None
+        row = conn.execute(
+            "SELECT * FROM objective_profiles WHERE id = ?",
+            (profile_ref,),
+        ).fetchone()
+        if not row:
+            print(f"Objective profile not found: {profile_ref}")
+            return None, None
+        return _json.loads(row["profile_json"]), row["id"]
+
+    if campaign_row and campaign_row.get("objective_profile_id"):
+        row = conn.execute(
+            "SELECT * FROM objective_profiles WHERE id = ?",
+            (campaign_row["objective_profile_id"],),
+        ).fetchone()
+        if row:
+            return _json.loads(row["profile_json"]), row["id"]
+    return None, None
+
+
+def _constraint_satisfied(value: float | None, op: str, expected) -> bool:
+    if value is None:
+        return False
+    expected = float(expected)
+    if op == "eq":
+        return value == expected
+    if op == "le":
+        return value <= expected
+    if op == "ge":
+        return value >= expected
+    if op == "lt":
+        return value < expected
+    if op == "gt":
+        return value > expected
+    return False
+
+
+def _objective_axis_meta(profile: dict | None) -> dict:
+    if not profile:
+        return {}
+    display = profile.get("display", {})
+    return {
+        metric: {
+            "label": meta.get("label", metric),
+            "format": meta.get("format", "number"),
+        }
+        for metric, meta in display.items()
+    }
+
+
+def _build_metric_points(
+    conn: sqlite3.Connection,
+    *,
+    campaign_id: str | None,
+    stage: str | None,
+    profile: dict,
+) -> tuple[list[dict], list[dict]]:
+    """Build Pareto points from run_metrics, returning (feasible, infeasible)."""
+    required = set(profile.get("maximize", [])) | set(profile.get("minimize", []))
+    required |= {c["metric"] for c in profile.get("hard_constraints", [])}
+    if not required:
+        return [], []
+
+    params: list = []
+    if campaign_id:
+        sql = """SELECT r.id, r.sweep_tag, cr.stage, cr.axis_values_json
+                 FROM campaign_runs cr
+                 JOIN runs r ON r.id = cr.run_id
+                 WHERE cr.campaign_id = ?
+                   AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')"""
+        params.append(campaign_id)
+        if stage:
+            sql += " AND cr.stage = ?"
+            params.append(stage)
+    else:
+        sql = """SELECT r.id, r.sweep_tag, NULL AS stage, '{}' AS axis_values_json
+                 FROM runs r
+                 WHERE r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')"""
+
+    rows = conn.execute(sql, params).fetchall()
+    feasible = []
+    infeasible = []
+    for row in rows:
+        metric_rows = conn.execute(
+            "SELECT metric_name, metric_value FROM run_metrics WHERE run_id = ?",
+            (row["id"],),
+        ).fetchall()
+        metrics = {m["metric_name"]: m["metric_value"] for m in metric_rows}
+        if not required.issubset(metrics):
+            continue
+        point = {
+            "run": row["id"][:8],
+            "run_full": row["id"],
+            "label": row["sweep_tag"] or row["id"][:8],
+            "arch": row["sweep_tag"] or row["id"][:8],
+            "stage": row["stage"],
+            "axis_values": _json.loads(row["axis_values_json"] or "{}"),
+            "constraint_status": {},
+        }
+        point.update(metrics)
+        failed = []
+        for constraint in profile.get("hard_constraints", []):
+            metric = constraint["metric"]
+            ok = _constraint_satisfied(metrics.get(metric), constraint["op"], constraint["value"])
+            point["constraint_status"][metric] = ok
+            if not ok:
+                failed.append(constraint)
+        if failed:
+            point["failed_constraints"] = failed
+            infeasible.append(point)
+        else:
+            feasible.append(point)
+    return feasible, infeasible
+
+
+def _compute_knee_point(front: list[dict], maximize: list[str], minimize: list[str]) -> tuple[dict | None, dict | None]:
+    """Pick a simple normalized utopia-distance knee point from the front."""
+    if not front:
+        return None, None
+    axes = maximize + minimize
+    ranges = {}
+    for axis in axes:
+        vals = [p.get(axis) for p in front if p.get(axis) is not None]
+        if not vals:
+            continue
+        ranges[axis] = (min(vals), max(vals))
+    best = None
+    best_dist = None
+    for point in front:
+        total = 0.0
+        used = 0
+        for axis in axes:
+            if axis not in ranges or point.get(axis) is None:
+                continue
+            lo, hi = ranges[axis]
+            if hi == lo:
+                norm = 1.0
+            elif axis in maximize:
+                norm = (point[axis] - lo) / (hi - lo)
+            else:
+                norm = (hi - point[axis]) / (hi - lo)
+            total += (1.0 - norm) ** 2
+            used += 1
+        dist = math.sqrt(total / used) if used else 0.0
+        if best_dist is None or dist < best_dist:
+            best = point
+            best_dist = dist
+    rationale = {
+        "method": "utopia_distance",
+        "distance": round(best_dist or 0.0, 6),
+        "axes": axes,
+    }
+    return best, rationale
+
+
 def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
                maximize: list[str] | None = None,
                minimize: list[str] | None = None,
@@ -1339,7 +1506,10 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
                allow_drift: bool = False,
                plot: bool = False,
                output_path: str | None = None,
-               stage: str | None = None) -> None:
+               stage: str | None = None,
+               objective_profile: str | None = None,
+               metric_source: str = "legacy",
+               show_knee: bool = False) -> None:
     """对 completed runs 执行非支配排序，输出 Pareto 前沿。
 
     默认轴: maximize WR, minimize params 和 wall_time.
@@ -1347,11 +1517,94 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
     支持 --stage 按 campaign stage 过滤。
     支持 --plot 生成 PNG 散点图。
     """
-    maximize = maximize or ["wr"]
-    minimize = minimize or ["params", "wall_s"]
-
     campaign_row = None
     campaign_id = None
+    if campaign is not None:
+        campaign_row = _resolve_campaign_or_exit(conn, campaign)
+        campaign_id = campaign_row["id"]
+
+    profile, profile_id = _load_objective_profile_for_pareto(conn, objective_profile, campaign_row)
+    if profile:
+        maximize = maximize or profile.get("maximize", [])
+        minimize = minimize or profile.get("minimize", [])
+        metric_source = "run_metrics"
+    else:
+        maximize = maximize or ["wr"]
+        minimize = minimize or ["params", "wall_s"]
+
+    if metric_source == "run_metrics":
+        if campaign_row:
+            drift = _campaign_drift(_campaign_run_rows(conn, campaign_id), campaign_row["protocol"])
+            if drift and not allow_drift:
+                print(f"Campaign '{campaign_row['name']}' has {len(drift)} drift run(s); refusing Pareto output.")
+                print("Use --allow-drift to override.")
+                return
+        if not profile:
+            profile = {
+                "maximize": maximize,
+                "minimize": minimize,
+                "hard_constraints": [],
+                "display": {},
+                "knee": {"method": "utopia_distance"},
+            }
+        points, infeasible = _build_metric_points(conn, campaign_id=campaign_id, stage=stage, profile=profile)
+        if not points:
+            print("No completed runs with run_metrics matching objective profile.")
+            return
+        front, dominated = _pareto_front(points, maximize=maximize, minimize=minimize)
+        sort_key = maximize[0] if maximize else (minimize[0] if minimize else None)
+        if sort_key:
+            front.sort(key=lambda p: -(p.get(sort_key) or 0))
+            dominated.sort(key=lambda p: -(p.get(sort_key) or 0))
+        knee, knee_rationale = _compute_knee_point(front, maximize, minimize) if show_knee or profile.get("knee", {}).get("method") == "utopia_distance" else (None, None)
+        _save_frontier_snapshot(
+            conn, front, dominated, maximize, minimize, eval_level, sweep_tag, campaign_id,
+            objective_profile_id=profile_id,
+            metric_source="run_metrics",
+            constraints_json=_json.dumps(profile.get("hard_constraints", []), ensure_ascii=False, sort_keys=True),
+            knee_run_id=knee.get("run_full") if knee else None,
+            knee_rationale_json=_json.dumps(knee_rationale, ensure_ascii=False, sort_keys=True) if knee_rationale else None,
+        )
+        if fmt == "json":
+            output = {
+                "pareto_front": front,
+                "dominated": dominated,
+                "infeasible": infeasible,
+                "knee": knee,
+                "knee_rationale": knee_rationale,
+                "axes": {"maximize": maximize, "minimize": minimize},
+                "metric_source": "run_metrics",
+                "campaign": campaign_row["name"] if campaign_row is not None else None,
+            }
+            print(_json.dumps(output, indent=2, ensure_ascii=False))
+        else:
+            print(f"Pareto Front (metric_source=run_metrics, maximize {', '.join(maximize)}, minimize {', '.join(minimize)})")
+            print(f"{'─' * 96}")
+            print(f"  Feasible: {len(points)}  |  Infeasible: {len(infeasible)}  |  Front: {len(front)}  |  Dominated: {len(dominated)}")
+            if knee:
+                print(f"  Knee: {knee['run']} ({knee.get('label', '-')})")
+            print()
+            cols = ["run", "label"] + maximize[:2] + minimize[:2]
+            print("  " + "  ".join(f"{c:>18}" for c in cols))
+            print("  " + "─" * (20 * len(cols)))
+            for p in front:
+                print("  " + "  ".join(f"{str(round(p.get(c), 6)) if isinstance(p.get(c), float) else str(p.get(c, '-')):>18}" for c in cols))
+        if plot:
+            from pareto_plot import plot_pareto
+            y_axis = maximize[0] if maximize else None
+            x_axis = minimize[0] if minimize else None
+            if y_axis and x_axis:
+                path = plot_pareto(
+                    front, dominated,
+                    x_key=x_axis, y_key=y_axis,
+                    label_key="label",
+                    output_path=output_path or "output/pareto_front.png",
+                    axis_meta=_objective_axis_meta(profile),
+                    knee_point=knee,
+                )
+                print(f"  📊 Plot saved: {path}")
+        return
+
     select_sql = """SELECT id, num_res_blocks, num_filters, num_params,
                            final_win_rate, wall_time_s, total_games, total_cycles,
                            total_steps, eval_level, eval_opponent, is_benchmark,
@@ -1367,8 +1620,6 @@ def cmd_pareto(conn: sqlite3.Connection, fmt: str = "md",
                      f"{wr_col} IS NOT NULL"]
     params_sql: list = []
     if campaign is not None:
-        campaign_row = _resolve_campaign_or_exit(conn, campaign)
-        campaign_id = campaign_row["id"]
         drift = _campaign_drift(_campaign_run_rows(conn, campaign_id), campaign_row["protocol"])
         if drift and not allow_drift:
             print(f"Campaign '{campaign_row['name']}' has {len(drift)} drift run(s); refusing Pareto output.")
@@ -1545,15 +1796,22 @@ def _save_frontier_snapshot(conn: sqlite3.Connection,
                             front: list[dict], dominated: list[dict],
                             maximize: list[str], minimize: list[str],
                             eval_level: int | None, sweep_tag: str | None,
-                            campaign_id: str | None = None) -> str | None:
+                            campaign_id: str | None = None,
+                            objective_profile_id: str | None = None,
+                            metric_source: str | None = None,
+                            constraints_json: str | None = None,
+                            knee_run_id: str | None = None,
+                            knee_rationale_json: str | None = None) -> str | None:
     """Persist a frontier snapshot to the frontier_snapshots table and return its id."""
     try:
         snapshot_id = str(uuid.uuid4())
         conn.execute(
             """INSERT INTO frontier_snapshots
-               (id, created_at, maximize_axes, minimize_axes, front_run_ids,
-                 dominated_count, total_runs, eval_level, sweep_tag, campaign_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id, created_at, maximize_axes, minimize_axes, front_run_ids,
+                 dominated_count, total_runs, eval_level, sweep_tag, campaign_id,
+                 objective_profile_id, metric_source, constraints_json,
+                 knee_run_id, knee_rationale_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 snapshot_id,
                 datetime.now(timezone.utc).isoformat(),
@@ -1565,6 +1823,11 @@ def _save_frontier_snapshot(conn: sqlite3.Connection,
                 eval_level,
                 sweep_tag,
                 campaign_id,
+                objective_profile_id,
+                metric_source,
+                constraints_json,
+                knee_run_id,
+                knee_rationale_json,
             )
         )
         conn.commit()
@@ -2342,6 +2605,12 @@ def main():
                         help="Allow protocol-drift runs inside campaign-scoped analyses")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path for plot PNG (default: output/pareto_front.png)")
+    parser.add_argument("--objective-profile", type=str, default=None,
+                        help="Objective profile path/id for domain-generic Pareto analysis")
+    parser.add_argument("--metric-source", choices=["legacy", "run_metrics"], default="legacy",
+                        help="Metric source for Pareto analysis (default: legacy)")
+    parser.add_argument("--knee", action="store_true",
+                        help="Report a normalized utopia-distance knee point for --pareto")
 
     # v21: selector configuration
     parser.add_argument("--selector-policy", type=str, default=None,
@@ -2390,7 +2659,10 @@ def main():
                    eval_level=args.eval_level, sweep_tag=args.sweep_tag,
                    campaign=args.campaign, allow_drift=args.allow_drift,
                    plot=args.plot, output_path=args.output,
-                   stage=args.stage)
+                   stage=args.stage,
+                   objective_profile=args.objective_profile,
+                   metric_source=args.metric_source,
+                   show_knee=args.knee)
     elif args.compare_by_steps:
         cmd_compare_by_steps(conn, args.compare_by_steps[0], args.compare_by_steps[1])
     elif args.promotion_chain:

@@ -67,8 +67,10 @@ def rerank_candidates(
     reranked = []
     for candidate in candidates:
         signals = candidate.get("score_signals", {})
-        predicted_wr = float(signals.get("mean_wr", signals.get("parent_wr", 0.5)) or 0.5)
-        mean_params = float(signals.get("mean_params") or 100000.0)
+        predicted_wr = float(
+            signals.get("predicted_objective", signals.get("mean_wr", signals.get("parent_wr", 0.5))) or 0.5
+        )
+        mean_params = float(signals.get("mean_params", signals.get("mean_cost", 100000.0)) or 100000.0)
         mean_wall_s = float(signals.get("mean_wall_s") or signals.get("mean_wall") or 120.0)
         posterior_sigma = _posterior_sigma(signals, priors)
         candidate_bonus = float(type_bonus.get(candidate["candidate_type"], 0.0))

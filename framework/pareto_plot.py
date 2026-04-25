@@ -10,10 +10,10 @@
 """
 
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 # Axis display metadata: (label, format function)
-_AXIS_META: dict[str, tuple[str, callable]] = {
+_AXIS_META: dict[str, tuple[str, Callable]] = {
     "wr": ("Win Rate", lambda v: f"{v:.1%}"),
     "params": ("Params", lambda v: f"{v/1000:.0f}K" if v and v < 1e6 else f"{v/1e6:.1f}M" if v else "?"),
     "wall_s": ("Wall Time (s)", lambda v: f"{v:.0f}s" if v else "?"),
@@ -25,17 +25,35 @@ _AXIS_META: dict[str, tuple[str, callable]] = {
 }
 
 
-def _get_label(key: str) -> str:
+def _format_by_kind(kind: str, val) -> str:
+    if val is None:
+        return "?"
+    if kind in ("ratio", "percent"):
+        return f"{float(val):.1%}"
+    if kind == "bps":
+        return f"{float(val):.1f} bps"
+    if kind == "seconds":
+        return f"{float(val):.0f}s"
+    if kind == "integer":
+        return f"{int(val)}"
+    return f"{float(val):.4g}" if isinstance(val, (int, float)) else str(val)
+
+
+def _get_label(key: str, axis_meta: Optional[dict] = None) -> str:
     """Get display label for an axis key."""
+    if axis_meta and key in axis_meta:
+        return axis_meta[key].get("label", key)
     if key in _AXIS_META:
         return _AXIS_META[key][0]
     return key
 
 
-def _fmt_val(key: str, val) -> str:
+def _fmt_val(key: str, val, axis_meta: Optional[dict] = None) -> str:
     """Format a value for annotation."""
     if val is None:
         return "?"
+    if axis_meta and key in axis_meta:
+        return _format_by_kind(axis_meta[key].get("format", "number"), val)
     if key in _AXIS_META:
         return _AXIS_META[key][1](val)
     return str(val)
@@ -56,6 +74,8 @@ def plot_pareto(
     dpi: int = 150,
     eval_level: Optional[int] = None,
     sweep_tag: Optional[str] = None,
+    axis_meta: Optional[dict] = None,
+    knee_point: Optional[dict] = None,
 ) -> str:
     """生成 Pareto 前沿散点图，返回输出文件路径。"""
     import matplotlib
@@ -106,7 +126,7 @@ def plot_pareto(
 
         # Annotations for front points
         for x, y, lbl, p in zip(front_x, front_y, front_labels, front_filtered):
-            y_str = _fmt_val(y_key, y)
+            y_str = _fmt_val(y_key, y, axis_meta)
             annotation = f"{lbl}\n{y_str}"
             ax.annotate(annotation, (x, y), textcoords="offset points",
                         xytext=(8, 10), fontsize=8, fontweight="bold",
@@ -116,9 +136,27 @@ def plot_pareto(
                         arrowprops=dict(arrowstyle="-", color="#93C5FD", lw=0.8),
                         zorder=5)
 
+    if knee_point and knee_point.get(x_key) is not None and knee_point.get(y_key) is not None:
+        ax.scatter([knee_point[x_key]], [knee_point[y_key]], c="#F59E0B", s=220,
+                   marker="*", edgecolors="#B45309", linewidths=1.2, zorder=6,
+                   label="Knee")
+        ax.annotate(
+            f"Knee\n{knee_point.get(label_key, knee_point.get('run', ''))}",
+            (knee_point[x_key], knee_point[y_key]),
+            textcoords="offset points",
+            xytext=(10, -22),
+            fontsize=8,
+            fontweight="bold",
+            color="#92400E",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#FEF3C7",
+                      edgecolor="#F59E0B", alpha=0.95),
+            arrowprops=dict(arrowstyle="-", color="#F59E0B", lw=0.8),
+            zorder=7,
+        )
+
     # --- Labels and title ---
-    ax.set_xlabel(x_label or _get_label(x_key), fontsize=11)
-    ax.set_ylabel(y_label or _get_label(y_key), fontsize=11)
+    ax.set_xlabel(x_label or _get_label(x_key, axis_meta), fontsize=11)
+    ax.set_ylabel(y_label or _get_label(y_key, axis_meta), fontsize=11)
 
     if title:
         ax.set_title(title, fontsize=13, fontweight="bold")
@@ -127,7 +165,7 @@ def plot_pareto(
         tag_str = f", sweep={sweep_tag}" if sweep_tag else ""
         total = len(front) + len(dominated)
         ax.set_title(
-            f"Pareto Front: {_get_label(y_key)} vs {_get_label(x_key)}"
+            f"Pareto Front: {_get_label(y_key, axis_meta)} vs {_get_label(x_key, axis_meta)}"
             f"\n({len(front)} front / {len(dominated)} dominated / {total} total"
             f"{level_str}{tag_str})",
             fontsize=12, fontweight="bold"

@@ -27,9 +27,11 @@ from core.db import (
     link_run_to_campaign_v20,
     save_recommendation_outcome,
     save_campaign_stage,
+    save_objective_profile,
     save_search_space,
     update_recommendation_status,
 )
+from objective_profile import load_objective_profile
 from search_space import describe_profile, load_profile, validate_selected_axes
 from stage_policy import load_stage_policy, get_stage_by_name
 from selector_policy import load_selector_policy, get_candidate_kind_config
@@ -55,6 +57,10 @@ def parse_args():
                    help="逗号分隔的每周期步数 (e.g. 20,30,40)")
     p.add_argument("--buffer-size", type=str, default=None,
                    help="逗号分隔的缓冲区大小 (e.g. 50000,100000)")
+    p.add_argument("--axis", action="append", default=None,
+                   help="Generic dynamic axis as name=v1,v2 (v22)")
+    p.add_argument("--candidate-json", type=str, default=None,
+                   help="Inline JSON object or path to a candidate JSON file (v22)")
 
     # 固定参数，应用于每次运行
     p.add_argument("--time-budget", type=int, default=None,
@@ -66,7 +72,9 @@ def parse_args():
     p.add_argument("--campaign", type=str, default=None,
                    help="本轮研究的 campaign 名称")
     p.add_argument("--search-space", type=str, default=None,
-                   help="JSON search-space profile 路径（v20.1）")
+                    help="JSON search-space profile 路径（v20.1）")
+    p.add_argument("--objective-profile", type=str, default=None,
+                   help="JSON objective profile path for domain-generic metrics (v22)")
     p.add_argument("--stage-policy", type=str, default=None,
                    help="JSON stage-policy 路径（v20.2）")
     p.add_argument("--stage", type=str, default=None,
@@ -135,8 +143,60 @@ def get_completed_campaign_tags(db_path: str, campaign_id: str) -> set[str]:
         conn.close()
 
 
-def build_matrix(args):
+def _parse_axis_values(name: str, raw: str, profile: dict | None):
+    axis = (profile or {}).get("axes", {}).get(name, {})
+    axis_type = axis.get("type")
+    values = []
+    for part in raw.split(","):
+        text = part.strip()
+        if axis_type == "int":
+            values.append(int(text))
+        elif axis_type == "float":
+            values.append(float(text))
+        else:
+            if text.lower() == "true":
+                values.append(True)
+            elif text.lower() == "false":
+                values.append(False)
+            else:
+                try:
+                    values.append(json.loads(text))
+                except json.JSONDecodeError:
+                    values.append(text)
+    return values
+
+
+def _load_candidate_json_arg(raw: str) -> dict:
+    if os.path.isfile(raw):
+        with open(raw, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("--candidate-json must resolve to a JSON object")
+    return data
+
+
+def _stable_candidate_key(payload: dict) -> str:
+    volatile = {"quote_id", "valid_from_at", "valid_to_at", "created_at", "latency", "quote_latency_ms"}
+    clean = {k: v for k, v in payload.items() if k not in volatile}
+    return json.dumps(clean, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_matrix(args, profile: dict | None = None):
     """从扫描轴生成配置字典列表。"""
+    if args.candidate_json:
+        payload = _load_candidate_json_arg(args.candidate_json)
+        seed = int(payload.get("seed", parse_csv(args.seeds, int)[0]))
+        tag = payload.get("sweep_tag") or f"{args.tag}_candidate_sd{seed}"
+        return [{
+            **payload,
+            "seed": seed,
+            "sweep_tag": tag,
+            "__candidate_payload": payload,
+            "__candidate_key": _stable_candidate_key(payload),
+        }]
+
     blocks = parse_csv(args.num_blocks, int)
     filters_ = parse_csv(args.num_filters, int)
     lrs = parse_csv(args.learning_rate, float)
@@ -162,6 +222,18 @@ def build_matrix(args):
     if args.buffer_size is not None:
         axis_names.append("buffer_size")
         axis_values.append(bufs)
+    if args.axis:
+        for spec in args.axis:
+            if "=" not in spec:
+                raise ValueError(f"--axis must use name=v1,v2 syntax, got: {spec}")
+            name, raw_values = spec.split("=", 1)
+            name = name.strip()
+            if not name:
+                raise ValueError("--axis name cannot be empty")
+            if name in axis_names:
+                raise ValueError(f"duplicate axis specified: {name}")
+            axis_names.append(name)
+            axis_values.append(_parse_axis_values(name, raw_values, profile))
 
     if not axis_names:
         print("错误: 至少指定一个扫描轴 (--num-blocks, --num-filters, --learning-rate, --steps-per-cycle, --buffer-size)")
@@ -179,11 +251,18 @@ def build_matrix(args):
                     "learning_rate": "lr",
                     "steps_per_cycle": "s",
                     "buffer_size": "buf",
-                }[name]
+                }.get(name, name)
                 parts.append(f"{short}{val}")
             parts.append(f"sd{seed}")
             tag = "_".join(parts)
-            configs.append({**cfg, "seed": seed, "sweep_tag": tag})
+            candidate_payload = {k: v for k, v in cfg.items()}
+            configs.append({
+                **cfg,
+                "seed": seed,
+                "sweep_tag": tag,
+                "__candidate_payload": candidate_payload if args.axis else None,
+                "__candidate_key": _stable_candidate_key(candidate_payload) if args.axis else None,
+            })
     return configs
 
 
@@ -215,13 +294,14 @@ def _ensure_profile_protocol(profile: dict, protocol: dict) -> None:
         raise ValueError("protocol does not match search-space profile: " + "; ".join(mismatches))
 
 
-def _ensure_campaign(conn, args, profile: dict | None, protocol: dict):
+def _ensure_campaign(conn, args, profile: dict | None, protocol: dict, objective_profile: dict | None = None):
     if not args.campaign:
         return None, None
     if profile is None:
         raise ValueError("--campaign requires --search-space")
 
     search_space_id = save_search_space(conn, profile)
+    objective_profile_id = save_objective_profile(conn, objective_profile) if objective_profile else None
     campaign = get_or_create_campaign(
         conn,
         name=args.campaign,
@@ -229,11 +309,12 @@ def _ensure_campaign(conn, args, profile: dict | None, protocol: dict):
         train_script=args.train_script,
         search_space_id=search_space_id,
         protocol=protocol,
+        objective_profile_id=objective_profile_id,
     )
     return campaign, search_space_id
 
 
-def run_one(cfg, args, idx, total):
+def run_one(cfg, args, idx, total, campaign=None):
     """执行单个训练配置。返回 (tag, 是否成功, 耗时)。"""
     tag = cfg["sweep_tag"]
     seed = cfg["seed"]
@@ -244,6 +325,8 @@ def run_one(cfg, args, idx, total):
            "--sweep-tag", tag]
     if args.db:
         cmd += ["--db", args.db]
+    if campaign and campaign.get("objective_profile_id"):
+        cmd += ["--campaign-id", campaign["id"]]
 
     if "num_blocks" in cfg and cfg["num_blocks"] is not None:
         cmd += ["--num-blocks", str(cfg["num_blocks"])]
@@ -255,6 +338,8 @@ def run_one(cfg, args, idx, total):
         cmd += ["--steps-per-cycle", str(cfg["steps_per_cycle"])]
     if "buffer_size" in cfg and cfg["buffer_size"] is not None:
         cmd += ["--buffer-size", str(cfg["buffer_size"])]
+    if cfg.get("__candidate_payload") is not None:
+        cmd += ["--candidate-json", json.dumps(cfg["__candidate_payload"], ensure_ascii=False, sort_keys=True)]
 
     if args.eval_level is not None:
         cmd += ["--eval-level", str(args.eval_level)]
@@ -265,7 +350,7 @@ def run_one(cfg, args, idx, total):
     if args.target_win_rate:
         cmd += ["--target-win-rate", str(args.target_win_rate)]
 
-    axis_desc = "  ".join(f"{k}={v}" for k, v in cfg.items() if k not in ("seed", "sweep_tag"))
+    axis_desc = "  ".join(f"{k}={v}" for k, v in cfg.items() if not k.startswith("__") and k not in ("seed", "sweep_tag"))
     print(f"\n{'='*60}")
     print(f"[{idx}/{total}] {tag}")
     print(f"  {axis_desc}  seed={seed}")
@@ -306,7 +391,7 @@ def _print_matrix_preview(configs, profile: dict | None, args, protocol: dict):
     print(f"{'Tag':<55} {'Params'}")
     print("-" * 96)
     for c in configs:
-        axis_desc = "  ".join(f"{k}={v}" for k, v in c.items() if k not in ("seed", "sweep_tag"))
+        axis_desc = "  ".join(f"{k}={v}" for k, v in c.items() if not k.startswith("__") and k not in ("seed", "sweep_tag"))
         print(f"{c['sweep_tag']:<55} {axis_desc}")
 
 
@@ -435,6 +520,9 @@ def _execute_point_recommendation(args) -> None:
         "seed": seed,
         "sweep_tag": tag,
     }
+    if campaign.get("objective_profile_id"):
+        cfg["__candidate_payload"] = axis_values
+        cfg["__candidate_key"] = _stable_candidate_key(axis_values)
 
     previous_best = conn.execute(
         """SELECT MAX(r.final_win_rate) AS best_wr
@@ -446,7 +534,7 @@ def _execute_point_recommendation(args) -> None:
     ).fetchone()
     previous_best_wr = previous_best["best_wr"] if previous_best else None
 
-    _, ok, _ = run_one(cfg, args, 1, 1)
+    _, ok, _ = run_one(cfg, args, 1, 1, campaign=campaign)
     run_id = find_run_by_sweep_tag(conn, tag)
     if run_id:
         axis_identity = {k: v for k, v in cfg.items() if k not in ("seed", "sweep_tag")}
@@ -499,7 +587,12 @@ def main():
     stage_cfg = None
     try:
         profile = load_profile(args.search_space) if args.search_space else None
-        configs = build_matrix(args)
+        objective_profile = load_objective_profile(args.objective_profile) if args.objective_profile else None
+        if objective_profile and profile and objective_profile["domain"] != profile["domain"]:
+            raise ValueError(
+                f"objective profile domain '{objective_profile['domain']}' != search-space domain '{profile['domain']}'"
+            )
+        configs = build_matrix(args, profile)
 
         selected_axes = {}
         for key in ("num_blocks", "num_filters", "learning_rate", "steps_per_cycle", "buffer_size"):
@@ -507,6 +600,10 @@ def main():
             if raw is not None:
                 dtype = float if key == "learning_rate" else int
                 selected_axes[key] = parse_csv(raw, dtype)
+        if args.axis:
+            for spec in args.axis:
+                name, raw_values = spec.split("=", 1)
+                selected_axes[name.strip()] = _parse_axis_values(name.strip(), raw_values, profile)
         if profile is not None:
             validate_selected_axes(profile, selected_axes)
 
@@ -534,7 +631,7 @@ def main():
         db_conn = init_db(args.db)
         campaign = None
         if args.campaign:
-            campaign, _ = _ensure_campaign(db_conn, args, profile, protocol)
+            campaign, _ = _ensure_campaign(db_conn, args, profile, protocol, objective_profile)
             # v20.2: write campaign stage record
             if stage_cfg:
                 save_campaign_stage(
@@ -583,12 +680,12 @@ def main():
     results = []
     sweep_start = time.time()
     for i, cfg in enumerate(configs, 1):
-        tag, ok, elapsed = run_one(cfg, args, i, total)
+        tag, ok, elapsed = run_one(cfg, args, i, total, campaign=campaign)
         results.append((tag, ok, elapsed))
         if campaign:
             run_id = find_run_by_sweep_tag(db_conn, tag)
             if run_id:
-                axis_values = {k: v for k, v in cfg.items() if k not in ("seed", "sweep_tag")}
+                axis_values = {k: v for k, v in cfg.items() if not k.startswith("__") and k not in ("seed", "sweep_tag")}
                 link_run_to_campaign_v20(
                     db_conn,
                     campaign_id=campaign["id"],
@@ -635,6 +732,8 @@ def main():
             pareto_cmd += ["--campaign", campaign["name"]]
             if args.stage:
                 pareto_cmd += ["--stage", args.stage]
+            if campaign.get("objective_profile_id"):
+                pareto_cmd += ["--metric-source", "run_metrics"]
         else:
             pareto_cmd += ["--sweep-tag", args.tag]
         proc = subprocess.run(pareto_cmd, capture_output=False, text=True)

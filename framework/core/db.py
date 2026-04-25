@@ -312,6 +312,17 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS objective_profiles (
+            id            TEXT PRIMARY KEY,
+            created_at    TEXT NOT NULL,
+            domain        TEXT NOT NULL,
+            name          TEXT NOT NULL,
+            version       TEXT NOT NULL,
+            profile_json  TEXT NOT NULL,
+            profile_hash  TEXT NOT NULL UNIQUE
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS campaigns (
             id              TEXT PRIMARY KEY,
             created_at      TEXT NOT NULL,
@@ -324,6 +335,11 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             notes           TEXT
         )
     """)
+    for col, typ in [("objective_profile_id", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE campaigns ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS campaign_runs (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -480,6 +496,14 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE recommendations ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    for col, typ in [
+        ("candidate_payload_json", "TEXT"),
+        ("objective_metrics_json", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE recommendations ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS recommendation_outcomes (
@@ -495,6 +519,11 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_rec_outcomes_rec "
                  "ON recommendation_outcomes(recommendation_id)")
+    for col, typ in [("constraint_status_json", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE recommendation_outcomes ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
 
     # v21.1: surrogate / acquisition evidence lineage
     conn.execute("""
@@ -514,6 +543,100 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_surrogate_snapshots_campaign "
                  "ON surrogate_snapshots(campaign_id)")
+
+    # v22: domain-generic metrics and FX spot quote-surface evidence.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS run_metrics (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id          TEXT NOT NULL REFERENCES runs(id),
+            metric_name     TEXT NOT NULL,
+            metric_value    REAL NOT NULL,
+            metric_unit     TEXT,
+            metric_role     TEXT NOT NULL,
+            direction       TEXT NOT NULL,
+            source          TEXT,
+            created_at      TEXT NOT NULL,
+            UNIQUE(run_id, metric_name)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_metrics_run "
+                 "ON run_metrics(run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_run_metrics_name "
+                 "ON run_metrics(metric_name)")
+
+    for col, typ in [
+        ("objective_profile_id", "TEXT"),
+        ("metric_source", "TEXT"),
+        ("constraints_json", "TEXT"),
+        ("knee_run_id", "TEXT"),
+        ("knee_rationale_json", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE frontier_snapshots ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS quote_windows (
+            id                         TEXT PRIMARY KEY,
+            campaign_id                TEXT NOT NULL REFERENCES campaigns(id),
+            anchor_currency            TEXT NOT NULL,
+            started_at                 TEXT NOT NULL,
+            expires_at                 TEXT NOT NULL,
+            max_quote_age_seconds      INTEGER NOT NULL,
+            portfolio_snapshot_json    TEXT NOT NULL,
+            liquidity_floor_json       TEXT NOT NULL,
+            provider_config_json       TEXT NOT NULL,
+            status                     TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quote_windows_campaign "
+                 "ON quote_windows(campaign_id)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fx_quotes (
+            id                  TEXT PRIMARY KEY,
+            quote_window_id     TEXT NOT NULL REFERENCES quote_windows(id),
+            provider            TEXT NOT NULL,
+            environment         TEXT NOT NULL,
+            quote_source        TEXT NOT NULL,
+            sell_currency       TEXT NOT NULL,
+            buy_currency        TEXT NOT NULL,
+            sell_amount         REAL,
+            buy_amount          REAL,
+            client_rate         REAL,
+            mid_rate            REAL,
+            awx_rate            REAL,
+            quote_id            TEXT,
+            valid_from_at       TEXT,
+            valid_to_at         TEXT,
+            conversion_date     TEXT,
+            quote_latency_ms    REAL,
+            raw_json            TEXT NOT NULL,
+            created_at          TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fx_quotes_window "
+                 "ON fx_quotes(quote_window_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fx_quotes_pair "
+                 "ON fx_quotes(sell_currency, buy_currency)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fx_route_legs (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id                      TEXT NOT NULL REFERENCES runs(id),
+            leg_index                   INTEGER NOT NULL,
+            sell_currency               TEXT NOT NULL,
+            buy_currency                TEXT NOT NULL,
+            sell_amount                 REAL,
+            buy_amount                  REAL,
+            quote_ref                   TEXT REFERENCES fx_quotes(id),
+            route_state_before_json     TEXT NOT NULL,
+            route_state_after_json      TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fx_route_legs_run "
+                 "ON fx_route_legs(run_id)")
 
     conn.commit()
     return conn
@@ -720,6 +843,48 @@ def save_search_space(conn: sqlite3.Connection, profile: dict) -> str:
     return space_id
 
 
+def save_objective_profile(conn: sqlite3.Connection, profile: dict) -> str:
+    """Persist a normalized objective profile; return its id."""
+    profile_json = _stable_json(profile)
+    profile_hash = profile.get("profile_hash")
+    if not profile_hash:
+        raise ValueError("objective profile missing profile_hash")
+
+    row = conn.execute(
+        "SELECT id FROM objective_profiles WHERE profile_hash = ?",
+        (profile_hash,),
+    ).fetchone()
+    if row:
+        return row["id"]
+
+    profile_id = str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO objective_profiles
+           (id, created_at, domain, name, version, profile_json, profile_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            profile_id,
+            datetime.now(timezone.utc).isoformat(),
+            profile["domain"],
+            profile["name"],
+            profile["version"],
+            profile_json,
+            profile_hash,
+        ),
+    )
+    conn.commit()
+    return profile_id
+
+
+def get_objective_profile(conn: sqlite3.Connection, profile_id: str) -> Optional[sqlite3.Row]:
+    """Return an objective profile by id, or None."""
+    row = conn.execute(
+        "SELECT * FROM objective_profiles WHERE id = ?",
+        (profile_id,),
+    ).fetchone()
+    return row
+
+
 def get_campaign(conn: sqlite3.Connection, campaign: str) -> Optional[sqlite3.Row]:
     """Resolve a campaign by exact id or exact name."""
     row = conn.execute(
@@ -735,6 +900,7 @@ def get_or_create_campaign(conn: sqlite3.Connection, *,
                            train_script: str,
                            search_space_id: str,
                            protocol: dict,
+                           objective_profile_id: Optional[str] = None,
                            notes: Optional[str] = None) -> dict:
     """Create a campaign if missing, otherwise verify compatibility."""
     protocol_json = _stable_json(protocol)
@@ -749,18 +915,27 @@ def get_or_create_campaign(conn: sqlite3.Connection, *,
             mismatches.append("search_space profile differs")
         if row["protocol_json"] != protocol_json:
             mismatches.append("protocol differs")
+        if objective_profile_id and row["objective_profile_id"] not in (None, objective_profile_id):
+            mismatches.append("objective profile differs")
         if mismatches:
             raise ValueError(
                 f"campaign '{name}' already exists with incompatible config: " + "; ".join(mismatches)
             )
+        if objective_profile_id and row["objective_profile_id"] is None:
+            conn.execute(
+                "UPDATE campaigns SET objective_profile_id = ? WHERE id = ?",
+                (objective_profile_id, row["id"]),
+            )
+            conn.commit()
+            row = get_campaign(conn, name)
         return dict(row)
 
     campaign_id = str(uuid.uuid4())
     conn.execute(
         """INSERT INTO campaigns
            (id, created_at, name, domain, train_script, search_space_id,
-            protocol_json, status, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+             protocol_json, objective_profile_id, status, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
         (
             campaign_id,
             datetime.now(timezone.utc).isoformat(),
@@ -769,6 +944,7 @@ def get_or_create_campaign(conn: sqlite3.Connection, *,
             train_script,
             search_space_id,
             protocol_json,
+            objective_profile_id,
             notes,
         ),
     )
@@ -817,6 +993,205 @@ def find_run_by_sweep_tag(conn: sqlite3.Connection, sweep_tag: str) -> Optional[
         (sweep_tag,),
     ).fetchone()
     return row["id"] if row else None
+
+
+def save_run_metric(
+    conn: sqlite3.Connection, *,
+    run_id: str,
+    metric_name: str,
+    metric_value: float,
+    metric_unit: str | None = None,
+    metric_role: str = "objective",
+    direction: str = "none",
+    source: str | None = "domain",
+) -> None:
+    """Persist one domain-generic metric for a run."""
+    conn.execute(
+        """INSERT INTO run_metrics
+           (run_id, metric_name, metric_value, metric_unit, metric_role,
+            direction, source, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(run_id, metric_name) DO UPDATE SET
+               metric_value = excluded.metric_value,
+               metric_unit = excluded.metric_unit,
+               metric_role = excluded.metric_role,
+               direction = excluded.direction,
+               source = excluded.source,
+               created_at = excluded.created_at""",
+        (
+            run_id,
+            metric_name,
+            float(metric_value),
+            metric_unit,
+            metric_role,
+            direction,
+            source,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def save_run_metrics(conn: sqlite3.Connection, run_id: str, metrics: list[dict]) -> None:
+    """Persist multiple domain-generic metrics for a run in one transaction."""
+    now = datetime.now(timezone.utc).isoformat()
+    for metric in metrics:
+        conn.execute(
+            """INSERT INTO run_metrics
+               (run_id, metric_name, metric_value, metric_unit, metric_role,
+                direction, source, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(run_id, metric_name) DO UPDATE SET
+                   metric_value = excluded.metric_value,
+                   metric_unit = excluded.metric_unit,
+                   metric_role = excluded.metric_role,
+                   direction = excluded.direction,
+                   source = excluded.source,
+                   created_at = excluded.created_at""",
+            (
+                run_id,
+                metric["metric_name"],
+                float(metric["metric_value"]),
+                metric.get("metric_unit"),
+                metric.get("metric_role", "objective"),
+                metric.get("direction", "none"),
+                metric.get("source", "domain"),
+                now,
+            ),
+        )
+    conn.commit()
+
+
+def list_run_metrics(conn: sqlite3.Connection, run_id: str) -> list[dict]:
+    """Return all generic metrics for a run."""
+    rows = conn.execute(
+        "SELECT * FROM run_metrics WHERE run_id = ? ORDER BY metric_name",
+        (run_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_run_metrics_map(conn: sqlite3.Connection, run_id: str) -> dict[str, float]:
+    """Return {metric_name: metric_value} for a run."""
+    return {m["metric_name"]: m["metric_value"] for m in list_run_metrics(conn, run_id)}
+
+
+def save_quote_window(
+    conn: sqlite3.Connection, *,
+    window_id: str,
+    campaign_id: str,
+    anchor_currency: str,
+    started_at: str,
+    expires_at: str,
+    max_quote_age_seconds: int,
+    portfolio_snapshot_json: str,
+    liquidity_floor_json: str,
+    provider_config_json: str,
+    status: str = "open",
+) -> None:
+    """Persist an FX spot quote window."""
+    conn.execute(
+        """INSERT INTO quote_windows
+           (id, campaign_id, anchor_currency, started_at, expires_at,
+            max_quote_age_seconds, portfolio_snapshot_json, liquidity_floor_json,
+            provider_config_json, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               campaign_id = excluded.campaign_id,
+               anchor_currency = excluded.anchor_currency,
+               started_at = excluded.started_at,
+               expires_at = excluded.expires_at,
+               max_quote_age_seconds = excluded.max_quote_age_seconds,
+               portfolio_snapshot_json = excluded.portfolio_snapshot_json,
+               liquidity_floor_json = excluded.liquidity_floor_json,
+               provider_config_json = excluded.provider_config_json,
+               status = excluded.status""",
+        (
+            window_id,
+            campaign_id,
+            anchor_currency,
+            started_at,
+            expires_at,
+            max_quote_age_seconds,
+            portfolio_snapshot_json,
+            liquidity_floor_json,
+            provider_config_json,
+            status,
+        ),
+    )
+    conn.commit()
+
+
+def save_fx_quote(conn: sqlite3.Connection, quote: dict) -> str:
+    """Persist one FX quote observation and return its id."""
+    quote_id = quote.get("id") or str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO fx_quotes
+           (id, quote_window_id, provider, environment, quote_source,
+            sell_currency, buy_currency, sell_amount, buy_amount, client_rate,
+            mid_rate, awx_rate, quote_id, valid_from_at, valid_to_at,
+            conversion_date, quote_latency_ms, raw_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               raw_json = excluded.raw_json,
+               quote_latency_ms = excluded.quote_latency_ms""",
+        (
+            quote_id,
+            quote["quote_window_id"],
+            quote["provider"],
+            quote["environment"],
+            quote["quote_source"],
+            quote["sell_currency"],
+            quote["buy_currency"],
+            quote.get("sell_amount"),
+            quote.get("buy_amount"),
+            quote.get("client_rate"),
+            quote.get("mid_rate"),
+            quote.get("awx_rate"),
+            quote.get("quote_id"),
+            quote.get("valid_from_at"),
+            quote.get("valid_to_at"),
+            quote.get("conversion_date"),
+            quote.get("quote_latency_ms"),
+            quote.get("raw_json", _stable_json(quote)),
+            quote.get("created_at", datetime.now(timezone.utc).isoformat()),
+        ),
+    )
+    conn.commit()
+    return quote_id
+
+
+def save_fx_route_leg(
+    conn: sqlite3.Connection, *,
+    run_id: str,
+    leg_index: int,
+    sell_currency: str,
+    buy_currency: str,
+    sell_amount: float | None,
+    buy_amount: float | None,
+    quote_ref: str | None,
+    route_state_before_json: str,
+    route_state_after_json: str,
+) -> None:
+    """Persist one executed/mock FX route leg."""
+    conn.execute(
+        """INSERT INTO fx_route_legs
+           (run_id, leg_index, sell_currency, buy_currency, sell_amount,
+            buy_amount, quote_ref, route_state_before_json, route_state_after_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            run_id,
+            leg_index,
+            sell_currency,
+            buy_currency,
+            sell_amount,
+            buy_amount,
+            quote_ref,
+            route_state_before_json,
+            route_state_after_json,
+        ),
+    )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1601,6 +1976,8 @@ def save_recommendation(
     acquisition_score: float | None = None,
     parent_run_id: str | None = None,
     parent_checkpoint_id: int | None = None,
+    candidate_payload_json: str | None = None,
+    objective_metrics_json: str | None = None,
     status: str = "planned",
 ) -> None:
     """Persist a single recommendation."""
@@ -1609,9 +1986,10 @@ def save_recommendation(
            (id, batch_id, candidate_type, candidate_key, rank, score_total,
              score_breakdown_json, rationale_json, axis_values_json,
              branch_reason, delta_json, selector_score_total, acquisition_score,
-             parent_run_id, parent_checkpoint_id, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
+             parent_run_id, parent_checkpoint_id, candidate_payload_json,
+             objective_metrics_json, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
                 batch_id = excluded.batch_id,
                 candidate_type = excluded.candidate_type,
                 candidate_key = excluded.candidate_key,
@@ -1623,14 +2001,17 @@ def save_recommendation(
                 branch_reason = excluded.branch_reason,
                 delta_json = excluded.delta_json,
                 selector_score_total = excluded.selector_score_total,
-                acquisition_score = excluded.acquisition_score,
-                parent_run_id = excluded.parent_run_id,
-                parent_checkpoint_id = excluded.parent_checkpoint_id,
-                status = excluded.status""",
+                 acquisition_score = excluded.acquisition_score,
+                 parent_run_id = excluded.parent_run_id,
+                 parent_checkpoint_id = excluded.parent_checkpoint_id,
+                 candidate_payload_json = excluded.candidate_payload_json,
+                 objective_metrics_json = excluded.objective_metrics_json,
+                 status = excluded.status""",
         (recommendation_id, batch_id, candidate_type, candidate_key, rank,
          score_total, score_breakdown_json, rationale_json, axis_values_json,
          branch_reason, delta_json, selector_score_total, acquisition_score,
-         parent_run_id, parent_checkpoint_id, status, datetime.now(timezone.utc).isoformat()),
+         parent_run_id, parent_checkpoint_id, candidate_payload_json,
+         objective_metrics_json, status, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
 
@@ -1720,16 +2101,17 @@ def save_recommendation_outcome(
     branch_id: str | None = None,
     observed_metrics_json: str = "{}",
     frontier_delta_json: str | None = None,
+    constraint_status_json: str | None = None,
     outcome_label: str = "unknown",
 ) -> None:
     """Persist an outcome record for a recommendation."""
     conn.execute(
         """INSERT INTO recommendation_outcomes
            (recommendation_id, run_id, branch_id, observed_metrics_json,
-            frontier_delta_json, outcome_label, evaluated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+             frontier_delta_json, constraint_status_json, outcome_label, evaluated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (recommendation_id, run_id, branch_id, observed_metrics_json,
-         frontier_delta_json, outcome_label, datetime.now(timezone.utc).isoformat()),
+         frontier_delta_json, constraint_status_json, outcome_label, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
 

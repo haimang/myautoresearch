@@ -25,6 +25,7 @@ from core.db import (
     get_campaign_runs_by_stage,
     get_branch_tree,
     get_latest_checkpoint,
+    get_objective_profile,
     get_search_space,
     list_all_checkpoints,
 )
@@ -40,6 +41,9 @@ def _stable_json(obj: dict) -> str:
 
 def generate_point_candidates(conn, campaign, policy, limit: int = 5) -> list[dict]:
     """Generate new_point and seed_recheck candidates from campaign runs."""
+    if campaign.get("objective_profile_id"):
+        return generate_generic_point_candidates(conn, campaign, policy, limit=limit)
+
     candidates = []
     campaign_id = campaign["id"]
 
@@ -153,6 +157,168 @@ def generate_point_candidates(conn, campaign, policy, limit: int = 5) -> list[di
                 })
                 if len(candidates) >= limit:
                     break
+
+    return candidates
+
+
+def _objective_profile_for_campaign(conn, campaign) -> dict | None:
+    profile_id = campaign.get("objective_profile_id")
+    if not profile_id:
+        return None
+    row = get_objective_profile(conn, profile_id)
+    if not row:
+        return None
+    try:
+        return json.loads(row["profile_json"])
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _generic_utility(metrics: dict[str, float], profile: dict) -> float:
+    score = 0.0
+    for metric in profile.get("maximize", []):
+        score += float(metrics.get(metric, 0.0) or 0.0)
+    for metric in profile.get("minimize", []):
+        score -= float(metrics.get(metric, 0.0) or 0.0) * 0.001
+    return score
+
+
+def generate_generic_point_candidates(conn, campaign, policy, limit: int = 5) -> list[dict]:
+    """Generate point candidates for domains whose objective lives in run_metrics."""
+    profile = _objective_profile_for_campaign(conn, campaign)
+    if not profile:
+        return []
+
+    metric_names = set(profile.get("maximize", [])) | set(profile.get("minimize", []))
+    metric_names |= {c["metric"] for c in profile.get("hard_constraints", [])}
+    if not metric_names:
+        return []
+
+    rows = conn.execute(
+        """SELECT cr.candidate_key, cr.axis_values_json, cr.seed,
+                  rm.metric_name, rm.metric_value
+           FROM campaign_runs cr
+           JOIN runs r ON r.id = cr.run_id
+           JOIN run_metrics rm ON rm.run_id = r.id
+           WHERE cr.campaign_id = ?
+             AND r.status IN ('completed', 'time_budget', 'target_win_rate', 'target_games')
+             AND rm.metric_name IN ({})
+           ORDER BY cr.candidate_key""".format(",".join("?" for _ in metric_names)),
+        (campaign["id"], *sorted(metric_names)),
+    ).fetchall()
+    if not rows:
+        return []
+
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        key = row["candidate_key"] or row["axis_values_json"]
+        bucket = grouped.setdefault(
+            key,
+            {
+                "candidate_key": key,
+                "axis_values_json": row["axis_values_json"] or "{}",
+                "seeds": set(),
+                "metric_values": {},
+            },
+        )
+        if row["seed"] is not None:
+            bucket["seeds"].add(row["seed"])
+        bucket["metric_values"].setdefault(row["metric_name"], []).append(float(row["metric_value"]))
+
+    summaries = []
+    for item in grouped.values():
+        metrics = {name: _mean(values) for name, values in item["metric_values"].items()}
+        if not metric_names.issubset(metrics):
+            continue
+        hard_ok = all(
+            metrics[c["metric"]] >= float(c["value"]) if c["op"] == "ge" else True
+            for c in profile.get("hard_constraints", [])
+        )
+        if not hard_ok:
+            continue
+        summaries.append({
+            **item,
+            "metrics": metrics,
+            "utility": _generic_utility(metrics, profile),
+            "seed_count": len(item["seeds"]) or 1,
+        })
+    if not summaries:
+        return []
+
+    summaries.sort(key=lambda row: row["utility"], reverse=True)
+    frontier = summaries[: max(1, min(3, len(summaries)))]
+    frontier_keys = {row["candidate_key"] for row in frontier}
+    existing_keys = set(grouped)
+    primary_max = profile.get("maximize", ["objective"])[0]
+    primary_min = profile.get("minimize", ["cost"])[0] if profile.get("minimize") else None
+
+    candidates = []
+    min_runs_for_variance = policy.get("limits", {}).get("min_runs_for_variance", 2)
+    for row in frontier:
+        if row["seed_count"] < min_runs_for_variance:
+            candidates.append({
+                "candidate_type": "seed_recheck",
+                "candidate_key": row["candidate_key"],
+                "axis_values": json.loads(row["axis_values_json"] or "{}"),
+                "score_signals": {
+                    "predicted_objective": row["metrics"].get(primary_max, row["utility"]),
+                    "mean_cost": row["metrics"].get(primary_min, 1.0) if primary_min else 1.0,
+                    "seed_count": row["seed_count"],
+                    "on_frontier": True,
+                    "objective_metrics": row["metrics"],
+                },
+            })
+
+    space_axes: dict = {}
+    space_row = get_search_space(conn, campaign["search_space_id"] or "")
+    if space_row:
+        try:
+            space_axes = json.loads(space_row["profile_json"]).get("axes", {})
+        except (json.JSONDecodeError, KeyError):
+            space_axes = {}
+
+    best = frontier[0]
+    axis_values = json.loads(best["axis_values_json"] or "{}")
+    for axis_key, current_val in axis_values.items():
+        if axis_key == "seed":
+            continue
+        axis_spec = space_axes.get(axis_key, {})
+        allowed_values = axis_spec.get("values")
+        if allowed_values and current_val in allowed_values:
+            idx = allowed_values.index(current_val)
+            neighbours = []
+            if idx + 1 < len(allowed_values):
+                neighbours.append(allowed_values[idx + 1])
+            if idx - 1 >= 0:
+                neighbours.append(allowed_values[idx - 1])
+        elif isinstance(current_val, (int, float)):
+            neighbours = [round(current_val * 1.1, 6) if isinstance(current_val, float) else current_val + 1]
+        else:
+            continue
+        for new_val in neighbours:
+            new_axis = dict(axis_values)
+            new_axis[axis_key] = new_val
+            new_key = _stable_json({k: v for k, v in new_axis.items() if k != "seed"})
+            if new_key in existing_keys:
+                continue
+            candidates.append({
+                "candidate_type": "new_point",
+                "candidate_key": new_key,
+                "axis_values": new_axis,
+                "score_signals": {
+                    "predicted_objective": best["metrics"].get(primary_max, best["utility"]),
+                    "mean_cost": best["metrics"].get(primary_min, 1.0) if primary_min else 1.0,
+                    "perturbed_axis": axis_key,
+                    "on_frontier": new_key in frontier_keys,
+                    "objective_metrics": best["metrics"],
+                },
+            })
+            if len(candidates) >= limit:
+                return candidates
 
     return candidates
 
@@ -291,17 +457,19 @@ def _score_candidate(candidate: dict, weights: dict, all_candidates: list[dict])
     breakdown = {}
 
     # frontier_gap: higher for frontier-adjacent / high-WR candidates
-    parent_wr = signals.get("parent_wr", signals.get("mean_wr", 0.5))
-    breakdown["frontier_gap"] = round(parent_wr * weights.get("frontier_gap", 1.0), 4)
+    predicted = signals.get("predicted_objective")
+    if predicted is None:
+        predicted = signals.get("parent_wr", signals.get("mean_wr", 0.5))
+    breakdown["frontier_gap"] = round(float(predicted) * weights.get("frontier_gap", 1.0), 4)
 
     # uncertainty: bonus for high-variance or under-sampled candidates
-    std_wr = signals.get("std_wr", 0)
+    std_wr = signals.get("std_wr", signals.get("posterior_sigma", 0))
     seed_count = signals.get("seed_count", 1)
     uncertainty_score = (std_wr * 2) + max(0, 2 - seed_count) * 0.3
     breakdown["uncertainty"] = round(uncertainty_score * weights.get("uncertainty", 0.8), 4)
 
     # cost_penalty: penalize expensive candidates (more params / longer wall time)
-    params = signals.get("mean_params", 100000)
+    params = signals.get("mean_params", signals.get("mean_cost", 100000))
     cost_penalty = math.log10(max(params, 1000)) / 6.0  # normalize ~0.5-1.0
     breakdown["cost_penalty"] = round(-cost_penalty * weights.get("cost_penalty", 0.5), 4)
 
@@ -314,7 +482,7 @@ def _score_candidate(candidate: dict, weights: dict, all_candidates: list[dict])
 
     rationale = {
         "summary": f"{ctype} candidate scored {score_total:.3f}",
-        "frontier_position": "on_frontier" if signals.get("on_frontier") else "near_frontier" if parent_wr > 0.6 else "back",
+        "frontier_position": "on_frontier" if signals.get("on_frontier") else "near_frontier" if float(predicted) > 0.6 else "back",
         "variance_concern": std_wr > 0.05,
         "seed_shortage": seed_count < 2,
         "dominated": dominated,
@@ -325,14 +493,16 @@ def _score_candidate(candidate: dict, weights: dict, all_candidates: list[dict])
 
 def _is_dominated(candidate: dict, all_candidates: list[dict]) -> bool:
     """Simple dominance check: candidate is dominated if another candidate has higher WR and fewer params."""
-    c_wr = candidate.get("score_signals", {}).get("mean_wr", candidate.get("score_signals", {}).get("parent_wr", 0))
-    c_params = candidate.get("score_signals", {}).get("mean_params", 100000)
+    c_signals = candidate.get("score_signals", {})
+    c_wr = c_signals.get("predicted_objective", c_signals.get("mean_wr", c_signals.get("parent_wr", 0)))
+    c_params = c_signals.get("mean_params", c_signals.get("mean_cost", 100000))
 
     for other in all_candidates:
         if other is candidate:
             continue
-        o_wr = other.get("score_signals", {}).get("mean_wr", other.get("score_signals", {}).get("parent_wr", 0))
-        o_params = other.get("score_signals", {}).get("mean_params", 100000)
+        o_signals = other.get("score_signals", {})
+        o_wr = o_signals.get("predicted_objective", o_signals.get("mean_wr", o_signals.get("parent_wr", 0)))
+        o_params = o_signals.get("mean_params", o_signals.get("mean_cost", 100000))
         if o_wr >= c_wr and o_params <= c_params and (o_wr > c_wr or o_params < c_params):
             return True
     return False
