@@ -1,0 +1,38 @@
+{
+  "domain": "gomoku",
+  "name": "candidate-pool-ucb",
+  "version": "1.0",
+  "description": "Portable candidate-pool acquisition policy for Gomoku. Reranks selector-generated candidates with a lightweight multi-objective UCB-style score.",
+  "selector_policy_ref": {
+    "domain": "gomoku",
+    "name": "cold-start-selector",
+    "version": "1.0"
+  },
+  "objectives": {
+    "maximize": ["win_rate"],
+    "minimize": ["num_params", "wall_time_s"]
+  },
+  "weights": {
+    "predicted_wr": 1.0,
+    "uncertainty": 0.9,
+    "params_penalty": 0.35,
+    "wall_penalty": 0.2,
+    "frontier_bonus": 0.08
+  },
+  "priors": {
+    "base_sigma": 0.04,
+    "min_sigma": 0.01,
+    "seed_shortage_bonus": 0.12,
+    "target_seed_count": 2
+  },
+  "candidate_type_bonus": {
+    "new_point": 0.02,
+    "seed_recheck": 0.05,
+    "continue_branch": 0.08,
+    "eval_upgrade": 0.06
+  },
+  "replay": {
+    "top_k": 2,
+    "positive_outcomes": ["new_front", "near_front"]
+  }
+}
