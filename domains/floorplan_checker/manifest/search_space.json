@@ -1,0 +1,52 @@
+{
+  "domain": "floorplan_checker",
+  "name": "multi_head_resnet_v1",
+  "version": "0.1",
+  "protocol": {
+    "is_benchmark": true,
+    "eval_level": 0
+  },
+  "axes": {
+    "num_res_blocks": {
+      "type": "int",
+      "values": [2, 4, 6, 8],
+      "scale": "linear",
+      "role": "structure"
+    },
+    "num_filters": {
+      "type": "int",
+      "values": [32, 64, 128],
+      "scale": "linear",
+      "role": "structure"
+    },
+    "learning_rate": {
+      "type": "float",
+      "values": [1e-5, 5e-5, 1e-4, 5e-4],
+      "scale": "log",
+      "role": "training"
+    },
+    "batch_size": {
+      "type": "categorical",
+      "values": [16, 32, 64],
+      "role": "training"
+    },
+    "loss_weight_bed": {
+      "type": "float",
+      "values": [0.5, 1.0, 2.0],
+      "scale": "linear",
+      "role": "strategy"
+    },
+    "loss_weight_bath": {
+      "type": "float",
+      "values": [0.5, 1.0, 2.0],
+      "scale": "linear",
+      "role": "strategy"
+    },
+    "loss_weight_park": {
+      "type": "float",
+      "values": [0.5, 1.0, 2.0],
+      "scale": "linear",
+      "role": "strategy"
+    }
+  }
+}

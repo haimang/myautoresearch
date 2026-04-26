@@ -1,0 +1,25 @@
+{
+  "domain": "floorplan_checker",
+  "stages": [
+    {
+      "stage_index": 0,
+      "name": "Smoke",
+      "budget_seconds": 60,
+      "gate_metrics": []
+    },
+    {
+      "stage_index": 1,
+      "name": "Early Truncation",
+      "budget_seconds": 300,
+      "gate_metrics": [
+        {"metric": "val_acc_bedroom", "threshold": 0.20}
+      ]
+    },
+    {
+      "stage_index": 2,
+      "name": "Full Validation",
+      "budget_seconds": 1800,
+      "gate_metrics": []
+    }
+  ]
+}

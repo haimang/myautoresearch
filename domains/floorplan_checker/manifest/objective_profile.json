@@ -1,0 +1,28 @@
+{
+  "domain": "floorplan_checker",
+  "name": "multi-head-optimization",
+  "version": "1.0",
+  "hard_constraints": [
+    {"metric": "peak_memory_mb", "op": "le", "value": 12000},
+    {"metric": "nan_loss_count", "op": "eq", "value": 0}
+  ],
+  "maximize": [
+    "val_acc_bedroom",
+    "val_acc_bathroom",
+    "val_acc_parking"
+  ],
+  "minimize": [
+    "wall_time_s"
+  ],
+  "display": {
+    "val_acc_bedroom": {"label": "Bed Acc", "format": "ratio"},
+    "val_acc_bathroom": {"label": "Bath Acc", "format": "ratio"},
+    "val_acc_parking": {"label": "Park Acc", "format": "ratio"},
+    "peak_memory_mb": {"label": "Peak Mem (MB)", "format": "number"},
+    "wall_time_s": {"label": "Time (s)", "format": "number"}
+  },
+  "knee": {
+    "method": "utopia_distance",
+    "constraint_first": true
+  }
+}

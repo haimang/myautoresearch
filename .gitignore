@@ -8,6 +8,10 @@ output/
 
 # Replay frame exports
 replay_frames/
+domains/floorplan_checker/dataset/*
+*.tar
+*.zip
+*.gz
 
 # ── OS ──
 .DS_Store

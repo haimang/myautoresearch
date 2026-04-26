@@ -1,0 +1,11 @@
+{
+  "domain": "floorplan_checker",
+  "reasons": {
+    "increase_capacity": {
+      "description": "Increase filters if underfitting",
+      "allowed_deltas": {
+        "num_filters": {"type": "multiply", "default_factor": 2.0}
+      }
+    }
+  }
+}

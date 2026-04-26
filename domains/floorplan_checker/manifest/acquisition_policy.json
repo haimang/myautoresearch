@@ -1,0 +1,12 @@
+{
+  "domain": "floorplan_checker",
+  "name": "constrained_ucb",
+  "version": "1.0",
+  "weights": {
+    "predicted_objective": 1.0,
+    "uncertainty_bonus": 0.2,
+    "frontier_gap_bonus": 0.5,
+    "cost_penalty": 0.1,
+    "infeasibility_penalty": 1000.0
+  }
+}

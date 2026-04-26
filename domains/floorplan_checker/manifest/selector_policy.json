@@ -1,0 +1,9 @@
+{
+  "domain": "floorplan_checker",
+  "name": "default",
+  "version": "1.0",
+  "candidate_generation": {
+    "strategy": "bayesian_frontier",
+    "num_candidates": 100
+  }
+}
