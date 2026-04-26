@@ -93,6 +93,16 @@ class TestRecommendCLI(unittest.TestCase):
         data = json.loads(proc.stdout)
         self.assertIn("recommendations", data)
 
+    def test_recommend_next_uses_manifest_default_selector_policy(self):
+        proc = self._run(
+            str(INDEX), "analyze",
+            "--db", self.db_path,
+            "--recommend-next", "rec-cli-test",
+            "--limit", "2",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Recommendations for:", proc.stdout)
+
     def test_recommend_next_persists_batch(self):
         proc = self._run(
             str(INDEX), "analyze",
