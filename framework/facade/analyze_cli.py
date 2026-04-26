@@ -665,7 +665,7 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
         policy = load_selector_policy(selector_policy)
     else:
         # Default: look for domain selector policy
-        default_path = f"domains/{c['domain']}/selector_policy.json"
+        default_path = f"domains/{c['domain']}/manifest/selector_policy.json"
         if os.path.isfile(default_path):
             policy = load_selector_policy(default_path)
         else:

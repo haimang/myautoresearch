@@ -231,6 +231,10 @@ def main():
         protocol = _derive_protocol(args, profile)
         if profile is not None:
             _ensure_profile_protocol(profile, protocol)
+        if args.eval_level is None and protocol.get("eval_level") is not None:
+            args.eval_level = protocol["eval_level"]
+        if args.eval_opponent is None and protocol.get("eval_opponent") is not None:
+            args.eval_opponent = protocol["eval_opponent"]
 
         # v20.2: stage policy
         if args.stage_policy:
