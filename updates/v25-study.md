@@ -249,41 +249,75 @@ v25 不建议一开始就把全部搜索空间做全笛卡尔积。
 
 ---
 
-### Phase 2 — 结构阶梯探索
+### Phase 2 — `6x64` 容量上移后的笛卡尔积快扫
 
-**目标**：在已知工作带内比较容量，而不是让 LR/resolution 噪声掩盖结构结论。
+> 2026-04-26 修订：由于机器侧内存预算可控，Phase 2 不再直接进入“多结构阶梯比较”，而是先对 **`6x64` 单一容量锚点** 做一次与 Phase 1 同构的快速笛卡尔积扫描。  
+> 目的不是立刻定最终 front，而是先回答：**容量上移到 `6x64` 之后，工作带、质量饱和区、耗时/内存簇是否发生结构性变化。**
+
+**目标**：
+
+1. 在 `6x64` 下快速扫描 `resolution × batch × lr`
+2. 与 Phase 1 的 `4x64` 结果做一一对照
+3. 判断 `6x64` 是否让 `224 / 256` 从“高成本探针”变成“值得进入后续验证的真实候选”
+4. 判断当前 Stage A 是否依然过于饱和，是否必须提高 budget / eval 严格度
 
 固定：
 
-1. 使用 Phase 1 中表现最稳的：
-   - `learning_rate`
-   - `batch_size`
-   - `image_resolution`
+1. `num_res_blocks = 6`
+2. `num_filters = 64`
+3. `loss_weight_bed = 1.0`
+4. `loss_weight_bath = 1.0`
+5. `loss_weight_park = 1.0`
+6. 保持当前 `objective_profile.json` 不变
+   - 继续保留 `peak_memory_mb <= 12000`
+   - 但解释时必须区分 **policy 视角** 与 **machine/exploration 视角**
 
-结构候选：
+探索轴：
 
-1. `2x32`
-2. `4x32`
-3. `4x64`
-4. `6x64`
-5. `4x128`
-6. `6x128`
+1. `image_resolution ∈ {160, 224, 256}`
+2. `batch_size ∈ {16, 32}`
+3. `learning_rate ∈ {5e-5, 1e-4, 5e-4}`
 
-为什么不一开始上 `8x128`：
+总点数：
 
-1. 成本过高
-2. 在第一次真实探索中更像“上界探针”，不是主战点
+```text
+3 × 2 × 3 = 18 个点
+```
 
-执行建议：
+预算策略：
 
-1. Stage B：上述 6 个结构，`seed_count = 2`
-2. Stage C：frontier 邻域保留 2–3 个结构，进入更长预算验证
+1. 仍使用快速扫描语义
+2. `stage = A`
+3. `seed_count = 1`
+4. 单点目标仍控制在 5 分钟以内
+5. 默认沿用短预算配置，优先获取平面几何形状，而不是长跑收敛终局
+
+为什么这一步比“立刻多结构阶梯比较”更合理：
+
+1. `4x64` 的问题不是跑不动，而是 Stage A 太快饱和
+2. 如果不先看 `6x64` 在同一平面上的几何形状，就直接把多个结构混扫，后面很难区分：
+   - 容量效应
+   - 工作带变化
+   - 评估分辨率不足
+3. 先做同构平面对照，才能决定后面该走：
+   - 真正的 capacity frontier
+   - 还是更严格的 Phase 2.5 / Stage B 验证
 
 本阶段输出：
 
-1. 第一版 capacity frontier
-2. 哪些结构是“显著过小”
-3. 哪些结构是“明显过大但收益不成比例”
+1. `6x64` 的 Phase-2 平面扫描表
+2. 与 `4x64` 的分组对照分析
+3. policy-feasible 区域是否进一步收缩或扩张
+4. 机器探索视角下哪些点值得进入下一轮 seed / 长预算验证
+
+本阶段的决策问题：
+
+1. `6x64 / 160 / 16` 是否仍然是最低成本工作带
+2. `6x64 / 224 / 16` 是否开始呈现更有意义的质量优势
+3. `256` 是否进一步证明“只是更贵”，还是已经形成新的候选簇
+4. Phase 3 应该优先进入：
+   - 更严格 budget 的同结构验证
+   - 还是重新恢复多结构阶梯比较
 
 ---
 
@@ -377,18 +411,24 @@ v25 不建议一开始就把全部搜索空间做全笛卡尔积。
 
 ## 8. 推荐的 v25 campaign 组织方式
 
-### 8.1 一个 experiment run，多个 stage
+### 8.1 研究账本组织
 
-推荐使用：
+初始推荐是一个 experiment run 对多个 stage，但在当前 v25 执行里，`4x64` 与 `6x64` 已经形成两个独立的“平面扫描批次”，因此更适合拆成两个并列 experiment run。
+
+当前采用：
 
 1. `experiment_run_id = v25-floorplan-real-001`
 2. `campaign = v25_floorplan_real_001`
+   - 用于 `4x64` Phase 1
+3. `experiment_run_id = v25-floorplan-real-002`
+4. `campaign = v25_floorplan_real_002`
+   - 用于 `6x64` Phase 2 快扫
 
-优点：
+这样做的优点：
 
-1. 所有 frontier、recommendation、surrogate snapshot 都挂在同一研究主题下
-2. 后续 findings / report 更容易追溯
-3. artifact 路径整齐
+1. 两个容量锚点的 tracker / artifact 不会混表
+2. findings 可以天然按“4x64 vs 6x64”做平面对照
+3. 后续若要单独重跑 `6x64` Stage B/C，也更容易保持账本干净
 
 ### 8.2 建议的 stage 语义
 
@@ -409,6 +449,14 @@ v25 不建议一开始就把全部搜索空间做全笛卡尔积。
 | campaign | `v25_floorplan_real_001` |
 | findings | `updates/v25-findings.md` |
 | main Pareto artifact dir | `output/floorplan_checker/v25-floorplan-real-001/campaigns/v25_floorplan_real_001/pareto/` |
+
+本次新增：
+
+| 对象 | 命名 |
+|---|---|
+| experiment run | `v25-floorplan-real-002` |
+| campaign | `v25_floorplan_real_002` |
+| artifact dir | `output/floorplan_checker/v25-floorplan-real-002/campaigns/v25_floorplan_real_002/pareto/` |
 
 ---
 

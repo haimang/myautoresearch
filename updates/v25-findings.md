@@ -606,3 +606,243 @@ Phase 1 的最终结论可以浓缩成一句话：
    - seed recheck
    - 更高分辨率 budget 下的结构阶梯比较
    - 更严格评估下的 frontier 精细化探索
+
+---
+
+## 12. Append — Phase 2 `6x64` 笛卡尔积快扫结果与新分析
+
+> 2026-04-26  
+> 对应计划已写回 `updates/v25-study.md` 的修订版 Phase 2。  
+> 本轮不是继续扫多结构，而是先把容量锚点上移到 `6x64`，再用与 Phase 1 同构的平面快扫，看平面几何形状是否发生实质变化。
+
+### 12.1 本轮实际执行计划
+
+固定：
+
+1. `num_res_blocks = 6`
+2. `num_filters = 64`
+3. `loss_weight_bed = 1.0`
+4. `loss_weight_bath = 1.0`
+5. `loss_weight_park = 1.0`
+
+探索轴：
+
+1. `image_resolution ∈ {160, 224, 256}`
+2. `batch_size ∈ {16, 32}`
+3. `learning_rate ∈ {5e-5, 1e-4, 5e-4}`
+
+总点数：
+
+```text
+3 × 2 × 3 = 18 个点
+```
+
+执行命令：
+
+```bash
+uv run python framework/index.py sweep \
+  --train-script domains/floorplan_checker/train.py \
+  --campaign v25_floorplan_real_002 \
+  --run-id v25-floorplan-real-002 \
+  --search-space domains/floorplan_checker/manifest/search_space.json \
+  --objective-profile domains/floorplan_checker/manifest/objective_profile.json \
+  --stage-policy domains/floorplan_checker/manifest/stage_policy.json \
+  --stage A \
+  --axis num_res_blocks=6 \
+  --axis num_filters=64 \
+  --axis image_resolution=160,224,256 \
+  --axis batch_size=16,32 \
+  --axis learning_rate=5e-5,1e-4,5e-4 \
+  --axis loss_weight_bed=1.0 \
+  --axis loss_weight_bath=1.0 \
+  --axis loss_weight_park=1.0 \
+  --seeds 42
+```
+
+### 12.2 执行情况
+
+结果：
+
+1. `18 / 18` 成功
+2. 总耗时：`547.48s`
+3. 单点耗时：`10.86s ~ 58.55s`
+4. 单点仍全部低于 5 分钟
+5. 无 NaN、无 dataset contract 异常、无 runtime 崩溃
+
+Campaign / Pareto 摘要：
+
+1. `campaign = v25_floorplan_real_002`
+2. `experiment_run_id = v25-floorplan-real-002`
+3. `Feasible = 3`
+4. `Infeasible = 15`
+5. `Front = 2`
+6. `Dominated = 1`
+7. 当前自动 knee：
+   - `160 / 16 / 5e-5`
+
+这里要立刻强调：
+
+> **这个 knee 只是当前 12GB policy 约束下、且质量轴几乎完全饱和时的自动选择结果；它不是“6x64 明显优于 4x64”的证据。**
+
+### 12.3 先看图：为什么 `overview.png` 还是不构成真正的 curve
+
+`overview.png` 这次依然只显示出极窄的 front，而且你也已经看到了：
+
+1. front-only 视角依旧几乎没有曲线
+2. 这是因为严格 feasible 区仍然只有 `160 / 16` 这一簇
+3. 同时在 `6x64` 下，Stage A 更容易把质量轴直接压到：
+   - `val_acc_macro ≈ 1.0`
+   - `val_acc_min_head ≈ 1.0`
+
+所以这次的正确解读不是“图坏了”，而是：
+
+> **`6x64` 把 Phase 2 的 Stage A 进一步推向了“质量全饱和、只剩成本分层”的形态。**
+
+本轮更有解释力的图是：
+
+1. `phase2_raw_macro_vs_wall.png`
+2. `phase2_raw_macro_vs_memory.png`
+3. `phase1_vs_phase2_macro_vs_wall.png`
+
+这些图共同说明：
+
+1. `6x64` 平面没有被“拉开”
+2. 而是整体向：
+   - 更高 wall time
+   - 更高 latency
+   - 更高 peak memory
+   方向平移
+
+### 12.4 Phase 2 分组汇总：`6x64` 平面本身长什么样
+
+| 分组 | avg macro | avg min-head | avg wall_s | avg latency_ms | peak mem MB | feasible |
+|---|---:|---:|---:|---:|---:|---:|
+| `160 × 16` | 1.0000 | 1.0000 | 10.88 | 5.46 | 8354 | 3 |
+| `160 × 32` | 1.0000 | 1.0000 | 22.26 | 5.83 | 16061 | 0 |
+| `224 × 16` | 0.9993 | 0.9979 | 21.18 | 10.88 | 15738 | 0 |
+| `224 × 32` | 1.0000 | 1.0000 | 41.64 | 10.79 | 31071 | 0 |
+| `256 × 16` | 1.0000 | 1.0000 | 28.17 | 14.74 | 20281 | 0 |
+| `256 × 32` | 1.0000 | 1.0000 | 58.37 | 15.13 | 40578 | 0 |
+
+这里最重要的事实有 4 个：
+
+1. **12GB policy 下仍然只有 `160 × 16` 合法**
+2. `6x64` 的最大峰值内存已经到 `40.58 GB`
+3. `224 × 16` 并没有形成比 `160 × 16` 更强的质量簇
+4. `256 × 16`、`224 × 32`、`256 × 32` 只是把成本继续向右上推
+
+### 12.5 `4x64` vs `6x64`：容量上移到底换来了什么
+
+参数量变化：
+
+1. `4x64 = 300,430`
+2. `6x64 = 449,166`
+3. 增幅约 **49.5%**
+
+按 `resolution × batch` 对照：
+
+| 分组 | macro delta | min-head delta | wall delta_s | latency delta_ms | mem delta_mb | 解释 |
+|---|---:|---:|---:|---:|---:|---|
+| `160 × 16` | +0.0208 | +0.0625 | +2.93 | +1.70 | +1735 | 补齐了 Phase 1 的轻微欠收敛，但成本明显上升 |
+| `160 × 32` | +0.1111 | +0.3333 | +6.72 | +1.81 | +3235 | 质量改善明显，但仍然不满足 12GB policy |
+| `224 × 16` | -0.0007 | -0.0021 | +5.31 | +2.87 | +3173 | **略差于 4x64**，说明同样 60s 下更大模型反而更容易欠训练 |
+| `224 × 32` | +0.0000 | +0.0000 | +12.75 | +3.34 | +8723 | 质量不变，只是更贵 |
+| `256 × 16` | +0.0007 | +0.0021 | +8.71 | +4.65 | +5688 | 提升几乎不可感知，成本显著恶化 |
+| `256 × 32` | +0.0000 | +0.0000 | +16.51 | +4.19 | +11393 | 纯成本放大 |
+
+这张表给出的核心判断非常明确：
+
+> **在当前 `60s + Stage A` 设定下，`6x64` 没有带来新的 frontier 结构，只是把成本面整体抬高。**
+
+### 12.6 最关键的新判断
+
+#### 12.6.1 `6x64` 没有改变 deployment-budget 结论
+
+在 `peak_memory_mb <= 12000` 的当前 policy 下：
+
+1. 合法区仍然只有 `160 / 16`
+2. Phase 1 的部署视角结论没有被推翻
+3. `4x64 / 160 / 16 / 1e-4` 依然是更可信的 deployment-budget 主锚点
+
+也就是说：
+
+> **把容量从 `4x64` 提到 `6x64`，并没有打开新的 12GB 内工作带。**
+
+#### 12.6.2 `6x64` 也没有改善 exploration 视角下的“曲线问题”
+
+如果站在机器探索视角看，问题也依然存在：
+
+1. 大多数点还是很快到 `macro ≈ 1.0`
+2. 这导致质量轴区分度接近消失
+3. 于是图像只剩 wall / latency / memory 的平移差异
+
+所以：
+
+> **Phase 2 证明的不是“6x64 更强”，而是“继续用当前浅预算横扫，已经无法从质量轴获得新信息”。**
+
+#### 12.6.3 `224 × 16` 的表现尤其重要
+
+这组结果是本轮最值得记住的信号：
+
+1. 在 `4x64` 下，`224 × 16` 平均是 `macro = 1.0 / min_head = 1.0`
+2. 到了 `6x64`，`224 × 16` 反而变成：
+   - `avg_macro = 0.9993`
+   - `avg_min_head = 0.9979`
+3. 同时 wall / latency / memory 都明显增加
+
+这强烈暗示：
+
+> **对于更大容量，`60s` 的 Stage A 已经开始出现“模型更大，但预算不够，所以看起来不升反降”的欠训练现象。**
+
+这也是为什么后面不能继续靠 Stage A 横扫来判断容量优劣。
+
+### 12.7 基于这轮新数据，对后续实验计划的建议
+
+这次 `6x64` Phase 2 跑完后，下一步我不建议继续做第三轮大面积笛卡尔积快扫。  
+更合理的是转向 **Phase 2.5 / Stage B-C 风格验证**。
+
+#### 12.7.1 deployment-budget 线
+
+继续保留：
+
+1. `4x64 / 160 / 16 / 1e-4`
+2. `4x64 / 160 / 16 / 5e-4`
+
+原因：
+
+1. 它们已经满足 12GB policy
+2. `6x64` 没有给出更优的 12GB 内替代点
+
+#### 12.7.2 exploration 线
+
+建议做更严格、但更窄的容量对照，而不是再横扫：
+
+1. `4x64 / 160 / 16 / 1e-4`
+2. `6x64 / 160 / 16 / 1e-4`
+3. `4x64 / 224 / 16 / 1e-4`
+4. `6x64 / 224 / 16 / 1e-4`
+5. 备选补点：
+   - `4x64 / 160 / 16 / 5e-4`
+   - `6x64 / 160 / 16 / 5e-4`
+
+并且必须同时提升：
+
+1. budget
+2. eval sample
+3. seed 数
+
+否则：
+
+> **我们只会继续得到“更大模型更贵，但图还是一条横线”的结果。**
+
+### 12.8 Phase 2 append 结论
+
+Phase 2 `6x64` 快扫可以浓缩成一句话：
+
+> **`6x64` 没有把 frontier 拉开，只是把成本整体抬高了；在当前 `60s` Stage A 设定下，它既没有改变 12GB policy 下的工作带，也没有提供足够的质量分辨率来支持更大的容量比较。**
+
+因此，v25 的下一步最合理方向已经进一步收敛为：
+
+1. 不再继续大面积浅预算横扫
+2. 进入更窄、更深的 `4x64 vs 6x64` 对照验证
+3. 用更严格 budget / eval / seeds 去判断容量上移到底有没有真实价值

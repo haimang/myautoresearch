@@ -1,0 +1,40 @@
+{
+  "domain": "floorplan_checker",
+  "name": "balanced-knee-v2",
+  "version": "2.0",
+  "hard_constraints": [
+    {"metric": "nan_loss_count", "op": "eq", "value": 0},
+    {"metric": "dataset_missing_file_count", "op": "eq", "value": 0},
+    {"metric": "dataset_missing_field_count", "op": "eq", "value": 0},
+    {"metric": "dataset_leakage_count", "op": "eq", "value": 0},
+    {"metric": "dataset_summary_mismatch_count", "op": "eq", "value": 0}
+  ],
+  "maximize": [
+    "val_acc_min_head",
+    "val_acc_macro",
+    "val_acc_bedroom",
+    "val_acc_bathroom",
+    "val_acc_parking"
+  ],
+  "minimize": [
+    "val_head_acc_gap",
+    "wall_time_s",
+    "peak_memory_mb",
+    "inference_latency_ms"
+  ],
+  "display": {
+    "val_acc_min_head": {"label": "Min Head Acc", "format": "ratio"},
+    "val_head_acc_gap": {"label": "Head Acc Gap", "format": "ratio"},
+    "val_acc_macro": {"label": "Macro Acc", "format": "ratio"},
+    "val_acc_bedroom": {"label": "Bed Acc", "format": "ratio"},
+    "val_acc_bathroom": {"label": "Bath Acc", "format": "ratio"},
+    "val_acc_parking": {"label": "Park Acc", "format": "ratio"},
+    "wall_time_s": {"label": "Time (s)", "format": "number"},
+    "peak_memory_mb": {"label": "Peak Mem (MB)", "format": "number"},
+    "inference_latency_ms": {"label": "Inference (ms)", "format": "number"}
+  },
+  "knee": {
+    "method": "utopia_distance",
+    "constraint_first": true
+  }
+}

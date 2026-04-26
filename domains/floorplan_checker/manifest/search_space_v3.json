@@ -1,0 +1,58 @@
+{
+  "domain": "floorplan_checker",
+  "name": "bathroom_balance_v3",
+  "version": "3.0",
+  "protocol": {
+    "is_benchmark": true,
+    "eval_level": 0
+  },
+  "axes": {
+    "num_res_blocks": {
+      "type": "int",
+      "values": [4],
+      "scale": "linear",
+      "role": "structure"
+    },
+    "num_filters": {
+      "type": "int",
+      "values": [64],
+      "scale": "linear",
+      "role": "structure"
+    },
+    "image_resolution": {
+      "type": "int",
+      "values": [160],
+      "scale": "linear",
+      "role": "structure"
+    },
+    "batch_size": {
+      "type": "categorical",
+      "values": [16],
+      "role": "training"
+    },
+    "learning_rate": {
+      "type": "float",
+      "values": [1e-4],
+      "scale": "log",
+      "role": "training"
+    },
+    "loss_weight_bed": {
+      "type": "float",
+      "values": [0.75, 1.0],
+      "scale": "linear",
+      "role": "strategy"
+    },
+    "loss_weight_bath": {
+      "type": "float",
+      "values": [1.0, 1.5, 2.0, 3.0, 4.0],
+      "scale": "linear",
+      "role": "strategy"
+    },
+    "loss_weight_park": {
+      "type": "float",
+      "values": [0.75, 1.0],
+      "scale": "linear",
+      "role": "strategy"
+    }
+  }
+}
