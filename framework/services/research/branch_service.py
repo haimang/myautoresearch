@@ -308,7 +308,7 @@ def execute_branches(conn, campaign, plans: list[dict], parent_ckpt: dict, args,
 def resolve_branch_policy_path(project_root: str, campaign: dict, explicit_path: str | None) -> str:
     if explicit_path:
         return explicit_path
-    default_path = os.path.join(project_root, "domains", campaign["domain"], "branch_policy.json")
+    default_path = os.path.join(project_root, "domains", campaign["domain"], "manifest", "branch_policy.json")
     if os.path.isfile(default_path):
         return default_path
     raise ValueError(f"No branch policy found for domain '{campaign['domain']}'")

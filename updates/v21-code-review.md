@@ -114,7 +114,7 @@ delta_json = '{"learning_rate": 0.1}'
 
 ### H-4：`branch_policy.json` seed_recheck 的 `default_value: null` 导致子运行无 seed
 
-**文件**：`domains/gomoku/branch_policy.json`  
+**文件**：`domains/gomoku/manifest/branch_policy.json`  
 **核心问题**：
 
 ```json
@@ -133,7 +133,7 @@ delta_json = '{"learning_rate": 0.1}'
 
 ### H-5：`branch_policy.json` `buffer_or_spc_adjust` 对整数参数做 multiply 可能产生浮点数
 
-**文件**：`domains/gomoku/branch_policy.json`  
+**文件**：`domains/gomoku/manifest/branch_policy.json`  
 **核心问题**：
 
 ```json

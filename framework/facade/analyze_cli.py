@@ -676,7 +676,7 @@ def cmd_recommend_next(conn: sqlite3.Connection, campaign: str,
     if acquisition_policy:
         acquisition = load_acquisition_policy(acquisition_policy)
     else:
-        default_path = f"domains/{c['domain']}/acquisition_policy.json"
+        default_path = f"domains/{c['domain']}/manifest/acquisition_policy.json"
         if os.path.isfile(default_path):
             acquisition = load_acquisition_policy(default_path)
 

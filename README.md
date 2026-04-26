@@ -17,7 +17,7 @@
 
 整个 loop 是有数据库支撑、可追溯的研究循环。框架本身是 domain-agnostic 的——它不知道五子棋是什么，只知道 `(成本轴, 真理指标)` 这样的抽象结构。
 
-当前有两个 domain：**`domains/gomoku/`** 是第一个实证域，一个 15×15 五子棋的 AlphaZero 风格训练系统；**`domains/fx_spot/`** 是 v22 新增的第二个 domain，用 mock quote provider 演绎当前报价窗口内的外汇头寸 route / quote-surface 搜索。未来其他 domain 也通过相同协议挂载到框架上。
+当前有两个 domain：**`domains/gomoku/`** 是第一个实证域，一个 15×15 五子棋的 AlphaZero 风格训练系统；**`domains/spot_trader/`** 是 v22 新增的第二个 domain，用 mock quote provider 演绎当前报价窗口内的外汇头寸 route / quote-surface 搜索。未来其他 domain 也通过相同协议挂载到框架上。
 
 ---
 
@@ -68,7 +68,7 @@ myautoresearch/
 │       ├── replay.py               棋局回放 / 成长蒙太奇导出
 │       ├── web/                    FastAPI + 浏览器 UI
 │       └── build_native.sh         编译 minimax_c
-│   └── fx_spot/                    —— spot FX quote-surface mock domain ——
+│   └── spot_trader/                —— spot FX quote-surface mock domain ——
 │       ├── train.py                当前报价窗口内的 mock route evaluation 入口
 │       ├── portfolio.py            当前头寸 / liquidity floor / headroom
 │       ├── mock_provider.py        deterministic local quote provider
@@ -273,7 +273,7 @@ uv run python domains/gomoku/train.py ... --auto-promote-to S2
   - `framework.services.frontier.plotting` 支持 profile-driven axis label / formatter / knee marker
 
 - **Spot FX mock domain**（v22）
-  - `domains/fx_spot/`
+  - `domains/spot_trader/`
   - 当前头寸 + liquidity floor + mock quote window
   - direct / USD-bridge route candidate
   - local mock execution 写入 `quote_windows` / `fx_quotes` / `fx_route_legs` / `run_metrics`
@@ -377,7 +377,7 @@ myautoresearch 框架对一个新 domain 的最小要求：
 - `index.py analyze --acquisition-summary` 可以追踪 acquisition evidence
 - tracker.db 自动追踪所有数据
 
-参考实现：`domains/gomoku/`（完整训练 domain，含 game engine + minimax + train loop + replay + web UI）与 `domains/fx_spot/`（轻量 mock domain，展示 v22 generic metrics / objective profile / quote evidence）。
+参考实现：`domains/gomoku/`（完整训练 domain，含 game engine + minimax + train loop + replay + web UI）与 `domains/spot_trader/`（轻量 mock domain，展示 v22 generic metrics / objective profile / quote evidence）。
 
 ---
 
@@ -392,7 +392,7 @@ myautoresearch 框架对一个新 domain 的最小要求：
 | **v20.3** | Continuation / trajectory | `run_branches` / `index.py branch` / trajectory report |
 | **v21** | Selector / recommendation | next-point / next-branch recommendation ledger |
 | **v21.1** | Acquisition / execution closure | accepted recommendation execution / surrogate snapshots / replay benchmark |
-| **v22** | Multi-domain / spot FX quote-surface | `run_metrics` / `objective_profiles` / dynamic candidate / `fx_spot` mock domain |
+| **v22** | Multi-domain / spot FX quote-surface | `run_metrics` / `objective_profiles` / dynamic candidate / `spot_trader` mock domain |
 
 每个版本的细节在 `updates/v{N}-update.md`（计划）和 `updates/v{N}-findings.md`（实测）。
 

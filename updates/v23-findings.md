@@ -1,9 +1,9 @@
 # v23 Findings — 关于 Bayesian 边界、巨石文件与 framework 重组
 
 > 2026-04-25  
-> 背景：v23 已经把 `fx_spot` 推进到 run-scoped / constraint-active / Bayesian-style refinement 原型，但这也暴露出新的框架层组织问题。  
+> 背景：v23 已经把 `spot_trader` 推进到 run-scoped / constraint-active / Bayesian-style refinement 原型，但这也暴露出新的框架层组织问题。  
 > 本文聚焦三个问题：  
-> 1. 为什么 Bayesian 代码现在在 `domains/fx_spot/` 里  
+> 1. 为什么 Bayesian 代码现在在 `domains/spot_trader/` 里  
 > 2. 哪些大文件已经到了必须拆分的程度  
 > 3. framework 目录结构下一步应该如何重组
 
@@ -11,7 +11,7 @@
 
 ## 1. 一句话结论
 
-> **当前 v23 的 Bayesian 代码放在 `domains/fx_spot/` 里，作为一次 domain-driven spike 是可以解释的，但从长期架构上看已经越界；与此同时，`framework/analyze.py`、`framework/core/db.py` 等文件已经明确进入“巨石化”状态，下一阶段应先完成 framework 的结构化拆分，再把 Bayesian loop 从 domain 中抽回 framework。**
+> **当前 v23 的 Bayesian 代码放在 `domains/spot_trader/` 里，作为一次 domain-driven spike 是可以解释的，但从长期架构上看已经越界；与此同时，`framework/analyze.py`、`framework/core/db.py` 等文件已经明确进入“巨石化”状态，下一阶段应先完成 framework 的结构化拆分，再把 Bayesian loop 从 domain 中抽回 framework。**
 
 更直接地说：
 
@@ -21,19 +21,19 @@
 
 ---
 
-## 2. 问题 1：为什么 Bayesian 代码现在在 `fx_spot` domain 里
+## 2. 问题 1：为什么 Bayesian 代码现在在 `spot_trader` domain 里
 
 ## 2.1 当前实现为什么会落在 domain 内
 
 这次 v23 新增的：
 
 ```text
-domains/fx_spot/bayesian_refine.py
+domains/spot_trader/bayesian_refine.py
 ```
 
 从工程边界看，确实会让人立刻不舒服，因为“Bayesian frontier refinement”听上去明显像 framework 能力，而不是某个 domain 的私有能力。
 
-但它之所以会先出现在 `fx_spot` 里，是因为这次实现实际上混在了一起做了 **三层东西**：
+但它之所以会先出现在 `spot_trader` 里，是因为这次实现实际上混在了一起做了 **三层东西**：
 
 1. **domain-specific candidate universe**
    - treasury scenario
@@ -60,7 +60,7 @@ domains/fx_spot/bayesian_refine.py
 
 因此，它先放在 domain 中，在 v23 阶段作为研究原型，是可以理解的：
 
-- 因为最初目标是验证 `fx_spot` 这个 domain 能不能承载 constrained Bayesian refinement；
+- 因为最初目标是验证 `spot_trader` 这个 domain 能不能承载 constrained Bayesian refinement；
 - 不是先做一个抽象完美、但尚未被真实 domain 证明可用的泛化引擎。
 
 换句话说，**它是一个 spike，先让研究闭环成立，而不是先做架构终局。**
@@ -75,10 +75,10 @@ domains/fx_spot/bayesian_refine.py
    - replay benchmark
    - frontier coverage 评价
    - knee targeting
-   这些都不该永久停留在 `domains/fx_spot/`。
+   这些都不该永久停留在 `domains/spot_trader/`。
 
 2. **下一 domain 无法复用**
-   - 如果 v24/v25 进入新 domain，而 Bayesian loop 仍绑死在 `fx_spot`，那就会重复造轮子。
+   - 如果 v24/v25 进入新 domain，而 Bayesian loop 仍绑死在 `spot_trader`，那就会重复造轮子。
 
 3. **domain 与 framework 的职责边界变脏**
    - domain 本应回答：
@@ -94,11 +94,11 @@ domains/fx_spot/bayesian_refine.py
 
 所以，结论不是：
 
-> “v23 把 Bayesian 放在 fx_spot 里是错得离谱的。”
+> “v23 把 Bayesian 放在 spot_trader 里是错得离谱的。”
 
 而是：
 
-> **“v23 作为 spike 可以先放在 `fx_spot`，但下一步应该把 generic Bayesian machinery 抽回 framework，把 `fx_spot` 保留为 adapter / evaluator / candidate provider。”**
+> **“v23 作为 spike 可以先放在 `spot_trader`，但下一步应该把 generic Bayesian machinery 抽回 framework，把 `spot_trader` 保留为 adapter / evaluator / candidate provider。”**
 
 ## 2.3 推荐的正确拆分
 
@@ -146,7 +146,7 @@ framework/services/bayes/
 ### domain 层
 
 ```text
-domains/fx_spot/
+domains/spot_trader/
   bayes_adapter.py
   train.py
   route_eval.py
@@ -168,12 +168,12 @@ domains/fx_spot/
 
 ## 2.4 推荐迁移策略
 
-不要下一步直接删除 `domains/fx_spot/bayesian_refine.py`。
+不要下一步直接删除 `domains/spot_trader/bayesian_refine.py`。
 
 正确方式是：
 
 1. 先把 generic 逻辑抽到 `framework/services/bayes/`
-2. 再让 `domains/fx_spot/bayesian_refine.py` 变成一个薄 facade：
+2. 再让 `domains/spot_trader/bayesian_refine.py` 变成一个薄 facade：
    - 解析 CLI
    - 注入 `FxSpotBayesAdapter`
    - 调用 framework 的通用 loop
@@ -201,7 +201,7 @@ domains/fx_spot/
 | `domains/gomoku/prepare.py` | 764 | 应拆，但优先级低于 framework 巨石 |
 | `framework/branch.py` | 666 | **应该拆，P1** |
 | `framework/selector.py` | 591 | **应该拆，P1** |
-| `domains/fx_spot/bayesian_refine.py` | 561 | **应该拆，且涉及边界修正，P0/P1** |
+| `domains/spot_trader/bayesian_refine.py` | 561 | **应该拆，且涉及边界修正，P0/P1** |
 | `framework/promote.py` | 447 | 应拆 |
 | `framework/pareto_plot.py` | 407 | 开始偏大，应拆为 frontier plotting/export |
 
@@ -354,7 +354,7 @@ framework/core/db/
 
 - framework
 - domains/gomoku
-- domains/fx_spot
+- domains/spot_trader
 - tests
 
 它已经是最核心的依赖节点之一。
@@ -444,7 +444,7 @@ domains/gomoku/
   train.py   # 只保留 facade
 ```
 
-## 3.7 `domains/fx_spot/bayesian_refine.py` 是“边界错误型大文件”
+## 3.7 `domains/spot_trader/bayesian_refine.py` 是“边界错误型大文件”
 
 它的 561 行不是最大的问题，最大的问题是：
 
@@ -704,7 +704,7 @@ framework/core/db/
 3. execution runner
 4. selector / promotion / branch service
 
-## Phase E — 把 Bayesian 从 `fx_spot` 抽回 framework
+## Phase E — 把 Bayesian 从 `spot_trader` 抽回 framework
 
 等到：
 
@@ -723,7 +723,7 @@ framework/services/bayes/
 此时再让：
 
 ```text
-domains/fx_spot/bayesian_refine.py
+domains/spot_trader/bayesian_refine.py
 ```
 
 退化为薄 facade / adapter，就顺理成章了。
@@ -734,7 +734,7 @@ domains/fx_spot/bayesian_refine.py
 
 - `domains/gomoku/train.py`
 - `domains/gomoku/prepare.py`
-- `domains/fx_spot/train.py`
+- `domains/spot_trader/train.py`
 
 这些应该拆，但不应抢在 framework 结构调整之前。
 
@@ -744,7 +744,7 @@ domains/fx_spot/bayesian_refine.py
 
 如果只问我一句话建议，我会这样回答：
 
-> **是的，Bayesian 代码最终应该属于 framework，而不是永久留在 `fx_spot`；同时，`analyze.py` 和 `core/db.py` 已经到了必须拆分的程度；而 framework 目录也确实应该进入 `facade/ + services/ + 收缩后的 core/` 的下一轮重组。**
+> **是的，Bayesian 代码最终应该属于 framework，而不是永久留在 `spot_trader`；同时，`analyze.py` 和 `core/db.py` 已经到了必须拆分的程度；而 framework 目录也确实应该进入 `facade/ + services/ + 收缩后的 core/` 的下一轮重组。**
 
 但执行上，我不建议一步到位大重排。
 
@@ -764,7 +764,7 @@ domains/fx_spot/bayesian_refine.py
 
 当前 v23 已经证明了：
 
-1. `fx_spot` 可以承载 constrained Bayesian-style frontier refinement
+1. `spot_trader` 可以承载 constrained Bayesian-style frontier refinement
 2. 但这次实现也证明了：
    - framework 边界需要重整
    - 大文件需要拆

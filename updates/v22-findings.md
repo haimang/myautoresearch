@@ -2,7 +2,7 @@
 
 > 2026-04-25  
 > 前置：`updates/v22-study-v2.md`、`updates/v22-update.md`  
-> 目的：在一次 clean-break 之后，对扩展过的 `fx_spot` mock domain 进行多 treasury scenario 的大样本冒烟实验，用数据而不是单次样本来判断当前 v22 代码到底证明了什么、没有证明什么。
+> 目的：在一次 clean-break 之后，对扩展过的 `spot_trader` mock domain 进行多 treasury scenario 的大样本冒烟实验，用数据而不是单次样本来判断当前 v22 代码到底证明了什么、没有证明什么。
 
 ---
 
@@ -12,7 +12,7 @@
 
 本轮要回答的是：
 
-1. 如果把 `fx_spot` 的 mock 棋盘做大，加入更多货币、更多桥接路径、更多 treasury 资金池，前沿会不会发生结构性变化？
+1. 如果把 `spot_trader` 的 mock 棋盘做大，加入更多货币、更多桥接路径、更多 treasury 资金池，前沿会不会发生结构性变化？
 2. 在多种更接近外贸企业的当前头寸场景下，哪些 quote regime 更容易进入 Pareto front？
 3. 两跳桥接路径到底只是噪音，还是会在真实多目标下稳定留在 front 上？
 4. 当前 v22 的数据足够支持什么结论，又还缺什么？
@@ -21,7 +21,7 @@
 
 ## 2. 本轮实验前的代码扩展
 
-为了让 smoke 不再只围绕 `USD/EUR/JPY/CNY` 的小盘面，本轮先扩展了 `fx_spot` mock domain：
+为了让 smoke 不再只围绕 `USD/EUR/JPY/CNY` 的小盘面，本轮先扩展了 `spot_trader` mock domain：
 
 1. **货币池扩大**
    - 新增：`HKD`、`SGD`、`GBP`、`AUD`、`MXN`
@@ -60,7 +60,7 @@
      - `latam_volatility`
 
 4. **新增 treasury scenario materialization**
-   - `fx_spot/train.py` 现在支持 `treasury_scenario`
+   - `spot_trader/train.py` 现在支持 `treasury_scenario`
    - 它会把候选自动扩展成：
      - `anchor_currency`
      - `portfolio`
@@ -422,7 +422,7 @@ via_hkd on HKD->USD
 
 ### 10.1 已经被数据支持的部分
 
-1. `fx_spot` 不是一个只会产出单点的玩具 demo
+1. `spot_trader` 不是一个只会产出单点的玩具 demo
 2. 多 treasury scenario 下，front 的组成会真实变化
 3. 多跳桥接路径会稳定留在前沿，不是偶发噪音
 4. 某些 regime（`short_validity`、`latam_volatility`）可以被数据性地排除
@@ -498,7 +498,7 @@ bridge_currency == buy_currency
 
 这轮 findings 的核心结论可以压缩成一句话：
 
-> **v22 的 `fx_spot` domain 经过 756 个点的多 scenario smoke 后，已经足以证明“当前头寸 + 当前报价 + route graph + objective-profile Pareto”这条路是成立的；但它证明的是多场景 frontier observation，不是贝叶斯式 frontier approximation。**
+> **v22 的 `spot_trader` domain 经过 756 个点的多 scenario smoke 后，已经足以证明“当前头寸 + 当前报价 + route graph + objective-profile Pareto”这条路是成立的；但它证明的是多场景 frontier observation，不是贝叶斯式 frontier approximation。**
 
 更具体地说：
 
@@ -768,11 +768,11 @@ bridge_currency == buy_currency
 
 ---
 
-## 14. 附加章节 — `fx_spot` 的输出必须按 run id 归档
+## 14. 附加章节 — `spot_trader` 的输出必须按 run id 归档
 
 除了图本身不可读之外，当前 v22 还暴露出另一个非常实际的问题：
 
-> **每次 `fx_spot` 执行产生的日志、Pareto JSON、PNG、TXT、数据库快照都被直接堆在 `output/` 根目录下。**
+> **每次 `spot_trader` 执行产生的日志、Pareto JSON、PNG、TXT、数据库快照都被直接堆在 `output/` 根目录下。**
 
 这会带来 4 个直接后果：
 
@@ -804,9 +804,9 @@ bridge_currency == buy_currency
 
 当前 `output/` 的问题，不是“文件名还可以更规范一点”，而是：
 
-> **缺少一个以本轮 `fx_spot` 执行为单位的 run-scoped artifact boundary。**
+> **缺少一个以本轮 `spot_trader` 执行为单位的 run-scoped artifact boundary。**
 
-也就是说，未来每次 `fx_spot` 跑，都应该有一个外层的 **run id / execution id**，把这一次实验产生的所有 artifacts 收拢到同一个目录里。
+也就是说，未来每次 `spot_trader` 跑，都应该有一个外层的 **run id / execution id**，把这一次实验产生的所有 artifacts 收拢到同一个目录里。
 
 这里需要区分两层身份：
 
@@ -814,7 +814,7 @@ bridge_currency == buy_currency
    - 表示单个 candidate / 单个执行记录。
 
 2. **文件系统层的 `fx_run_id` / `execution_run_id`**
-   - 表示“这一次 `fx_spot` 实验”的总容器。
+   - 表示“这一次 `spot_trader` 实验”的总容器。
    - 同一轮实验里的多个 campaign、多个 plot、多个 report，都应该归到这个目录下。
 
 ### 14.2 建议的输出目录形态
@@ -823,7 +823,7 @@ bridge_currency == buy_currency
 
 ```text
 output/
-  fx_spot/
+  spot_trader/
     <fx_run_id>/
       manifest.json
       tracker.db
@@ -848,7 +848,7 @@ output/
 最少也应该做到：
 
 ```text
-output/fx_spot/<fx_run_id>/
+output/spot_trader/<fx_run_id>/
 ```
 
 作为每次执行的根目录，而不是继续把：
@@ -863,7 +863,7 @@ output/fx_spot/<fx_run_id>/
 
 ### 14.3 run id 的最低要求
 
-每次 `fx_spot` 执行都应满足：
+每次 `spot_trader` 执行都应满足：
 
 1. **有明确 run id**
    - 可以显式传入：
@@ -882,7 +882,7 @@ output/fx_spot/<fx_run_id>/
      - acquisition trace
 
 3. **根目录只保留索引，不保留散乱正文**
-   - `output/` 或 `output/fx_spot/` 根层最多保留：
+   - `output/` 或 `output/spot_trader/` 根层最多保留：
      - latest pointer
      - run index
      - 汇总清单
@@ -899,7 +899,7 @@ output/fx_spot/<fx_run_id>/
 
 因此，这个问题不应被视为“顺手整理一下 output”的小修饰，而应该被写入下一阶段工作优先级：
 
-> **v23 必须把 `fx_spot` 的实验输出从“根目录平铺”升级为“run id 归档的实验工作区”。**
+> **v23 必须把 `spot_trader` 的实验输出从“根目录平铺”升级为“run id 归档的实验工作区”。**
 
 否则：
 

@@ -11,7 +11,7 @@ from framework.core.db import DB_PATH
 
 
 def filter_fx_degenerate_routes(configs: list[dict], profile: dict | None) -> list[dict]:
-    if not profile or profile.get("domain") != "fx_spot":
+    if not profile or profile.get("domain") != "spot_trader":
         return configs
     out = []
     for cfg in configs:
@@ -27,18 +27,19 @@ def filter_fx_degenerate_routes(configs: list[dict], profile: dict | None) -> li
 
 
 def maybe_setup_run_workspace(args, profile: dict | None, objective_profile: dict | None) -> dict | None:
-    if not profile or profile.get("domain") != "fx_spot":
+    if not profile or profile.get("domain") not in ("spot_trader", "floorplan_checker"):
         return None
-    run_id = args.run_id or datetime.now(timezone.utc).strftime("fx-%Y%m%d-%H%M%S")
-    workspace = os.path.join(args.output_root, "fx_spot", run_id)
+    domain_name = profile.get("domain")
+    run_id = args.run_id or datetime.now(timezone.utc).strftime(f"{domain_name}-%Y%m%d-%H%M%S")
+    workspace = os.path.join(args.output_root, domain_name, run_id)
     os.makedirs(workspace, exist_ok=True)
     os.makedirs(os.path.join(workspace, "logs"), exist_ok=True)
     os.makedirs(os.path.join(workspace, "campaigns"), exist_ok=True)
     if args.db == DB_PATH:
         args.db = os.path.join(workspace, "tracker.db")
     manifest = {
-        "fx_run_id": run_id,
-        "domain": "fx_spot",
+        "run_id": run_id,
+        "domain": domain_name,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "campaign": args.campaign,
         "search_space": args.search_space,

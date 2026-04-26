@@ -8,7 +8,7 @@
 
 ## 1. v22 一句话目标
 
-> **把 myautoresearch 从“Gomoku 参数 / trajectory frontier”推进到真正的 multi-domain 研究框架：先完成数据库、分析、绘图、测试与文档叙事的 domain-generic 改造，再落地一个不依赖真实 Airwallex sandbox 密钥的 `fx_spot` mock domain，用当前头寸 + 当前报价 + 流动性硬约束去搜索 spot quote-surface 的 Pareto front 与 knee point。**
+> **把 myautoresearch 从“Gomoku 参数 / trajectory frontier”推进到真正的 multi-domain 研究框架：先完成数据库、分析、绘图、测试与文档叙事的 domain-generic 改造，再落地一个不依赖真实 Airwallex sandbox 密钥的 `spot_trader` mock domain，用当前头寸 + 当前报价 + 流动性硬约束去搜索 spot quote-surface 的 Pareto front 与 knee point。**
 
 v22 不做：
 
@@ -23,7 +23,7 @@ v22 要做：
 1. 把框架层的核心指标系统从 Gomoku legacy columns 泛化为 `run_metrics`。
 2. 让 Pareto / plot / recommendation / acquisition 由 objective profile 驱动。
 3. 让 sweep / candidate execution 支持动态 axis 与 JSON candidate。
-4. 新增 `domains/fx_spot/`，用 mock provider 完成 quote graph、route enumeration、local mock execution、Pareto front、knee point。
+4. 新增 `domains/spot_trader/`，用 mock provider 完成 quote graph、route enumeration、local mock execution、Pareto front、knee point。
 5. 形成未来接 Airwallex live quote / sandbox conversion 的安全 adapter 边界。
 
 ---
@@ -129,7 +129,7 @@ legacy 32 份全部命中，这是合理的历史记录，不应批量改写。
 
 | 优先级 | 文档 | 操作 |
 |---|---|---|
-| P0 | `README.md` | 小范围同步：加入 `fx_spot` 作为第二 domain，说明 Gomoku 是第一个实证域 |
+| P0 | `README.md` | 小范围同步：加入 `spot_trader` 作为第二 domain，说明 Gomoku 是第一个实证域 |
 | P0 | `updates/pareto-frontier.md` | 增补 “domain-generic objective profile” 章节；保留 Gomoku 示例 |
 | P0 | `updates/v22-study-v2.md` | 作为 spot FX 研究定义保留 |
 | P0 | `updates/v22-update.md` | 本文件作为 v22 执行源头 |
@@ -188,7 +188,7 @@ FX spot 示例：
 
 ```json
 {
-  "domain": "fx_spot",
+  "domain": "spot_trader",
   "name": "spot-quote-frontier",
   "version": "0.1",
   "hard_constraints": [
@@ -390,11 +390,11 @@ ALTER TABLE recommendation_outcomes ADD COLUMN constraint_status_json TEXT;
 ```bash
 uv run python framework/sweep.py \
   --campaign fx-spot-demo \
-  --search-space domains/fx_spot/search_space.json \
+  --search-space domains/spot_trader/manifest/search_space.json \
   --axis route_topology=direct,two_hop \
   --axis amount_bucket_ratio=0.1,0.2,0.5 \
   --axis quote_validity=MIN_1,MIN_15,MIN_30 \
-  --train-script domains/fx_spot/train.py
+  --train-script domains/spot_trader/train.py
 ```
 
 以及：
@@ -403,7 +403,7 @@ uv run python framework/sweep.py \
 uv run python framework/sweep.py \
   --campaign fx-spot-demo \
   --candidate-json candidate.json \
-  --train-script domains/fx_spot/train.py
+  --train-script domains/spot_trader/train.py
 ```
 
 ### 6.2 通用 subprocess 协议
@@ -573,7 +573,7 @@ FX plot 应支持：
 4. **liquidity headroom plot**
    - route 执行前后每个 currency 的 headroom bar。
 
-这些可以后续拆到 `domains/fx_spot/plot.py`，framework 只提供 generic scatter。
+这些可以后续拆到 `domains/spot_trader/plot.py`，framework 只提供 generic scatter。
 
 ---
 
@@ -582,7 +582,7 @@ FX plot 应支持：
 ### 8.1 目录
 
 ```text
-domains/fx_spot/
+domains/spot_trader/
 ├── train.py
 ├── portfolio.py
 ├── quote_graph.py
@@ -941,7 +941,7 @@ v22 完成必须同时满足：
 1. `run_metrics` 和 `objective_profiles` 已落库并有测试。
 2. Gomoku legacy tests 不回退。
 3. 至少一个 non-Gomoku fake domain 使用 `run_metrics` 完成 Pareto。
-4. `domains/fx_spot/` 在 mock provider 下完成 smoke chain。
+4. `domains/spot_trader/` 在 mock provider 下完成 smoke chain。
 5. FX mock smoke 能生成：
    - quote window
    - fx quotes
@@ -968,7 +968,7 @@ v22 完成必须同时满足：
 3. **再做 dynamic candidate execution**
    - 让 `sweep.py` 能执行 FX candidate。
 
-4. **再做 `fx_spot` mock domain**
+4. **再做 `spot_trader` mock domain**
    - 不需要 Airwallex 密钥，先证明完整 loop。
 
 5. **再做 selector / acquisition 泛化**
@@ -1055,7 +1055,7 @@ v22 的研究边界是：
    - `acquisition.py` 支持 `predicted_objective / mean_cost`，保留 legacy `predicted_wr / mean_params` 兼容路径。
    - `analyze.py --recommend-next` 会把 generic candidate payload 与 objective metrics 写入 recommendation ledger。
 
-7. **新增 `domains/fx_spot/` mock domain**
+7. **新增 `domains/spot_trader/` mock domain**
    - 新增当前头寸、liquidity floor、mock provider、quote graph、route evaluation、metric mapping、train entry。
    - 支持 direct route 与 USD intermediate route。
    - `train.py` 支持 `--candidate-json`、`--campaign-id`、`--sweep-tag`、`--time-budget`。
@@ -1068,39 +1068,39 @@ v22 的研究边界是：
    - 新增 `search_space.json`、`objective_profile.json`、`selector_policy.json`、`acquisition_policy.json`、`stage_policy.json`、`branch_policy.json`。
 
 8. **建立 Airwallex adapter 安全边界**
-   - 新增 `domains/fx_spot/airwallex_provider.py`。
+   - 新增 `domains/spot_trader/airwallex_provider.py`。
    - 当前只定义 quote-only provider adapter，不创建 conversion，不移动资金。
    - adapter 从环境变量读取 base URL / API key / client id。
    - 真实 sandbox / production 接入不进入默认测试；默认使用 `MockQuoteProvider`。
 
 9. **README 小范围同步**
    - 保留 README 原有叙事，不改成执行流水账。
-   - 同步当前事实：项目已有 `gomoku` 与 `fx_spot` 两个 domain。
-   - 增补 `objective_profile.py`、`run_metrics`、`fx_spot` 目录和 v22 roadmap 条目。
+   - 同步当前事实：项目已有 `gomoku` 与 `spot_trader` 两个 domain。
+   - 增补 `objective_profile.py`、`run_metrics`、`spot_trader` 目录和 v22 roadmap 条目。
    - 将 domain 接入指南从 legacy columns-only 更新为 legacy columns + v22 `run_metrics` 双轨。
 
 ### 15.2 新增文件
 
 1. `framework/objective_profile.py`
-2. `domains/fx_spot/__init__.py`
-3. `domains/fx_spot/train.py`
-4. `domains/fx_spot/portfolio.py`
-5. `domains/fx_spot/provider_base.py`
-6. `domains/fx_spot/mock_provider.py`
-7. `domains/fx_spot/airwallex_provider.py`
-8. `domains/fx_spot/quote_graph.py`
-9. `domains/fx_spot/route_eval.py`
-10. `domains/fx_spot/metrics.py`
-11. `domains/fx_spot/search_space.json`
-12. `domains/fx_spot/objective_profile.json`
-13. `domains/fx_spot/selector_policy.json`
-14. `domains/fx_spot/acquisition_policy.json`
-15. `domains/fx_spot/stage_policy.json`
-16. `domains/fx_spot/branch_policy.json`
+2. `domains/spot_trader/__init__.py`
+3. `domains/spot_trader/train.py`
+4. `domains/spot_trader/portfolio.py`
+5. `domains/spot_trader/provider_base.py`
+6. `domains/spot_trader/mock_provider.py`
+7. `domains/spot_trader/airwallex_provider.py`
+8. `domains/spot_trader/quote_graph.py`
+9. `domains/spot_trader/route_eval.py`
+10. `domains/spot_trader/metrics.py`
+11. `domains/spot_trader/manifest/search_space.json`
+12. `domains/spot_trader/manifest/objective_profile.json`
+13. `domains/spot_trader/manifest/selector_policy.json`
+14. `domains/spot_trader/manifest/acquisition_policy.json`
+15. `domains/spot_trader/manifest/stage_policy.json`
+16. `domains/spot_trader/manifest/branch_policy.json`
 17. `tests/test_objective_profile.py`
 18. `tests/test_run_metrics_pareto.py`
 19. `tests/test_sweep_dynamic.py`
-20. `tests/test_fx_spot_domain.py`
+20. `tests/test_spot_trader_domain.py`
 21. `updates/v22-study-v2.md`
 22. `updates/v22-update.md`
 
@@ -1136,7 +1136,7 @@ v22 的研究边界是：
 1. **v22 targeted regression**
    - 命令：
      ```bash
-     uv run python -m pytest tests/test_objective_profile.py tests/test_run_metrics_pareto.py tests/test_sweep_dynamic.py tests/test_fx_spot_domain.py tests/test_search_space.py tests/test_campaign_db.py tests/test_recommendation_execution.py -q
+     uv run python -m pytest tests/test_objective_profile.py tests/test_run_metrics_pareto.py tests/test_sweep_dynamic.py tests/test_spot_trader_domain.py tests/test_search_space.py tests/test_campaign_db.py tests/test_recommendation_execution.py -q
      ```
    - 结果：`26 passed`
 
@@ -1144,10 +1144,10 @@ v22 的研究边界是：
    - 命令核心：
      ```bash
      uv run python framework/sweep.py \
-       --train-script domains/fx_spot/train.py \
+       --train-script domains/spot_trader/train.py \
        --campaign fx-v22-smoke \
-       --search-space domains/fx_spot/search_space.json \
-       --objective-profile domains/fx_spot/objective_profile.json \
+       --search-space domains/spot_trader/manifest/search_space.json \
+       --objective-profile domains/spot_trader/manifest/objective_profile.json \
        --axis sell_currency=EUR \
        --axis buy_currency=CNY \
        --axis route_template=direct \
@@ -1164,7 +1164,7 @@ v22 的研究边界是：
 
 3. **FX recommendation execution smoke**
    - 流程：
-     - 运行一个 `fx_spot` campaign。
+     - 运行一个 `spot_trader` campaign。
      - `analyze.py --recommend-next fx-v22-rec --limit 1` 生成 generic recommendation。
      - 手动将 recommendation 标记为 `accepted`。
      - `sweep.py --execute-recommendation <rec_id>` 执行。
@@ -1185,7 +1185,7 @@ v22 的核心断点已经成立：
 2. 新 domain 可以通过 `objective_profile.json + run_metrics` 定义自己的 truth / cost / hard constraints。
 3. `sweep.py` 可以执行 dynamic JSON candidate，不再只服务 Gomoku hyperparameters。
 4. `analyze.py --pareto` 可以从 objective profile 读取任意 metrics，并输出 feasible / infeasible / knee。
-5. `fx_spot` 在没有 Airwallex key 的情况下，已经能完成当前报价窗口的 local mock execution、quote evidence、route metrics、Pareto 和 recommendation execution closure。
+5. `spot_trader` 在没有 Airwallex key 的情况下，已经能完成当前报价窗口的 local mock execution、quote evidence、route metrics、Pareto 和 recommendation execution closure。
 
 仍然明确不做的事情：
 
@@ -1195,7 +1195,7 @@ v22 的核心断点已经成立：
 4. 不自动创建 Airwallex conversion。
 5. 不把 sandbox response 当作 production price guarantee。
 
-因此，v22 已经完成从 `Gomoku-only autoresearch` 到 `multi-domain autoresearch` 的结构性切分。后续 v23 可以在 `fx_spot` 上继续做 provider contract tests、route graph visualization、live quote-only integration，或直接进入第三个 domain。
+因此，v22 已经完成从 `Gomoku-only autoresearch` 到 `multi-domain autoresearch` 的结构性切分。后续 v23 可以在 `spot_trader` 上继续做 provider contract tests、route graph visualization、live quote-only integration，或直接进入第三个 domain。
 
 ### 15.6 Airwallex sandbox base URL 与密钥填写方式
 
@@ -1214,7 +1214,7 @@ export AIRWALLEX_CLIENT_ID="<your client id, if required by the account>"
    - 自动测试、CI、本地无密钥 smoke 全部走 `MockQuoteProvider`。
 
 2. **Airwallex adapter 只做 quote-only**
-   - `domains/fx_spot/airwallex_provider.py` 当前只封装 quote request boundary。
+   - `domains/spot_trader/airwallex_provider.py` 当前只封装 quote request boundary。
    - 不创建 conversion。
    - 不移动资金。
 

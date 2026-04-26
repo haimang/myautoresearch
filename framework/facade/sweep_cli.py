@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -359,7 +360,7 @@ def main():
         else:
             pareto_plot_path = f"output/pareto_{plot_key}.png"
         pareto_cmd = [
-            sys.executable, os.path.join(os.path.dirname(__file__), "analyze.py"),
+            sys.executable, os.path.join(_PROJECT_ROOT, "framework/index.py"), "analyze",
             "--pareto", "--plot", "--output", pareto_plot_path,
             "--db", args.db,
         ]

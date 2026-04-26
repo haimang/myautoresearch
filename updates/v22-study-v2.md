@@ -727,7 +727,7 @@ knee point 可先用两种方法：
 
 ```json
 {
-  "domain": "fx_spot_portfolio",
+  "domain": "spot_trader_portfolio",
   "name": "spot-quote-surface-core",
   "version": "0.1",
   "protocol": {
@@ -939,7 +939,7 @@ mock quote
 ## 14. 推荐新增 domain 结构
 
 ```text
-domains/fx_spot/
+domains/spot_trader/
 ├── train.py                         # subprocess 入口：执行一次 quote-route episode
 ├── portfolio.py                     # 当前头寸、红线、锚定币种估值
 ├── quote_graph.py                   # 当前报价图 / route enumeration
@@ -1241,7 +1241,7 @@ risk-free arbitrage
 5. `acquisition.py`
    - 新增 generic policy path，保留 Gomoku path。
 
-### 19.2 再做 fx_spot domain
+### 19.2 再做 spot_trader domain
 
 1. `portfolio.py`
 2. `quote_graph.py`

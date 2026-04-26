@@ -51,7 +51,7 @@ def next_seed_for_candidate(conn, campaign_id: str, candidate_key: str | None) -
 
 
 def default_budget_for_recommendation(project_root: str, campaign: dict, candidate_type: str) -> int:
-    selector_path = os.path.join(project_root, "domains", campaign["domain"], "selector_policy.json")
+    selector_path = os.path.join(project_root, "domains", campaign["domain"], "manifest", "selector_policy.json")
     if os.path.isfile(selector_path):
         policy = load_selector_policy(selector_path)
         cfg = get_candidate_kind_config(policy, candidate_type)

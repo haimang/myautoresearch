@@ -23,7 +23,7 @@ def load_branch_policy(project_root: str, policy: dict) -> dict | None:
     policy_ref = policy.get("branch_policy_ref", {})
     if not (policy_ref.get("domain") and policy_ref.get("name")):
         return None
-    policy_path = os.path.join(project_root, "domains", policy_ref["domain"], "branch_policy.json")
+    policy_path = os.path.join(project_root, "domains", policy_ref["domain"], "manifest", "branch_policy.json")
     if not os.path.isfile(policy_path):
         return None
     try:
