@@ -19,6 +19,12 @@
       "scale": "linear",
       "role": "structure"
     },
+    "image_resolution": {
+      "type": "int",
+      "values": [160, 224, 256],
+      "scale": "linear",
+      "role": "structure"
+    },
     "learning_rate": {
       "type": "float",
       "values": [1e-5, 5e-5, 1e-4, 5e-4],

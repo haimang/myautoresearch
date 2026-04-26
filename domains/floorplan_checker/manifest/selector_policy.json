@@ -1,9 +1,59 @@
 {
   "domain": "floorplan_checker",
-  "name": "default",
+  "name": "multi-head-selector",
   "version": "1.0",
-  "candidate_generation": {
-    "strategy": "bayesian_frontier",
-    "num_candidates": 100
+  "description": "Selector policy for floorplan_checker. Balances unexplored architecture points, stability rechecks, and selective continuation of promising CV runs.",
+  "search_space_ref": {
+    "domain": "floorplan_checker",
+    "name": "multi_head_resnet_v1",
+    "version": "0.1"
+  },
+  "stage_policy_ref": {
+    "domain": "floorplan_checker",
+    "name": "multi-head-promotion",
+    "version": "1.0"
+  },
+  "branch_policy_ref": {
+    "domain": "floorplan_checker",
+    "name": "multi-head-continuation",
+    "version": "1.0"
+  },
+  "candidate_kinds": {
+    "new_point": {
+      "description": "Try a fresh architecture or loss-weight combination near the current frontier gap.",
+      "max_per_batch": 4,
+      "default_budget_s": 60
+    },
+    "seed_recheck": {
+      "description": "Repeat a promising run with another seed to estimate cross-run stability.",
+      "max_per_batch": 2,
+      "default_budget_s": 60
+    },
+    "continue_branch": {
+      "description": "Continue a strong candidate from checkpoint with a policy-approved delta such as lr_decay or capacity increase.",
+      "max_per_batch": 2,
+      "default_budget_s": 300
+    },
+    "eval_upgrade": {
+      "description": "Upgrade evaluation strictness for a candidate that looks plateaued under the current benchmark.",
+      "max_per_batch": 1,
+      "default_budget_s": 300
+    },
+    "skip_dominated": {
+      "description": "Explicitly mark dominated regions so the selector avoids wasting further budget there.",
+      "max_per_batch": 0,
+      "default_budget_s": 0
+    }
+  },
+  "score_weights": {
+    "frontier_gap": 1.0,
+    "uncertainty": 0.6,
+    "cost_penalty": 0.25,
+    "dominance_penalty": 0.8
+  },
+  "limits": {
+    "default_batch_size": 5,
+    "min_runs_for_variance": 2,
+    "max_wr_std_for_confident": 0.03
   }
 }

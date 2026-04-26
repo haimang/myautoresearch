@@ -1,12 +1,38 @@
 {
   "domain": "floorplan_checker",
-  "name": "constrained_ucb",
+  "name": "multi-head-acquisition",
   "version": "1.0",
+  "description": "Candidate-pool reranker for floorplan_checker using accuracy, cost, and uncertainty signals from prior CV runs.",
+  "selector_policy_ref": {
+    "domain": "floorplan_checker",
+    "name": "multi-head-selector",
+    "version": "1.0"
+  },
+  "objectives": {
+    "maximize": ["val_acc_bedroom", "val_acc_bathroom", "val_acc_parking"],
+    "minimize": ["num_params", "wall_time_s", "peak_memory_mb"]
+  },
   "weights": {
-    "predicted_objective": 1.0,
-    "uncertainty_bonus": 0.2,
-    "frontier_gap_bonus": 0.5,
-    "cost_penalty": 0.1,
-    "infeasibility_penalty": 1000.0
+    "predicted_wr": 1.0,
+    "uncertainty": 0.35,
+    "params_penalty": 0.1,
+    "wall_penalty": 0.15,
+    "frontier_bonus": 0.12
+  },
+  "priors": {
+    "base_sigma": 0.03,
+    "min_sigma": 0.005,
+    "seed_shortage_bonus": 0.08,
+    "target_seed_count": 2
+  },
+  "candidate_type_bonus": {
+    "new_point": 0.05,
+    "seed_recheck": 0.03,
+    "continue_branch": 0.07,
+    "eval_upgrade": 0.04
+  },
+  "replay": {
+    "top_k": 3,
+    "positive_outcomes": ["new_front", "near_front"]
   }
 }

@@ -4,22 +4,34 @@
   "version": "1.0",
   "hard_constraints": [
     {"metric": "peak_memory_mb", "op": "le", "value": 12000},
-    {"metric": "nan_loss_count", "op": "eq", "value": 0}
+    {"metric": "nan_loss_count", "op": "eq", "value": 0},
+    {"metric": "dataset_missing_file_count", "op": "eq", "value": 0},
+    {"metric": "dataset_missing_field_count", "op": "eq", "value": 0},
+    {"metric": "dataset_leakage_count", "op": "eq", "value": 0},
+    {"metric": "dataset_summary_mismatch_count", "op": "eq", "value": 0}
   ],
   "maximize": [
     "val_acc_bedroom",
     "val_acc_bathroom",
-    "val_acc_parking"
+    "val_acc_parking",
+    "val_acc_macro",
+    "val_acc_min_head"
   ],
   "minimize": [
-    "wall_time_s"
+    "wall_time_s",
+    "inference_latency_ms"
   ],
   "display": {
     "val_acc_bedroom": {"label": "Bed Acc", "format": "ratio"},
     "val_acc_bathroom": {"label": "Bath Acc", "format": "ratio"},
     "val_acc_parking": {"label": "Park Acc", "format": "ratio"},
+    "val_acc_macro": {"label": "Macro Acc", "format": "ratio"},
+    "val_acc_min_head": {"label": "Min Head Acc", "format": "ratio"},
     "peak_memory_mb": {"label": "Peak Mem (MB)", "format": "number"},
-    "wall_time_s": {"label": "Time (s)", "format": "number"}
+    "wall_time_s": {"label": "Time (s)", "format": "number"},
+    "inference_latency_ms": {"label": "Inference (ms)", "format": "number"},
+    "samples_per_second": {"label": "Samples/s", "format": "number"},
+    "loader_wait_ratio": {"label": "Loader Wait", "format": "number"}
   },
   "knee": {
     "method": "utopia_distance",

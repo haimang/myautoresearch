@@ -1,11 +1,88 @@
 {
   "domain": "floorplan_checker",
-  "reasons": {
-    "increase_capacity": {
-      "description": "Increase filters if underfitting",
+  "name": "multi-head-continuation",
+  "version": "1.0",
+  "description": "Continuation policy for floorplan_checker. Uses the existing framework reason vocabulary while mapping it to CV-friendly follow-up moves such as LR decay, capacity increases, and seed confirmation.",
+  "search_space_ref": {
+    "domain": "floorplan_checker",
+    "name": "multi_head_resnet_v1",
+    "version": "0.1"
+  },
+  "stage_policy_ref": {
+    "domain": "floorplan_checker",
+    "name": "multi-head-promotion",
+    "version": "1.0"
+  },
+  "branch_reasons": {
+    "lr_decay": {
+      "description": "Reduce learning rate and continue from the parent checkpoint once early accuracy gains flatten.",
       "allowed_deltas": {
-        "num_filters": {"type": "multiply", "default_factor": 2.0}
-      }
+        "learning_rate": {
+          "type": "multiply",
+          "default_factor": 0.2,
+          "min_factor": 0.05,
+          "max_factor": 0.5
+        }
+      },
+      "preserves_protocol": true,
+      "example": "learning_rate *= 0.2"
+    },
+    "mcts_upshift": {
+      "description": "Increase model capacity in lieu of a larger search budget by widening the shared feature trunk.",
+      "allowed_deltas": {
+        "num_filters": {
+          "type": "multiply",
+          "default_factor": 2.0,
+          "min_factor": 1.25,
+          "max_factor": 2.0
+        }
+      },
+      "preserves_protocol": true,
+      "example": "num_filters *= 2"
+    },
+    "eval_upgrade": {
+      "description": "Keep the training recipe intact but move to a stricter evaluation protocol.",
+      "allowed_deltas": {
+        "eval_level": {
+          "type": "add",
+          "default_delta": 1,
+          "min_delta": 1,
+          "max_delta": 1
+        }
+      },
+      "preserves_protocol": false,
+      "allowed_protocol_changes": ["eval_level", "eval_opponent"],
+      "example": "eval_level += 1"
+    },
+    "seed_recheck": {
+      "description": "Repeat the same candidate with a fresh seed to estimate stability.",
+      "allowed_deltas": {
+        "seed": {
+          "type": "set",
+          "default_value": null
+        }
+      },
+      "preserves_protocol": true,
+      "example": "seed = new_value"
+    },
+    "buffer_or_spc_adjust": {
+      "description": "Adjust effective training rhythm for a continuation run without changing the campaign protocol.",
+      "allowed_deltas": {
+        "buffer_size": {
+          "type": "multiply",
+          "default_factor": 1.5,
+          "min_factor": 0.5,
+          "max_factor": 4.0
+        },
+        "steps_per_cycle": {
+          "type": "multiply",
+          "default_factor": 1.5,
+          "min_factor": 0.5,
+          "max_factor": 3.0
+        }
+      },
+      "preserves_protocol": true,
+      "example": "buffer_size *= 1.5, steps_per_cycle *= 1.5"
     }
   }
 }

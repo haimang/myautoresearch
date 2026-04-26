@@ -4,15 +4,25 @@ MAXIMIZE = [
     "val_acc_bedroom",
     "val_acc_bathroom",
     "val_acc_parking",
+    "val_acc_macro",
+    "val_acc_min_head",
 ]
 
 MINIMIZE = [
     "wall_time_s",
     "inference_latency_ms",
-    "peak_memory_mb"
+    "peak_memory_mb",
+    "loader_wait_ratio",
+    "train_step_time_ms",
 ]
 
-HARD = ["nan_loss_count"]
+HARD = [
+    "nan_loss_count",
+    "dataset_missing_file_count",
+    "dataset_missing_field_count",
+    "dataset_leakage_count",
+    "dataset_summary_mismatch_count",
+]
 
 def metric_rows(metrics: dict[str, float]) -> list[dict]:
     rows = []

@@ -1,25 +1,49 @@
 {
   "domain": "floorplan_checker",
+  "name": "multi-head-promotion",
+  "version": "1.0",
+  "description": "Stage policy for floorplan_checker. Stage A catches broken data/model configs, Stage B replicates promising settings, Stage C validates them under a larger budget, and Stage D is the continuation handoff slot.",
+  "search_space_ref": {
+    "domain": "floorplan_checker",
+    "name": "multi_head_resnet_v1",
+    "version": "0.1"
+  },
   "stages": [
     {
-      "stage_index": 0,
-      "name": "Smoke",
-      "budget_seconds": 60,
-      "gate_metrics": []
+      "name": "A",
+      "description": "Short smoke training against a tiny subset to catch shape, data, and optimizer failures.",
+      "time_budget": 60,
+      "seed_count": 1,
+      "promote_top_k": 6,
+      "metric": "final_win_rate",
+      "min_runs": 1
     },
     {
-      "stage_index": 1,
-      "name": "Early Truncation",
-      "budget_seconds": 300,
-      "gate_metrics": [
-        {"metric": "val_acc_bedroom", "threshold": 0.20}
-      ]
+      "name": "B",
+      "description": "Early truncation stage to repeat viable candidates and remove unstable runs.",
+      "time_budget": 300,
+      "seed_count": 2,
+      "promote_top_k": 3,
+      "metric": "final_win_rate",
+      "min_runs": 1
     },
     {
-      "stage_index": 2,
-      "name": "Full Validation",
-      "budget_seconds": 1800,
-      "gate_metrics": []
+      "name": "C",
+      "description": "Longer validation stage for candidates near the current CV Pareto frontier.",
+      "time_budget": 1800,
+      "seed_count": 2,
+      "promote_top_k": 1,
+      "metric": "final_win_rate",
+      "min_runs": 1
+    },
+    {
+      "name": "D",
+      "description": "Handoff slot for checkpoint continuation or later branch execution.",
+      "time_budget": null,
+      "seed_count": 2,
+      "promote_top_k": 0,
+      "metric": "final_win_rate",
+      "min_runs": 1
     }
   ]
 }
