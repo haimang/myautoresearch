@@ -23,7 +23,7 @@ from framework.policies.selector_policy import (
 
 class TestSelectorPolicyLoad(unittest.TestCase):
     def test_load_valid_policy(self):
-        path = ROOT / "domains" / "gomoku" / "selector_policy.json"
+        path = ROOT / "domains" / "gomoku" / "manifest" / "selector_policy.json"
         policy = load_selector_policy(str(path))
         self.assertEqual(policy["domain"], "gomoku")
         self.assertIn("new_point", policy["candidate_kinds"])

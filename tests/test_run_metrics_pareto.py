@@ -47,7 +47,7 @@ class TestRunMetricsPareto(unittest.TestCase):
                     "--db", db_path,
                     "--pareto",
                     "--metric-source", "run_metrics",
-                    "--objective-profile", str(ROOT / "domains" / "fx_spot" / "objective_profile.json"),
+                    "--objective-profile", str(ROOT / "domains" / "spot_trader" / "manifest" / "objective_profile.json"),
                     "--format", "json",
                     "--knee",
                 ],

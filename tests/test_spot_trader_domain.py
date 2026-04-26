@@ -1,4 +1,4 @@
-"""Smoke tests for the v22 fx_spot domain."""
+"""Smoke tests for the v22 spot_trader domain."""
 
 import json
 import subprocess
@@ -11,29 +11,29 @@ ROOT = Path(__file__).resolve().parents[1]
 FRAMEWORK = ROOT / "framework"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-FX_SPOT = ROOT / "domains" / "fx_spot"
-if str(FX_SPOT) not in sys.path:
-    sys.path.insert(0, str(FX_SPOT))
+SPOT_TRADER = ROOT / "domains" / "spot_trader"
+if str(SPOT_TRADER) not in sys.path:
+    sys.path.insert(0, str(SPOT_TRADER))
 
 from framework.core.db import get_or_create_campaign, init_db, save_objective_profile, save_search_space
 from framework.profiles.objective_profile import load_objective_profile
 from framework.profiles.search_space import load_profile
 
 
-class TestFxSpotDomain(unittest.TestCase):
+class TestSpotTraderDomain(unittest.TestCase):
     def test_mock_train_writes_metrics_and_quote_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "tracker.db")
             conn = init_db(db_path)
-            search = load_profile(str(ROOT / "domains" / "fx_spot" / "search_space.json"))
-            objective = load_objective_profile(str(ROOT / "domains" / "fx_spot" / "objective_profile.json"))
+            search = load_profile(str(ROOT / "domains" / "spot_trader" / "manifest" / "search_space.json"))
+            objective = load_objective_profile(str(ROOT / "domains" / "spot_trader" / "manifest" / "objective_profile.json"))
             space_id = save_search_space(conn, search)
             objective_id = save_objective_profile(conn, objective)
             campaign = get_or_create_campaign(
                 conn,
                 name="fx-smoke",
-                domain="fx_spot",
-                train_script=str(ROOT / "domains" / "fx_spot" / "train.py"),
+                domain="spot_trader",
+                train_script=str(ROOT / "domains" / "spot_trader" / "train.py"),
                 search_space_id=space_id,
                 protocol={"eval_level": None, "eval_opponent": None, "is_benchmark": False},
                 objective_profile_id=objective_id,
@@ -51,7 +51,7 @@ class TestFxSpotDomain(unittest.TestCase):
             proc = subprocess.run(
                 [
                     sys.executable,
-                    str(ROOT / "domains" / "fx_spot" / "train.py"),
+                    str(ROOT / "domains" / "spot_trader" / "train.py"),
                     "--db", db_path,
                     "--campaign-id", campaign["id"],
                     "--sweep-tag", "fx-smoke",
@@ -83,15 +83,15 @@ class TestFxSpotDomain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "tracker.db")
             conn = init_db(db_path)
-            search = load_profile(str(ROOT / "domains" / "fx_spot" / "search_space.json"))
-            objective = load_objective_profile(str(ROOT / "domains" / "fx_spot" / "objective_profile.json"))
+            search = load_profile(str(ROOT / "domains" / "spot_trader" / "manifest" / "search_space.json"))
+            objective = load_objective_profile(str(ROOT / "domains" / "spot_trader" / "manifest" / "objective_profile.json"))
             space_id = save_search_space(conn, search)
             objective_id = save_objective_profile(conn, objective)
             campaign = get_or_create_campaign(
                 conn,
                 name="fx-scenario",
-                domain="fx_spot",
-                train_script=str(ROOT / "domains" / "fx_spot" / "train.py"),
+                domain="spot_trader",
+                train_script=str(ROOT / "domains" / "spot_trader" / "train.py"),
                 search_space_id=space_id,
                 protocol={"eval_level": None, "eval_opponent": None, "is_benchmark": False},
                 objective_profile_id=objective_id,
@@ -110,7 +110,7 @@ class TestFxSpotDomain(unittest.TestCase):
             proc = subprocess.run(
                 [
                     sys.executable,
-                    str(ROOT / "domains" / "fx_spot" / "train.py"),
+                    str(ROOT / "domains" / "spot_trader" / "train.py"),
                     "--db", db_path,
                     "--campaign-id", campaign["id"],
                     "--sweep-tag", "fx-scenario",

@@ -31,7 +31,7 @@ from framework.profiles.search_space import load_profile
 class TestBranchDB(unittest.TestCase):
     def setUp(self):
         self.conn = init_db(":memory:")
-        self.profile = load_profile(str(ROOT / "domains" / "gomoku" / "search_space.json"))
+        self.profile = load_profile(str(ROOT / "domains" / "gomoku" / "manifest" / "search_space.json"))
         self.space_id = save_search_space(self.conn, self.profile)
         self.campaign = get_or_create_campaign(
             self.conn,

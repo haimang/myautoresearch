@@ -1,5 +1,5 @@
 {
-  "domain": "fx_spot",
+  "domain": "spot_trader",
   "name": "spot-route-surface",
   "version": "1.0",
   "description": "Current quote-window route search space for import/export portfolio spot FX exploration.",

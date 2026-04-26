@@ -25,7 +25,7 @@ from framework.core.db import (
 from framework.profiles.search_space import load_profile
 
 INDEX = ROOT / "framework" / "index.py"
-PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
+PROFILE_PATH = ROOT / "domains" / "gomoku" / "manifest" / "search_space.json"
 
 
 class TestRecommendationReport(unittest.TestCase):

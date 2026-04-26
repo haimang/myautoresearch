@@ -29,7 +29,7 @@ from framework.core.db import (
 )
 from framework.profiles.search_space import load_profile
 
-PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
+PROFILE_PATH = ROOT / "domains" / "gomoku" / "manifest" / "search_space.json"
 
 
 class TestRecommendationDB(unittest.TestCase):

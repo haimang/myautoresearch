@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
 
 from framework.policies.acquisition_policy import describe_acquisition_policy, load_acquisition_policy, validate_acquisition_policy
 
-POLICY_PATH = ROOT / "domains" / "gomoku" / "acquisition_policy.json"
+POLICY_PATH = ROOT / "domains" / "gomoku" / "manifest" / "acquisition_policy.json"
 
 
 class TestAcquisitionPolicy(unittest.TestCase):

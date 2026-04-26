@@ -1,5 +1,5 @@
 {
-  "domain": "fx_spot",
+  "domain": "spot_trader",
   "name": "liquidity-first-spot",
   "version": "1.0",
   "description": "Liquidity-first spot FX route objectives for current quote-window autoresearch.",

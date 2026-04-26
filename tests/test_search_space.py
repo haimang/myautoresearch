@@ -16,7 +16,7 @@ from framework.profiles.search_space import (
 )
 
 
-PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
+PROFILE_PATH = ROOT / "domains" / "gomoku" / "manifest" / "search_space.json"
 
 
 class TestSearchSpace(unittest.TestCase):

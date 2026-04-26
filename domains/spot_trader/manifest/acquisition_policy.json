@@ -1,9 +1,9 @@
 {
-  "domain": "fx_spot",
+  "domain": "spot_trader",
   "name": "spot-route-acquisition",
   "version": "1.0",
   "description": "Candidate-pool reranker for spot FX route exploration over generic objective signals.",
-  "selector_policy_ref": {"domain": "fx_spot", "name": "spot-route-selector", "version": "1.0"},
+  "selector_policy_ref": {"domain": "spot_trader", "name": "spot-route-selector", "version": "1.0"},
   "objectives": {
     "maximize": ["liquidity_headroom_ratio", "preservation_ratio", "spot_uplift_bps"],
     "minimize": ["embedded_spread_bps", "route_leg_count", "locked_funds_ratio"]

@@ -1,10 +1,10 @@
 {
-  "domain": "fx_spot",
+  "domain": "spot_trader",
   "name": "spot-route-selector",
   "version": "1.0",
-  "search_space_ref": {"domain": "fx_spot", "name": "spot-route-surface", "version": "1.0"},
-  "stage_policy_ref": {"domain": "fx_spot", "name": "single-window", "version": "1.0"},
-  "branch_policy_ref": {"domain": "fx_spot", "name": "no-branch", "version": "1.0"},
+  "search_space_ref": {"domain": "spot_trader", "name": "spot-route-surface", "version": "1.0"},
+  "stage_policy_ref": {"domain": "spot_trader", "name": "single-window", "version": "1.0"},
+  "branch_policy_ref": {"domain": "spot_trader", "name": "no-branch", "version": "1.0"},
   "candidate_kinds": {
     "new_point": {
       "description": "Neighbour route candidate from generic run_metrics frontier.",

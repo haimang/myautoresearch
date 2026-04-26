@@ -24,7 +24,7 @@ from framework.policies.branch_policy import (
 
 class TestBranchPolicyLoad(unittest.TestCase):
     def test_load_valid_policy(self):
-        path = ROOT / "domains" / "gomoku" / "branch_policy.json"
+        path = ROOT / "domains" / "gomoku" / "manifest" / "branch_policy.json"
         policy = load_branch_policy(str(path))
         self.assertEqual(policy["domain"], "gomoku")
         self.assertIn("lr_decay", policy["branch_reasons"])

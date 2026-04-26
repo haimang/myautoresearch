@@ -45,6 +45,6 @@ def metric_rows(metrics: dict[str, float]) -> list[dict]:
             "metric_unit": unit,
             "metric_role": role,
             "direction": direction,
-            "source": "fx_spot_mock",
+            "source": "spot_trader_mock",
         })
     return rows

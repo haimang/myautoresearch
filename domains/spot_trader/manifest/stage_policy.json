@@ -1,8 +1,8 @@
 {
-  "domain": "fx_spot",
+  "domain": "spot_trader",
   "name": "single-window",
   "version": "1.0",
-  "search_space_ref": {"domain": "fx_spot", "name": "spot-route-surface", "version": "1.0"},
+  "search_space_ref": {"domain": "spot_trader", "name": "spot-route-surface", "version": "1.0"},
   "stages": [
     {
       "name": "A",

@@ -23,8 +23,8 @@ from framework.core.db import (
 from framework.profiles.search_space import load_profile
 
 INDEX = ROOT / "framework" / "index.py"
-SELECTOR_POLICY = ROOT / "domains" / "gomoku" / "selector_policy.json"
-PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
+SELECTOR_POLICY = ROOT / "domains" / "gomoku" / "manifest" / "selector_policy.json"
+PROFILE_PATH = ROOT / "domains" / "gomoku" / "manifest" / "search_space.json"
 
 
 class TestRecommendCLI(unittest.TestCase):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Constrained Bayesian-style frontier refinement for the fx_spot mock domain."""
+"""Constrained Bayesian-style frontier refinement for the spot_trader mock domain."""
 
 from __future__ import annotations
 
@@ -48,12 +48,12 @@ from framework.services.frontier.pareto import compute_knee_point, pareto_front 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="v23 constrained BO replay for fx_spot")
+    parser = argparse.ArgumentParser(description="v23 constrained BO replay for spot_trader")
     parser.add_argument("--db", default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--output-root", default="output")
-    parser.add_argument("--search-space", default="domains/fx_spot/search_space.json")
-    parser.add_argument("--objective-profile", default="domains/fx_spot/objective_profile.json")
+    parser.add_argument("--search-space", default="domains/spot_trader/manifest/search_space.json")
+    parser.add_argument("--objective-profile", default="domains/spot_trader/manifest/objective_profile.json")
     parser.add_argument("--scenarios", default="cn_exporter_core,usd_importer_mix,global_diversified,asia_procurement_hub")
     parser.add_argument("--budget", type=int, default=64)
     parser.add_argument("--seed-observations", type=int, default=12)
@@ -69,13 +69,13 @@ def main() -> None:
     objective = load_objective_profile(args.objective_profile)
     scenarios = [scenario.strip() for scenario in args.scenarios.split(",") if scenario.strip()]
     fx_run_id = args.run_id or datetime.now(timezone.utc).strftime("fx-bo-%Y%m%d-%H%M%S")
-    workspace = Path(args.output_root) / "fx_spot" / fx_run_id
+    workspace = Path(args.output_root) / "spot_trader" / fx_run_id
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "benchmarks").mkdir(exist_ok=True)
     db_path = args.db or str(workspace / "tracker.db")
     manifest = {
         "fx_run_id": fx_run_id,
-        "domain": "fx_spot",
+        "domain": "spot_trader",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "method": "constrained_bootstrap_ridge_bo",
         "budget": args.budget,
@@ -103,7 +103,7 @@ def main() -> None:
     save_experiment_run(
         conn,
         run_id=fx_run_id,
-        domain="fx_spot",
+        domain="spot_trader",
         output_root=str(workspace),
         manifest=manifest,
         objective_profile_id=objective_id,
@@ -114,8 +114,8 @@ def main() -> None:
         campaign = get_or_create_campaign(
             conn,
             name=f"v23-{strategy_name}-{fx_run_id}",
-            domain="fx_spot",
-            train_script="domains/fx_spot/bayesian_refine.py",
+            domain="spot_trader",
+            train_script="domains/spot_trader/bayesian_refine.py",
             search_space_id=space_id,
             protocol={"eval_level": None, "eval_opponent": None, "is_benchmark": False},
             objective_profile_id=objective_id,

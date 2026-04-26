@@ -37,7 +37,7 @@ def _load_campaign_and_policy(conn, campaign_name: str, acquisition_policy_path:
     if acquisition_policy_path:
         policy = load_acquisition_policy(acquisition_policy_path)
     else:
-        default_path = ROOT / "domains" / campaign["domain"] / "acquisition_policy.json"
+        default_path = ROOT / "domains" / campaign["domain"] / "manifest" / "acquisition_policy.json"
         if not default_path.is_file():
             raise ValueError(f"No acquisition policy found for domain '{campaign['domain']}'")
         policy = load_acquisition_policy(str(default_path))

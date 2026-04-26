@@ -33,8 +33,8 @@ from framework.services.research.selector_service import (
 )
 from framework.policies.selector_policy import load_selector_policy
 
-PROFILE_PATH = ROOT / "domains" / "gomoku" / "search_space.json"
-SELECTOR_POLICY_PATH = ROOT / "domains" / "gomoku" / "selector_policy.json"
+PROFILE_PATH = ROOT / "domains" / "gomoku" / "manifest" / "search_space.json"
+SELECTOR_POLICY_PATH = ROOT / "domains" / "gomoku" / "manifest" / "selector_policy.json"
 
 
 class TestSelectorEngine(unittest.TestCase):

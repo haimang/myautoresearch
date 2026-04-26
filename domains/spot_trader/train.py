@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-legs", type=int, default=2)
     p.add_argument("--provider", default="mock")
     p.add_argument("--quote-scenario", default="base")
-    p.add_argument("--run-id", default=None, help="Filesystem-level fx_spot experiment run id")
+    p.add_argument("--run-id", default=None, help="Filesystem-level spot_trader experiment run id")
     p.add_argument("--artifact-root", default=None, help="Run-scoped artifact workspace root")
     return p.parse_args()
 
@@ -91,7 +91,7 @@ def main() -> None:
         os.makedirs(artifact_dir, exist_ok=True)
         os.makedirs(os.path.join(args.artifact_root, "campaigns", safe_campaign), exist_ok=True)
     elif args.run_id:
-        artifact_dir = os.path.join("output", "fx_spot", args.run_id, "runs", run_id)
+        artifact_dir = os.path.join("output", "spot_trader", args.run_id, "runs", run_id)
         os.makedirs(artifact_dir, exist_ok=True)
     conn = init_db(args.db)
     create_run(

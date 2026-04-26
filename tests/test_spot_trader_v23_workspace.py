@@ -1,4 +1,4 @@
-"""Tests for v23 fx_spot run-scoped workspace and BO smoke."""
+"""Tests for v23 spot_trader run-scoped workspace and BO smoke."""
 
 import subprocess
 import sys
@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / "framework" / "index.py"
-BO = ROOT / "domains" / "fx_spot" / "bayesian_refine.py"
+BO = ROOT / "domains" / "spot_trader" / "bayesian_refine.py"
 
 
 class TestFxV23Workspace(unittest.TestCase):
@@ -19,9 +19,9 @@ class TestFxV23Workspace(unittest.TestCase):
                 [
                     sys.executable,
                     str(INDEX), "sweep",
-                    "--train-script", str(ROOT / "domains" / "fx_spot" / "train.py"),
-                    "--search-space", str(ROOT / "domains" / "fx_spot" / "search_space.json"),
-                    "--objective-profile", str(ROOT / "domains" / "fx_spot" / "objective_profile.json"),
+                    "--train-script", str(ROOT / "domains" / "spot_trader" / "train.py"),
+                    "--search-space", str(ROOT / "domains" / "spot_trader" / "manifest" / "search_space.json"),
+                    "--objective-profile", str(ROOT / "domains" / "spot_trader" / "manifest" / "objective_profile.json"),
                     "--campaign", "fx-v23-workspace",
                     "--run-id", "fx-test-run",
                     "--output-root", str(output_root),
@@ -45,7 +45,7 @@ class TestFxV23Workspace(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            workspace = output_root / "fx_spot" / "fx-test-run"
+            workspace = output_root / "spot_trader" / "fx-test-run"
             self.assertTrue((workspace / "manifest.json").exists())
             self.assertTrue((workspace / "tracker.db").exists())
             self.assertTrue((workspace / "runs").exists())
@@ -71,7 +71,7 @@ class TestFxV23Workspace(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            workspace = output_root / "fx_spot" / "fx-bo-test"
+            workspace = output_root / "spot_trader" / "fx-bo-test"
             self.assertTrue((workspace / "benchmarks" / "benchmark_summary.csv").exists())
             self.assertTrue((workspace / "benchmarks" / "benchmark_summary.md").exists())
             self.assertTrue(any(workspace.glob("campaigns/*/pareto/overview.png")))

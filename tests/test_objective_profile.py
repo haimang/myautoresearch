@@ -14,8 +14,8 @@ from framework.profiles.objective_profile import load_objective_profile, validat
 
 class TestObjectiveProfile(unittest.TestCase):
     def test_loads_fx_profile(self):
-        profile = load_objective_profile(str(ROOT / "domains" / "fx_spot" / "objective_profile.json"))
-        self.assertEqual(profile["domain"], "fx_spot")
+        profile = load_objective_profile(str(ROOT / "domains" / "spot_trader" / "manifest" / "objective_profile.json"))
+        self.assertEqual(profile["domain"], "spot_trader")
         self.assertIn("preservation_ratio", profile["maximize"])
         self.assertIn("embedded_spread_bps", profile["minimize"])
         self.assertIn("profile_hash", profile)

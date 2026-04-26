@@ -24,7 +24,7 @@ from framework.policies.stage_policy import (
 
 class TestStagePolicyLoad(unittest.TestCase):
     def test_load_valid_policy(self):
-        path = ROOT / "domains" / "gomoku" / "stage_policy.json"
+        path = ROOT / "domains" / "gomoku" / "manifest" / "stage_policy.json"
         policy = load_stage_policy(str(path))
         self.assertEqual(policy["domain"], "gomoku")
         self.assertEqual(len(policy["stages"]), 4)
