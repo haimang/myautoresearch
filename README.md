@@ -56,11 +56,12 @@ myautoresearch/
 │       ├── train.py                训练入口（agent 修改的主目标文件）
 │       ├── game.py                 棋盘引擎 (Board, BatchBoards, Renderer)
 │       ├── prepare.py              minimax 对手 L0-L3 + evaluate_win_rate
-│       ├── search_space.json       v20.1 search-space profile
-│       ├── stage_policy.json       v20.2 multi-fidelity stage policy
-│       ├── branch_policy.json      v20.3 continuation / branch policy
-│       ├── selector_policy.json    v21 recommendation policy
-│       ├── acquisition_policy.json v21.1 acquisition policy
+│       ├── manifest/               domain policies / profiles
+│       │   ├── search_space.json       v20.1 search-space profile
+│       │   ├── stage_policy.json       v20.2 multi-fidelity stage policy
+│       │   ├── branch_policy.json      v20.3 continuation / branch policy
+│       │   ├── selector_policy.json    v21 recommendation policy
+│       │   └── acquisition_policy.json v21.1 acquisition policy
 │       ├── minimax_c.c             C 原生 minimax + pattern scorer (v15)
 │       ├── minimax_native.py       minimax_c 的 ctypes wrapper
 │       ├── play.py                 CLI 人机对弈 (pygame)
@@ -74,8 +75,10 @@ myautoresearch/
 │       ├── mock_provider.py        deterministic local quote provider
 │       ├── route_eval.py           本地 mock execution + run_metrics
 │       ├── airwallex_provider.py   quote-only adapter boundary（默认不执行 conversion）
-│       ├── search_space.json       v22 dynamic route search-space
-│       └── objective_profile.json  liquidity-first spot FX objectives
+│       ├── manifest/
+│       │   ├── search_space.json       v22 dynamic route search-space
+│       │   └── objective_profile.json  liquidity-first spot FX objectives
+│       └── bayesian_refine.py      受约束 BO / frontier benchmark smoke
 │
 ├── output/                         ═══ 训练产物（gitignore）═══
 │   ├── tracker.db                  框架的核心数据库
@@ -358,12 +361,12 @@ myautoresearch 框架对一个新 domain 的最小要求：
    - 跑完后写入 `tracker.db`：legacy domain 至少写 `runs.final_win_rate`（domain 真理）、`runs.wall_time_s`、`runs.total_games`、`runs.total_steps`、`runs.num_params`；generic domain 优先写 `run_metrics`
    - 退出码 0 = 成功
 3. **policy 文件**：
-   - `search_space.json`
-   - `objective_profile.json`（v22 generic Pareto / constraints）
-   - `stage_policy.json`
-   - `branch_policy.json`
-   - `selector_policy.json`
-   - `acquisition_policy.json`
+   - `manifest/search_space.json`
+   - `manifest/objective_profile.json`（v22 generic Pareto / constraints）
+   - `manifest/stage_policy.json`
+   - `manifest/branch_policy.json`
+   - `manifest/selector_policy.json`
+   - `manifest/acquisition_policy.json`
 4. **(可选)** 评估模块 `domains/<name>/prepare.py`：定义对手 / 评估函数
 5. **(可选)** 注册自定义列：domain 可以往 `runs` 表写自己的列（框架不会解读，但 analyze 会展示）
 
